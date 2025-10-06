@@ -27,6 +27,29 @@ except Exception:
 
 ColorIn = Union[str, Tuple[int,int,int], List[int], Tuple[float,float,float], List[float]]
 
+# --- CVP Spec Defaults (single source of truth) ---
+
+CVP_SPEC_VERSION = "cvp-1.0"
+DEFAULT_STEP_L:float = 0.8
+DEFAULT_STEP_A:float = 1.6
+DEFAULT_STEP_B:float = 1.6
+DEFAULT_DE_MAX:float = 0.8
+DEFAULT_DIRS    = 8
+DEFAULT_RINGS   = 2
+DEFAULT_L_VARS  = False
+
+def cvp_defaults():
+    return {
+        "version": CVP_SPEC_VERSION,
+        "stepL": DEFAULT_STEP_L,
+        "stepa": DEFAULT_STEP_A,
+        "stepb": DEFAULT_STEP_B,
+        "deltaE": DEFAULT_DE_MAX,
+        "directions": DEFAULT_DIRS,
+        "rings": DEFAULT_RINGS,
+        "Lvars": DEFAULT_L_VARS,
+    }
+
 # ---------------- sRGB <-> Lab utilities ----------------
 
 def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
@@ -141,7 +164,7 @@ def _rgb_to_hex(rgb: Tuple[int,int,int]) -> str:
 # Any color in the same voxel -> SAME canonical center & SAME CVP list.
 
 class Voxelizer:
-    def __init__(self, step_L: float = 4.0, step_a: float = 6.0, step_b: float = 6.0):
+    def __init__(self, step_L: float = DEFAULT_STEP_L, step_a: float = DEFAULT_STEP_A, step_b: float = DEFAULT_STEP_B):
         self.step_L = float(step_L)
         self.step_a = float(step_a)
         self.step_b = float(step_b)
@@ -169,13 +192,13 @@ class Voxelizer:
 
 def cvp_list_for_color(
     color: ColorIn,
-    step_L: float = 4.0,
-    step_a: float = 6.0,
-    step_b: float = 6.0,
-    directions: int = 8,
-    ring_count: int = 2,
-    deltaE_max: float = 2.0,
-    include_L_variants: bool = False
+    step_L: float = DEFAULT_STEP_L,
+    step_a: float = DEFAULT_STEP_A,
+    step_b: float = DEFAULT_STEP_B,
+    directions: int = DEFAULT_DIRS,
+    ring_count: int = DEFAULT_RINGS,
+    deltaE_max: float = DEFAULT_DE_MAX,
+    include_L_variants: bool = DEFAULT_L_VARS
 ) -> List[Tuple[int,int,int]]:
     """
     Returns an ordered list of CVPs (RGB ints 0..255) for the voxel that contains `color`.
@@ -276,13 +299,13 @@ def write_cvp_strip(cvp_list: List[Tuple[int,int,int]], w: int, out_path: str) -
 def read_cvp_strip(
     path: str,
     w: Optional[int] = None,
-    step_L: float = 4.0,
-    step_a: float = 6.0,
-    step_b: float = 6.0,
-    directions: int = 8,
-    ring_count: int = 2,
-    deltaE_max: float = 2.0,
-    include_L_variants: bool = False
+    step_L: float = DEFAULT_STEP_L,
+    step_a: float = DEFAULT_STEP_A,
+    step_b: float = DEFAULT_STEP_B,
+    directions: int = DEFAULT_DIRS,
+    ring_count: int = DEFAULT_RINGS,
+    deltaE_max: float = DEFAULT_DE_MAX,
+    include_L_variants: bool = DEFAULT_L_VARS
 ) -> Dict[str, Any]:
     """
     Read a horizontal CVP strip: one row, tiles of size w×w, left->right.
@@ -373,13 +396,13 @@ def read_cvp_strip(
 def main():
     ap = argparse.ArgumentParser(description="Deterministic CVP list for a color (voxel-based) + strip IO.")
     ap.add_argument("color", nargs="?", default=None, help="e.g. '#66cc99' or '102,204,153' (omit if using --from_strip)")
-    ap.add_argument("--stepL", type=float, default=4.0, help="voxel step for L*")
-    ap.add_argument("--stepa", type=float, default=6.0, help="voxel step for a*")
-    ap.add_argument("--stepb", type=float, default=6.0, help="voxel step for b*")
-    ap.add_argument("--directions", type=int, default=8, help="angles per ring")
-    ap.add_argument("--rings", type=int, default=2, help="rings (inside voxel)")
-    ap.add_argument("--deltaE", type=float, default=2.0, help="max ΔE to canonical")
-    ap.add_argument("--Lvars", action="store_true", help="include tiny ±L* variants")
+    ap.add_argument("--stepL", type=float, default=DEFAULT_STEP_L, help="voxel step for L*")
+    ap.add_argument("--stepa", type=float, default=DEFAULT_STEP_A, help="voxel step for a*")
+    ap.add_argument("--stepb", type=float, default=DEFAULT_STEP_B, help="voxel step for b*")
+    ap.add_argument("--directions", type=int, default=DEFAULT_DIRS, help="angles per ring")
+    ap.add_argument("--rings", type=int, default=DEFAULT_RINGS, help="rings (inside voxel)")
+    ap.add_argument("--deltaE", type=float, default=DEFAULT_DE_MAX, help="max ΔE to canonical")
+    ap.add_argument("--Lvars", type=bool, default=DEFAULT_L_VARS,action="store_true", help="include tiny ±L* variants")
 
     # Output strip
     ap.add_argument("--out", type=str, default=None, help="Write a CVP strip image to this path (generation mode)")
