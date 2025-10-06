@@ -1,217 +1,313 @@
-# Imprint: Calibrated Color-Constellation Codes for Print/Scan-Robust Embedded Metadata
+# Imprint — Perceptual, Camera-Robust Data in Images (WIP)
 
-## Abstract
+![](versus.png)
 
-**Imprint** encodes metadata directly into an image by nudging colors inside human-invisible bounds, arranged in a QR-style macro layout that includes geometric **finders** and **color calibration** chips. Each data tile chooses one of several **perceptually equivalent color variants** of its local base color to represent a symbol (M-ary modulation). Robust decoding rectifies geometry, corrects color, classifies each tile in a perceptual space, and applies forward-error correction (FEC). Phase-1 targets lossless or lightly compressed images; stronger JPEG-robustness is planned as Phase-2.
+Imprint is a research prototype for **embedding small amounts of structured data into ordinary images** so that:
 
----
+* The changes are **hard to notice by humans** under normal viewing.
+* The data can be **recovered from screenshots or re-photographs** (not just by reading file metadata).
+* The scheme can be extended with **authentication (signatures, timestamping, ledger proofs)** for evidentiary use.
 
-## 1) Terminology (canonical names)
-
-* **Finder (TACF)**: Three large **T**ri-**A**nchor **C**olor **F**inder modules (top-left, top-right, bottom-left). Each has a high-contrast ring for detection plus embedded **Calibration Chips** (mini color patches).
-* **Calibration Chips**: Known colors inside each finder used to recover a device-independent color transform (camera/print correction).
-* **Tile (iPS)**: A square **I**mprint **P**ixel **S**ize block that carries one symbol. Recommended: 12–16 px for the prototype.
-* **Finder Size (iCP)**: A finder is **I**mprint **C**orner **P**ixel sized at `iCP = κ × iPS` (κ≈5).
-* **Color Variant Palette (CVP)**: For each tile, an ordered list of N perceptually-close colors around its **Base Color** in OKLab.
-* **Chromatic Variant Index (CVI)**: Index into the CVP. It’s the formalized version of your iOI:
-
-  * CVI = `⊘` (null) → use the 1st (default) variant; no data carried.
-  * CVI = 0 → use the 2nd variant; CVI = 1 → 3rd variant; etc.
-* **Framing Header**: A small header encoded in the first row/column of tiles: version, grid, iPS, iCP, N, ECC, seed.
-* **FEC**: Reed–Solomon RS(255,k) over GF(256) on the tile-symbol stream.
-* **ΔE**: Perceptual color difference (OKLab/OKLCh ΔE). Visible goal after calibration: ΔE ≤ 2.
+> Status: early prototype. The code intentionally favors clarity over speed. Formats and CLIs are subject to change.
 
 ---
 
-## 2) System Overview
+## Why another “watermark”?
 
-**Encoder**:
-
-1. Place three TACF finders; lay timing lines between them.
-2. Partition payload region into `R×C` tiles of size iPS.
-3. For each tile, compute base color (OKLab), build CVP of N variants with tiny ΔE offsets, pick the variant that encodes the next symbol (CVI).
-4. Render tiles with **blue-noise dither** toward the target variant (to avoid flat blocks).
-5. Write Framing Header + FEC’d payload.
-6. Optionally sign a **Manifest** (time/location/hash) in Phase-1b.
-
-**Decoder**:
-
-1. Detect TACFs, estimate homography, **rectify**.
-2. Read calibration chips, solve RGB→OKLab correction (3×3 or small 3D LUT).
-3. Convert rectified payload to OKLab; sample each tile’s mean.
-4. Classify to nearest CVP entry → CVI → symbol; majority vote within the tile if sub-samples are used.
-5. Deframe + Reed–Solomon decode; verify header + optional signature.
+Most “invisible watermark” systems push bits into frequency coefficients (e.g., JPEG DCT), which is brittle when images are re-shot from a screen, printed and scanned, or run through aggressive filters. Imprint approaches the problem *from the color side*: we define **sets of color variants that are perceptually the same to a human** (within a ΔE threshold) and use *which* variant is chosen to carry information. Think of it as “**same color, different coordinates**.”
 
 ---
 
-## 3) Color Model & Palette Construction (CVP)
+## Core Ideas
 
-* Work in **OKLab** for perceptual uniformity.
-* For a tile with base color `b = (L,a,b)`, construct N variants:
+### 1) Canonical Variant Palette (CVP)
 
-  * Fix lightness `L` (to avoid luminance edges).
-  * Generate small hue/chroma offsets on a symmetric star around `b` in **OKLCh**:
+For any input color, we deterministically compute a **voxel** in CIE Lab space (a coarse cell). Inside that voxel we create:
 
-    * `ΔC ∈ {±c1, ±c2}`, `Δh ∈ {±h1, ±h2}` (tunable); clamp to gamut.
-  * Order variants by predicted **post-correction** ΔE; first is “default” (CVI=⊘), then 2nd→CVI=0, 3rd→CVI=1, etc.
-* Prototype palette sizes: **N=8 (3 bits/tile)** or **N=4 (2 bits/tile)** for extra margin.
+* A **canonical/default color** (index 0) — the perceptual “center”.
+* A fixed, ordered list of **alternate variants** (indices 1..K) that stay inside the same voxel and within a small ΔE of the canonical.
+  These variants look the same to humans but are numerically different to a computer.
 
-**Visibility budget**: pre-correction ΔE up to ~4 (cap 6), post-correction target ≤2. In sensitive regions (skin/highlights) reduce ΔE via masks.
+This ordered list is the **CVP**. The **Imprint Order Index (iOI)** of a pixel is just the index in this CVP (default is “null”; alternates map to 0,1,2,… for carrying symbols).
 
----
+> Determinism guarantee: no matter which CVP member you start from (or small perturbations around them), you recover the exact same ordered CVP list.
 
-## 4) Layout & Geometry
+### 2) Imprint Pixel Squares (iPS)
 
-* Canvas is divided into:
+We work in tiles of size **w×w** pixels (argument: `-w`, often 10–20). Each tile contains many pixels of similar color; we quantize each pixel to the **default** CVP color (normalization), then choose a **single CVP variant index** for the *whole tile* to encode a symbol. Using per-tile symbols provides redundancy and robustness.
 
-  * Three TACFs at corners (iCP = 5×iPS suggested).
-  * Horizontal/vertical **Timing Lines** (alternating high-contrast + known chroma) for precise row/col spacing estimation.
-  * Payload grid occupying the remaining rectangle.
-* Minimal viable grid for prototype: **R×C ≥ 16×16 tiles** (with N=8 → raw ~768 bits before overhead/FEC).
+### 3) Targetable Affine Corner Finder (TACF)
 
----
+To survive re-photography, we add three high-contrast **corner markers** (top-left, top-right, bottom-left). They allow the decoder to:
 
-## 5) Framing & Error Correction
+* detect the region-of-interest,
+* estimate perspective/rotation/scale,
+* recover the iPS grid.
 
-* **Header fields** (encoded first; RS-protected):
+Marker size is controlled by **iCP** (an integer multiplier of iPS): e.g., iPS=14 and iCP=5 → 70×70 corner squares.
 
-  * `ver` (u4), `iPS` (u8), `κ` (u4), `R` (u10), `C` (u10), `N` (u4), `FEC` (u8), `seed` (u32).
-* **FEC**: Start with **RS(255, 191)** (~25% parity) for decent redundancy; tune later.
-* **Interleaving**: Block-interleave symbols across rows to spread local damage.
-* **Tile sampling**: For each tile, sample a 3×3 blue-noise subgrid; majority vote → tile mean.
+### 4) Adaptive Radix per Tile (planned)
+
+Each tile can have different numbers of safe CVP variants (depends on local color & gamut). Instead of forcing a global base (e.g., pure bits), the encoder will choose a **per-tile radix** (3..16 symbols typical) and pack data with FEC (Reed–Solomon) across the stream.
 
 ---
 
-## 6) Calibration & Classification
+## What’s in this repo (prototype modules)
 
-* **Geometry**: detect TACF rings; solve homography H via four corner ring centroids (three rings + one synthetic from timing lines).
-* **Color**: use 6–12 Calibration Chips (W, 75% gray, 25% gray, R, G, B, plus two saturated hues).
+* `utils/cvp.py`
+  Deterministic CVP generator and strip IO.
 
-  * Solve `RGB_cam → OKLab_ref` with least-squares: either (a) linear 3×3 + offset in linear-RGB, or (b) a compact 3D LUT (5³).
-* **Classification**: for a tile’s corrected OKLab mean `x`, compute `argmin_j ΔE(x, v_j)` over CVP; map to CVI → symbol.
+  * **Generate** CVP list from a color, optionally render a strip image.
+  * **Read** a CVP strip back and verify invariance.
+* `utils/normalizer.py`
+  Snap every pixel in an image to the **default** member of its CVP (human-similar baseline).
 
-  * Reject if nearest–second ΔE gap < τ (ambiguous); mark as erasure for FEC.
-
----
-
-## 7) Cryptographic Binding (Phase-1b, optional)
-
-* **Manifest** (CBOR/JSON): version, device_id, capture_time, location (coarse), image_hash (SHA-256 of original cover or robust perceptual hash), CVP/ECC params, nonce.
-* **Signature**: Ed25519 over the manifest; embed signature bytes via tiles.
-* **Time-stamp MAC** and/or append-only log proof can be added later for auditability.
-
----
-
-## 8) Prototype Parameters (recommended)
-
-* **Image formats**: PNG / lossless WebP. Accept JPEG only at very high quality for lab.
-* **iPS**: 14 px (range 12–16).
-* **iCP**: κ = 5 → 70 px finders.
-* **N (palette)**: 8 (3 bits/tile) to start.
-* **FEC**: RS(255, 191), interleave by rows.
-* **ΔE targets**: pre-corr ≤4 (cap 6), post-corr ≤2.
-* **Dither**: blue-noise error-diffusion within tile toward target OKLab.
-* **Seeding**: derive CVP orientation + dither seed from `seed` in header (or from the manifest nonce) for determinism.
+  * Also provides a **sanity checker** that reports whether an image is fully normalized.
+* `utils/tile_grid.py`
+  Split an image into **w×w** tiles (as centered as possible) and optionally render grid lines for visualization.
+* `utils/tacf.py`
+  Draw the three **TACF** corner markers sized by `iCP` and aligned to the grid.
+* `test.py`
+  Convenience script to render a canvas with TACF and a blank tile grid.
+* `imprint.py` (earlier PoC)
+  First pass encoder/decoder; kept for reference. Newer workflows prefer the utils above and will bring back encode/decode as we stabilize headers and FEC.
 
 ---
 
-## 9) Encoder Algorithm (prototype)
+## Install
 
-1. **Plan layout** from `(iPS, κ, R, C)`.
-2. **Render TACFs** with ring + calibration chips (fixed reference OKLab).
-3. **Frame payload**: header + (optional) manifest → RS encode → symbol stream.
-4. For each payload tile:
+```bash
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# macOS/Linux
+source .venv/bin/activate
 
-   * Compute base OKLab from the underlying cover region.
-   * Build CVP (N variants) around base; order as per §3.
-   * Take next symbol `s`; choose CVI = `s` (CVI=⊘ when header says “null”).
-   * Render toward the chosen variant using blue-noise dither (stay within gamut/ΔE budget).
-5. Output PNG/lossless WebP.
-
----
-
-## 10) Decoder Algorithm (prototype)
-
-1. **Detect TACFs** (ring Hough/contour), compute homography **H**, **rectify**.
-2. **Read timing lines**; refine grid spacing & skew.
-3. **Calibrate color** from chips; apply correction to the rectified payload region.
-4. **Tile sampling**: compute OKLab mean per tile (with 3×3 sub-samples).
-5. **Classify** each tile → nearest CVP index; ambiguous → erasure.
-6. **Deinterleave**, **RS decode**, parse header, recover payload.
-7. If present, verify **signature** over the manifest.
-
----
-
-## 11) Evaluation Plan
-
-* **Datasets**: flat graphics, photos with skin/sky, high-texture scenes.
-* **Perturbations**: brightness/contrast changes, white-balance shifts, slight blur, small rescale, print→scan loop (laser/inkjet).
-* **Metrics**: tile classification accuracy, RS frame success rate, ΔE distributions pre/post correction, visual difference maps.
-* **Ablations**: turn off calibration, reduce N, vary iPS, vary ΔE budget, with/without dither.
-
----
-
-## 12) Threat Model (Phase-1)
-
-* **Benign distortions**: exposure, WB, slight blur, mild rescale → handled by TACFs + calibration + FEC.
-* **Malicious edits**: heavy recolor/filters, inpainting of finders, recompress to low-quality JPEG → out of scope for Phase-1; addressed in Phase-2.
-* **Counterfeit**: Without the private key, an attacker can’t forge a valid signature/nonce bound to the image hash.
-
----
-
-## 13) Roadmap
-
-* **Phase-1 (this prototype)**: PNG/lossless path, N=8, iPS≈14, κ=5, RS(255,191), manifest optional.
-* **Phase-1b**: Enable Ed25519 signing + manifest embedding + verification CLI.
-* **Phase-2**: JPEG-robust variant:
-
-  * Either keep macro layout but add **chroma-domain CVP** (work primarily in Cr) and larger ΔE;
-  * Or add a **DCT-domain watermark** for redundancy under compression, cross-checking the macro code.
-
----
-
-## 14) Pseudocode (concise)
-
-**Encode**
-
-```python
-def encode(img, payload_bytes, iPS=14, kappa=5, N=8, rs_k=191, seed=0x1234):
-    place_TACF_findings(img, iPS*kappa)
-    grid = plan_grid(img, iPS, kappa)
-    header = mk_header(iPS, kappa, grid.R, grid.C, N, rs_k, seed)
-    symbols = rs_encode(frame(header, payload_bytes), rs_k)
-    rng = PRNG(seed)
-    for t, tile in enumerate(grid.tiles):
-        base = mean_oklab(img[tile.region])
-        cvp = build_cvp(base, N, rng)   # ordered by ΔE
-        s   = symbols[t] if t < len(symbols) else NULL_CVI
-        target = cvp[s if s is not None else 0]  # 0th is “default”
-        render_tile_with_blue_noise(img, tile.region, base, target, rng)
-    return img
-```
-
-**Decode**
-
-```python
-def decode(img, iPS_hint=None):
-    H, chips = detect_TACFs_and_rectify(img)
-    corr = fit_color_correction(chips)       # RGB_cam → OKLab_ref
-    grid = recover_grid(H, timing_lines=True)
-    samples = []
-    for tile in grid.tiles:
-        x = mean_oklab(apply_corr(img[tile.region], corr))
-        cvp = reconstruct_cvp_from_header_or_seed(tile, x)  # same generator
-        s   = classify_to_symbol(x, cvp)  # nearest; ambiguity → erasure
-        samples.append(s)
-    header, payload = rs_decode_and_deframe(samples)
-    return payload, header
+pip install -U pip
+pip install numpy pillow opencv-python
+# (reedsolomon/FEC will be added when we enable it; currently not required)
 ```
 
 ---
 
-## 15) What we are (and aren’t) doing in the prototype
+## Quickstart: CVP Basics
 
-* **We are**: using **calibrated color** + **macro geometry** to embed data that survives recapture, starting with friendly formats (PNG/lossless).
-* **We aren’t (yet)**: resisting harsh JPEG pipelines or aesthetic filters; that’s Phase-2 with a more aggressive chroma palette and/or DCT redundancy.
+Generate the CVP list for a color and render a strip:
+
+```bash
+python utils/cvp.py "#66cc99" --out ./example_img/cvp_strip.png --w 40
+```
+
+Read the strip back and verify invariance:
+
+```bash
+python utils/cvp.py --from_strip ./example_img/cvp_strip.png --w 40
+```
+
+Example output (abridged):
+
+```json
+{
+  "mode": "generate",
+  "count": 9,
+  "cvps": [
+    {"index":"default","rgb":[...],"hex":"#..."},
+    {"index":0,"rgb":[...],"hex":"#..."},
+    {"index":1,"rgb":[...],"hex":"#..."}
+  ],
+  "image": "./example_img/cvp_strip.png"
+}
+```
 
 ---
+
+## Normalize an Image (build a “base”)
+
+Normalize every pixel to its **default CVP** (this yields an image perceptually close to the original, but numerically aligned for embedding):
+
+```bash
+python utils/normalizer.py ./example_img/demo_in.png ./example_img/demo_base.png \
+  --stepL 8 --stepa 12 --stepb 12 --deltaE 1.0
+```
+
+Check whether an image is fully normalized:
+
+```bash
+python utils/normalizer.py ./example_img/demo_base.png --check
+# -> reports "normalized": true/false and (optionally) a map of offending pixels
+```
+
+> Tuning invisibility vs. capacity:
+>
+> * Larger voxel steps (`--stepL/--stepa/--stepb`) and smaller `--deltaE` make the “base” closer to the original (less visible drift), but reduce how many safe variants each tile gets.
+> * Start with `--stepL 8 --stepa 12 --stepb 12 --deltaE 1.0`. If you still see visible drift, increase steps a little or drop `deltaE` to `0.8`.
+
+---
+
+## Make a Tile Grid (iPS)
+
+Split an image into **w×w** tiles and (optionally) render grid lines for inspection:
+
+```bash
+python utils/tile_grid.py ./example_img/demo_base.png \
+  --w 14 \
+  --grid_out ./example_img/demo_base_grid.png \
+  --json_out ./example_img/demo_base_grid.json
+```
+
+* `--w` is your **iPS** size.
+* `--grid_out` saves a copy with visible lines (debugging only).
+* `--json_out` lists the grid geometry (rows, cols, tile rectangles).
+
+---
+
+## Add TACF Corner Markers (iCP)
+
+Draw the three calibration markers sized by an integer **iCP** multiplier of iPS:
+
+```bash
+python utils/tacf.py ./example_img/demo_base.png ./example_img/demo_tacf.png \
+  --w 14 --iCP 5 --style classic
+```
+
+* Markers are placed at top-left, top-right, bottom-left.
+* The decoder will use these to unwarp, align, and recover the grid.
+
+---
+
+## Compose a Canvas with TACF and Grid (demo)
+
+Render a synthetic canvas that contains TACF + grid (no payload yet):
+
+```bash
+python test.py \
+  --w 14 --iCP 5 \
+  --W 1024 --H 768 \
+  --out ./example_img/canvas.png
+```
+
+---
+
+## Roadmap (next steps)
+
+* **Adaptive radix per tile** (current utils already expose per-tile CVP size; the encoder will pack symbols using as many variants as are safely available for that tile).
+* **Header design**: magic + version + layout parameters (w, iCP), content digest; salted and optionally encrypted payload.
+* **FEC**: Reed–Solomon across the symbol stream; interleaving across rows/cols to survive localized damage.
+* **Robust decoding**:
+
+  * TACF detection → homography → grid recovery.
+  * Photometric normalization (white balance, gamma) before CVP decisions.
+  * Multi-hypothesis testing on CVP index per tile with confidence reduction.
+* **Security** (optional layers):
+
+  * Detached **manifest** (what was embedded) and **signature** (Ed25519).
+  * **Timestamp token** (TSA HMAC or RFC 3161).
+  * **Transparency log** (Merkle inclusion proof) to prove the imprint existed at a past time.
+* **Human-factor tuning**:
+
+  * Psychovisual masks to choose tiles where changes are maximally hidden.
+  * Spatial dithering to reduce block boundary salience.
+
+---
+
+## Current Limitations
+
+* The “base/normalized” image may still be distinguishable from the original on flat gradients or large smooth areas. Mitigations:
+
+  * Use larger Lab voxel steps and smaller ΔE for the base.
+  * Prefer textures; avoid flat fills if strong invisibility is required.
+* Decoding from prints/re-photos is not implemented yet; TACF exists, but the end-to-end homography + symbol inference is in progress.
+* The legacy `imprint.py` encoder/decoder is experimental and will be replaced by the adaptive-radix pipeline.
+
+---
+
+## Practical Use Cases (target)
+
+* **Provenance & anti-tamper**: bind time, device, and location into pixels; verify even after screenshots/recompression.
+* **Chain-of-custody**: couple a photo to a case ID with a verifiable ledger entry.
+* **Soft DRM & leak forensics**: encode a short session or user ID robustly.
+
+> Reminder: cryptographic binding (signatures, logs) turns “this image contains bits” into “this image claims X, signed by Y, seen at time T.” The pixels carry the bits; the proofs make them meaningful.
+
+---
+
+## Example End-to-End (today’s prototype)
+
+1. **Normalize** the image:
+
+```bash
+python utils/normalizer.py ./example_img/demo_in.png ./example_img/demo_base.png \
+  --stepL 8 --stepa 12 --stepb 12 --deltaE 1.0
+```
+
+2. **Grid** and **markers**:
+
+```bash
+python utils/tile_grid.py ./example_img/demo_base.png --w 14 \
+  --grid_out ./example_img/demo_base_grid.png \
+  --json_out ./example_img/demo_base_grid.json
+
+python utils/tacf.py ./example_img/demo_base.png ./example_img/demo_tacf.png \
+  --w 14 --iCP 5
+```
+
+3. **(Soon)** Encode a short message with adaptive radix per tile and export a manifest.
+4. **(Soon)** Decode from the TACF + grid, recover message + verify manifest.
+
+---
+
+## Design Choices & Tuning Notes
+
+* **Color space**: CIE Lab for perceptual uniformity.
+* **Voxelization**: `(stepL, stepa, stepb)` define buckets; any input in the same bucket yields the same CVP list.
+* **ΔE tolerance**: bounds how far variants may wander from the canonical center.
+* **Invisibility levers**:
+
+  * Higher `step*` and lower `ΔE` → closer to the original appearance (fewer variants).
+  * Lower `step*` and higher `ΔE` → more variants (capacity) but increased risk of visible hue/contrast shifts.
+* **Human vision**: ΔE ≈ 1 is near just-noticeable difference under ideal viewing; many displays/printers/phones are noisier than that. Start conservative and test on your target pipeline (screenshot, print, compress).
+
+---
+
+## Troubleshooting
+
+* **“The normalized image still looks different.”**
+  Increase `--stepL/--stepa/--stepb` and/or reduce `--deltaE`. For very flat backgrounds, consider texture-preserving masks (coming soon).
+* **“Grid won’t fit nicely.”**
+  Try a smaller `-w`. The grid aligns itself centered; we pad/clip as needed.
+* **“Decoder can’t find markers.”**
+  Ensure TACF is present and large enough (`iCP ≥ 4` for small images). Avoid cropping.
+
+---
+
+## Contributing
+
+Open issues with:
+
+* A minimal input image,
+* Exact command lines,
+* The observed vs. expected behavior.
+
+The code is intentionally modular; PRs that improve determinism, decoding robustness, or human-factors are welcome.
+
+---
+
+## License
+
+TBD for the research phase. All rights reserved for now; contact the maintainers for evaluation/commercial discussions.
+
+---
+
+## Glossary
+
+* **CVP** — Canonical Variant Palette (ordered list of perceptually-equivalent color variants; index 0 is the canonical/default).
+* **iOI** — Imprint Order Index (tile’s chosen CVP index used to encode a symbol; default is “null,” alternates map to 0,1,2,…).
+* **iPS** — Imprint Pixel Square (tile size `w×w` used as one symbol carrier).
+* **iCP** — Imprint Corner Pixel multiplier (marker size in multiples of `w`).
+* **TACF** — Targetable Affine Corner Finder (three corner markers for alignment).
+* **ΔE** — Perceptual color difference (CIE76 in this prototype).
+* **FEC** — Forward Error Correction (Reed–Solomon planned).
+
+---
+
+*This document evolves with the prototype. If something is unclear or you want a worked example tailored to your image set (e.g., medical scans, body cams, receipts), that’s the perfect next experiment.*

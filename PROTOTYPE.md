@@ -170,46 +170,7 @@
 
 ---
 
-## 14) Pseudocode (concise)
-
-**Encode**
-
-```python
-def encode(img, payload_bytes, iPS=14, kappa=5, N=8, rs_k=191, seed=0x1234):
-    place_TACF_findings(img, iPS*kappa)
-    grid = plan_grid(img, iPS, kappa)
-    header = mk_header(iPS, kappa, grid.R, grid.C, N, rs_k, seed)
-    symbols = rs_encode(frame(header, payload_bytes), rs_k)
-    rng = PRNG(seed)
-    for t, tile in enumerate(grid.tiles):
-        base = mean_oklab(img[tile.region])
-        cvp = build_cvp(base, N, rng)   # ordered by ΔE
-        s   = symbols[t] if t < len(symbols) else NULL_CVI
-        target = cvp[s if s is not None else 0]  # 0th is “default”
-        render_tile_with_blue_noise(img, tile.region, base, target, rng)
-    return img
-```
-
-**Decode**
-
-```python
-def decode(img, iPS_hint=None):
-    H, chips = detect_TACFs_and_rectify(img)
-    corr = fit_color_correction(chips)       # RGB_cam → OKLab_ref
-    grid = recover_grid(H, timing_lines=True)
-    samples = []
-    for tile in grid.tiles:
-        x = mean_oklab(apply_corr(img[tile.region], corr))
-        cvp = reconstruct_cvp_from_header_or_seed(tile, x)  # same generator
-        s   = classify_to_symbol(x, cvp)  # nearest; ambiguity → erasure
-        samples.append(s)
-    header, payload = rs_decode_and_deframe(samples)
-    return payload, header
-```
-
----
-
-## 15) What we are (and aren’t) doing in the prototype
+## 14) What we are (and aren’t) doing in the prototype
 
 * **We are**: using **calibrated color** + **macro geometry** to embed data that survives recapture, starting with friendly formats (PNG/lossless).
 * **We aren’t (yet)**: resisting harsh JPEG pipelines or aesthetic filters; that’s Phase-2 with a more aggressive chroma palette and/or DCT redundancy.
