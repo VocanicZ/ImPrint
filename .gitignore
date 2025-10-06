@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+tiles/
+examples/*_strip*
+examples/*_tacf*
+examples/*_grid*
