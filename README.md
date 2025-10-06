@@ -294,7 +294,7 @@ The code is intentionally modular; PRs that improve determinism, decoding robust
 
 ## License
 
-TBD for the research phase. All rights reserved for now; contact the maintainers for evaluation/commercial discussions.
+This project is under MIT License
 
 ---
 
