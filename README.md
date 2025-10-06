@@ -1,8 +1,8 @@
-# Imprint — Perceptual, Camera-Robust Data in Images (WIP)
+# ImPrint — Perceptual, Camera-Robust Data in Images (WIP)
 
 ![](versus.png)
 
-Imprint is a research prototype for **embedding small amounts of structured data into ordinary images** so that:
+ImPrint is a research prototype for **embedding small amounts of structured data into ordinary images** so that:
 
 * The changes are **hard to notice by humans** under normal viewing.
 * The data can be **recovered from screenshots or re-photographs** (not just by reading file metadata).
@@ -14,7 +14,7 @@ Imprint is a research prototype for **embedding small amounts of structured data
 
 ## Why another “watermark”?
 
-Most “invisible watermark” systems push bits into frequency coefficients (e.g., JPEG DCT), which is brittle when images are re-shot from a screen, printed and scanned, or run through aggressive filters. Imprint approaches the problem *from the color side*: we define **sets of color variants that are perceptually the same to a human** (within a ΔE threshold) and use *which* variant is chosen to carry information. Think of it as “**same color, different coordinates**.”
+Most “invisible watermark” systems push bits into frequency coefficients (e.g., JPEG DCT), which is brittle when images are re-shot from a screen, printed and scanned, or run through aggressive filters. ImPrint approaches the problem *from the color side*: we define **sets of color variants that are perceptually the same to a human** (within a ΔE threshold) and use *which* variant is chosen to carry information. Think of it as “**same color, different coordinates**.”
 
 ---
 
@@ -28,11 +28,11 @@ For any input color, we deterministically compute a **voxel** in CIE Lab space (
 * A fixed, ordered list of **alternate variants** (indices 1..K) that stay inside the same voxel and within a small ΔE of the canonical.
   These variants look the same to humans but are numerically different to a computer.
 
-This ordered list is the **CVP**. The **Imprint Order Index (iOI)** of a pixel is just the index in this CVP (default is “null”; alternates map to 0,1,2,… for carrying symbols).
+This ordered list is the **CVP**. The **ImPrint Order Index (iOI)** of a pixel is just the index in this CVP (default is “null”; alternates map to 0,1,2,… for carrying symbols).
 
 > Determinism guarantee: no matter which CVP member you start from (or small perturbations around them), you recover the exact same ordered CVP list.
 
-### 2) Imprint Pixel Squares (iPS)
+### 2) ImPrint Pixel Squares (iPS)
 
 We work in tiles of size **w×w** pixels (argument: `-w`, often 10–20). Each tile contains many pixels of similar color; we quantize each pixel to the **default** CVP color (normalization), then choose a **single CVP variant index** for the *whole tile* to encode a symbol. Using per-tile symbols provides redundancy and robustness.
 
@@ -202,7 +202,7 @@ python test.py \
 
   * Detached **manifest** (what was embedded) and **signature** (Ed25519).
   * **Timestamp token** (TSA HMAC or RFC 3161).
-  * **Transparency log** (Merkle inclusion proof) to prove the imprint existed at a past time.
+  * **Transparency log** (Merkle inclusion proof) to prove the ImPrint existed at a past time.
 * **Human-factor tuning**:
 
   * Psychovisual masks to choose tiles where changes are maximally hidden.
@@ -301,9 +301,9 @@ TBD for the research phase. All rights reserved for now; contact the maintainers
 ## Glossary
 
 * **CVP** — Canonical Variant Palette (ordered list of perceptually-equivalent color variants; index 0 is the canonical/default).
-* **iOI** — Imprint Order Index (tile’s chosen CVP index used to encode a symbol; default is “null,” alternates map to 0,1,2,…).
-* **iPS** — Imprint Pixel Square (tile size `w×w` used as one symbol carrier).
-* **iCP** — Imprint Corner Pixel multiplier (marker size in multiples of `w`).
+* **iOI** — ImPrint Order Index (tile’s chosen CVP index used to encode a symbol; default is “null,” alternates map to 0,1,2,…).
+* **iPS** — ImPrint Pixel Square (tile size `w×w` used as one symbol carrier).
+* **iCP** — ImPrint Corner Pixel multiplier (marker size in multiples of `w`).
 * **TACF** — Targetable Affine Corner Finder (three corner markers for alignment).
 * **ΔE** — Perceptual color difference (CIE76 in this prototype).
 * **FEC** — Forward Error Correction (Reed–Solomon planned).
