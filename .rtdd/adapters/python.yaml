@@ -1,0 +1,23 @@
+# pytest adapter for ImPrint; overrides rtdd's built-in `python` adapter (same name,
+# so map rows keep "a":"python"). Same flags as the built-in, but it also detects the
+# suite file itself and runs pytest through scripts/rtdd-pytest.sh, which reuses
+# ci-local's .venv, installs pytest-cov + pytest-reportlog when missing, caps
+# OMP/OPENBLAS threads at 4 and runs under `nice`. The built-in calls bare `pytest`,
+# which finds neither the venv nor the plugins.
+name: python
+detect: ["pytest.ini", "test_imprint_cam.py"]
+env:
+  COVERAGE_CORE: ctrace
+  COVERAGE_FILE: .coverage
+seed: "scripts/rtdd-pytest.sh --cov --cov-context=test --cov-report= --report-log={log}"
+subset: "scripts/rtdd-pytest.sh {tests} --cov --cov-context=test --cov-report= --report-log={log}"
+subset_plain: "scripts/rtdd-pytest.sh {tests} --report-log={log}"
+list: "scripts/rtdd-pytest.sh --collect-only -q"
+coverage: sqlite
+report: pytest-reportlog
+failfast_flag: "-x"
+test_globs: ["tests/**/*.py", "**/test_*.py", "**/*_test.py"]
+source_globs: ["**/*.py"]
+exit_codes: { 4: bad-selector, 5: no-tests-collected }
+opaque: ["**/*.yaml", "**/*.yml", "**/*.sql", "**/*.html", "**/*.j2", "**/*.json", "**/fixtures/**", "testdata/**"]
+full_escalate: ["requirements.txt", "pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "poetry.lock", "uv.lock", "**/conftest.py", "scripts/rtdd-pytest.sh", "scripts/ci-local.sh"]
