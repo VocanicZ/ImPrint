@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ImPrint</title>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --fg:#1d1d1b; --muted:#6b6b66; --line:#ddddd8; --acc:#2f6fdf; --ok:#1f9d55; --warn:#d48a00; --bad:#d23b3b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#1f1f1f; --fg:#ececea; --muted:#9a9a95; --line:#333; --acc:#6b9bff; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:980px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 12px; }
+  nav { display:flex; gap:6px; margin-bottom:14px; }
+  nav button { flex:1; padding:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:8px; font-size:15px; cursor:pointer; }
+  nav button.on { border-color:var(--acc); color:var(--acc); font-weight:600; }
+  section { display:none; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  section.on { display:block; }
+  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:13px; }
+  label.inline { display:flex; gap:8px; align-items:center; color:var(--fg); font-size:14px; }
+  input[type=text], input[type=number] { width:100%; padding:8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font-size:15px; }
+  input[type=file] { width:100%; }
+  .row { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px; }
+  .go, .btn { margin-top:14px; padding:11px 18px; border:0; border-radius:8px; background:var(--acc); color:#fff; font-size:15px; cursor:pointer; display:inline-block; text-decoration:none; }
+  .btn.alt { background:var(--card); color:var(--fg); border:1px solid var(--line); }
+  .go:disabled, .btn:disabled { opacity:.5; }
+  .out { margin-top:16px; }
+  img, canvas { max-width:100%; border:1px solid var(--line); border-radius:6px; display:block; }
+  .big { font-size:22px; font-weight:700; margin:6px 0; word-break:break-all; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; font-size:14px; margin:8px 0; }
+  .kv b { font-weight:500; color:var(--muted); }
+  .note { color:var(--muted); font-size:13px; }
+  table { border-collapse:collapse; width:100%; font-size:14px; margin:10px 0; }
+  th, td { border:1px solid var(--line); padding:6px; text-align:center; }
+  a { color:var(--acc); }
+  .cmp { user-select:none; -webkit-user-select:none; touch-action:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ImPrint: invisible, print/camera-robust image codes</h1>
+  <nav>
+    <button data-tab="enc" class="on">Encode</button>
+    <button data-tab="dec">Decode</button>
+    <button data-tab="lad">Strength ladder</button>
+  </nav>
+
+  <section id="enc" class="on">
+    <label>Image</label>
+    <input type="file" id="e-file" accept="image/*">
+    <label>Payload text (max 32 bytes; shorter = more robust)</label>
+    <input type="text" id="e-text" value="IMPRINT1">
+    <div class="row">
+      <div><label>Strength δ: <span id="e-dv">2</span> (lower = less visible)</label>
+        <input type="range" id="e-delta" min="1" max="4" step="0.25" value="2" style="width:100%"></div>
+      <div><label>Print width (cm), sets the cell size</label><input type="number" id="e-width" value="15" min="3" step="0.5"></div>
+    </div>
+    <button class="go" id="e-go">Encode</button>
+    <div class="out" id="e-out"></div>
+  </section>
+
+  <section id="dec">
+    <label>Photo or scan of the printed picture (no border needed: background, rotation, mirroring, even cropping are fine; fill the frame and keep it sharp)</label>
+    <input type="file" id="d-file" accept="image/*">
+    <label>Condition label, optional (e.g. "30deg, lamp, 40cm")</label>
+    <input type="text" id="d-label">
+    <button class="go" id="d-go">Decode</button>
+    <div class="out" id="d-out"></div>
+  </section>
+
+  <section id="lad">
+    <p>Makes one A4 page with your picture encoded at strengths 1, 1.5, 2 and 3, labelled with plain text.
+       Print it at <b>100% / actual size</b>, check which ones you can see, then photograph the page and
+       decode it: each decoded copy reports its strength (payload <code>d1.5…</code>).</p>
+    <label>Image</label>
+    <input type="file" id="l-file" accept="image/*">
+    <label>Tag added to each payload (optional, a few characters)</label>
+    <input type="text" id="l-tag" maxlength="8">
+    <button class="go" id="l-go">Make test page</button>
+    <div class="out" id="l-out"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button, section').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); $(b.dataset.tab).classList.add('on');
+});
+$('e-delta').oninput = e => $('e-dv').textContent = e.target.value;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const kv = o => '<div class="kv">' + Object.entries(o).map(([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join('') + '</div>';
+const pct = x => (x * 100).toFixed(1) + '%';
+
+async function post(url, fields, btn, out, busy = 'Working…') {
+  btn.disabled = true; out.innerHTML = `<p class="note">${esc(busy)}</p>`;
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+  try {
+    const r = await fetch(url, {method: 'POST', body: fd});
+    const j = await r.json();
+    if (!r.ok) throw new Error(typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail));
+    return j;
+  } catch (e) { out.innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
+  finally { btn.disabled = false; }
+}
+
+// ---------------------------------------------------------------- encode
+$('e-go').onclick = async () => {
+  const f = $('e-file').files[0], out = $('e-out');
+  if (!f) return out.innerHTML = '<p class="bad">Choose an image.</p>';
+  if (new TextEncoder().encode($('e-text').value).length > 32) return out.innerHTML = '<p class="bad">Payload over 32 bytes.</p>';
+  const j = await post('/api/encode', {file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value}, $('e-go'), out);
+  if (!j) return;
+  const s = j.stats, warn = [];
+  if (j.subblock_mm < j.min_subblock_mm) warn.push(`Printed sub-block is ${j.subblock_mm} mm (< ${j.min_subblock_mm} mm): print larger, or use a higher-resolution image.`);
+  if (s.tiles < 2) warn.push('Low redundancy (fewer than 2 payload tiles): use a shorter payload or a larger image.');
+  if (s.wrong_cells > 0.15) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
+  const name = 'imprint_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
+  out.innerHTML = `
+    ${warn.map(w => `<p class="warn">${esc(w)}</p>`).join('')}
+    ${kv({'similarity (SSIM)': s.ssim + '  (1 = identical)', 'PSNR': s.psnr + ' dB',
+          'lightness change': `mean ${s.mean_dL}, 99% of pixels ≤ ${s.p99_dL} (ΔL*; ~1 is a just-noticeable step on a flat area)`,
+          'cells': `${s.cols} × ${s.rows} (payload tile ${s.tile}×${s.tile}, repeated ${s.tiles}×)`,
+          'print': `${j.print_cm[0]} × ${j.print_cm[1]} cm @ ${j.dpi} dpi, sub-block ${j.subblock_mm} mm`})}
+    <p><a class="btn" href="${j.image}" download="${esc(name)}">Download PNG</a>
+       <button class="btn alt" id="e-hold">Hold to see original</button>
+       <button class="btn alt" id="e-diff">Show difference ×10</button></p>
+    <img id="e-img" class="cmp" src="${j.image}">
+    <p class="note">Same size as your original, no border or markers: a hidden sync pattern lets the decoder find the code anywhere. Hold the button (or press on the image) to flip to the original. Print at 100%; the PNG carries the DPI for the chosen width.</p>`;
+  const img = $('e-img');
+  let diffOn = false;
+  const show = which => img.src = which === 'orig' ? j.original : diffOn ? j.diff : j.image;
+  for (const el of [$('e-hold'), img]) {
+    el.onpointerdown = e => { e.preventDefault(); show('orig'); };
+    el.onpointerup = el.onpointerleave = el.onpointercancel = () => show('enc');
+  }
+  $('e-diff').onclick = () => { diffOn = !diffOn; $('e-diff').textContent = diffOn ? 'Show encoded' : 'Show difference ×10'; show('enc'); };
+};
+
+// ---------------------------------------------------------------- decode
+$('d-go').onclick = async () => {
+  const f = $('d-file').files[0], out = $('d-out');
+  if (!f) return out.innerHTML = '<p class="bad">Choose a photo.</p>';
+  const j = await post('/api/decode', {file: f, label: $('d-label').value}, $('d-go'), out, 'Searching for the hidden sync pattern…');
+  if (!j) return;
+  const head = j.found.length
+    ? j.found.map((f, i) => `<div class="big ok">#${i + 1} ✓ ${esc(f.text)}</div>` + kv({
+        'raw cell error': pct(f.raw_ber) + ' (fixed by error correction)', 'cells read': `${f.cells} (${f.tiles} payload tiles)`,
+        'photo px / sub-block': f.photo_px_per_subblock, 'mirrored photo': f.mirrored ? 'yes' : 'no'})).join('')
+    : `<div class="big bad">✗ nothing decoded</div>
+       <p class="note">Sync candidates: ${j.seeds}, tried ${j.tried}. Try: closer so the picture fills the frame, sharper focus, less glare.</p>`;
+  out.innerHTML = head + kv({'photo': j.photo, 'time': j.seconds + ' s'}) +
+    `<figure style="margin:10px 0 0"><img src="${j.overlay}"><figcaption class="note">Green = area where the code was read.</figcaption></figure>`;
+};
+
+// ---------------------------------------------------------------- ladder
+$('l-go').onclick = async () => {
+  const f = $('l-file').files[0], out = $('l-out');
+  if (!f) return out.innerHTML = '<p class="bad">Choose an image.</p>';
+  const j = await post('/api/ladder', {file: f, tag: $('l-tag').value}, $('l-go'), out, 'Encoding 4 copies…');
+  if (!j) return;
+  out.innerHTML = `<table><tr><th>strength δ</th><th>SSIM</th><th>PSNR</th><th>mean ΔL*</th><th>99% ΔL*</th><th>payload tiles</th></tr>
+    ${j.stats.map(s => `<tr><td>${s.delta}</td><td>${s.ssim}</td><td>${s.psnr}</td><td>${s.mean_dL}</td><td>${s.p99_dL}</td><td>${s.tiles}×</td></tr>`).join('')}</table>
+    <a class="btn" href="${j.pdf}" download="imprint_ladder.pdf">Download test page (PDF)</a>
+    <p class="note">Each copy prints ~8.8 cm wide. Photograph the whole page; the decoder finds every copy it can read.</p>`;
+};
+</script>
+</body>
+</html>

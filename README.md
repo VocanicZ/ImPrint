@@ -12,6 +12,25 @@ ImPrint is a research prototype for **embedding small amounts of structured data
 
 ---
 
+## Print/camera-robust prototype (`imprint_cam.py`)
+
+Goal: hide a short payload in an image so the encoded file looks like the original (same size, **no visible border, markers or finder patterns**) and still decodes from a phone photo of a print or screen: any angle, light, grayscale print, mirrored, gently curled, background clutter, even cropped.
+
+* **Data:** each cell (4×4 sub-blocks) carries one bit as the sign of a ±1 sub-block pattern on L\*. Patterns are orthogonal to flat color and linear ramps, so lighting, white balance and printer drift cancel. Informed embedding plus per-pixel texture masking and gamut headroom (pure black/white/saturated pixels are never touched).
+* **Hidden sync (the invisible finder):** three faint cosines locked to the cell grid. Each is one spectral line, so the decoder finds the grid anywhere from the spectrum. The encoder notches the image's own content at those frequencies so texture can't drown them. Matched-filter phase gives the cell offset; the decoder then tracks the pilot outward and fits perspective + curl.
+* **Payload tiles:** the codeword (payload + CRC-32, rate-½ Reed–Solomon) repeats in T×T-cell tiles over the whole picture, so any large-enough piece decodes. The decoder tries every tile phase.
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765   # web UI: encode / decode / strength ladder
+scripts/ci-local.sh                                      # self-check (also what Harness agents run)
+.venv/bin/python sim.py --trials 2 photo1.png            # simulated print->photo benchmark
+```
+
+`sim.py` simulates print (AM halftone, dot gain, grayscale option) and photo (pinhole 3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; the real printer/phone decides. Current status, open problems and acceptance targets live in the PRD issue on GitHub.
+
+---
+
 ## Why another “watermark”?
 
 Most “invisible watermark” systems push bits into frequency coefficients (e.g., JPEG DCT), which is brittle when images are re-shot from a screen, printed and scanned, or run through aggressive filters. ImPrint approaches the problem *from the color side*: we define **sets of color variants that are perceptually the same to a human** (within a ΔE threshold) and use *which* variant is chosen to carry information. Think of it as “**same color, different coordinates**.”
