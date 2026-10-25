@@ -213,3 +213,6 @@ examples/*_grid*
 examples/*_base*
 # local run output
 results/
+.rtdd/junit.xml
+.rtdd/meta.json
+.coverage

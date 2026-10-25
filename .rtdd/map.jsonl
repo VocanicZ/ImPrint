@@ -1,0 +1,3 @@
+{"t":"test_imprint_cam.py::test_found_without_border_any_orientation","f":["imprint_cam.py","test_imprint_cam.py"],"c":"f37c4d1","d":209201,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_same_size_no_markers","f":["imprint_cam.py","test_imprint_cam.py"],"c":"f37c4d1","d":12560,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_survives_simulated_print_and_photo","f":["imprint_cam.py","sim.py","test_imprint_cam.py"],"c":"f37c4d1","d":1667265,"s":"pass","a":"python"}
