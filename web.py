@@ -6,10 +6,13 @@ Then open http://<this-pc-ip>:8765 on the PC or on a phone in the same network.
 import base64
 import csv
 import io
+import os
+import re
 import time
 from pathlib import Path
 
-import cv2
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(50_000_000))   # the decoder itself refuses bombs
+import cv2  # noqa: E402
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
@@ -36,15 +39,15 @@ def read_rgb(data: bytes) -> np.ndarray:
     if w * h > MAX_PIXELS:
         raise HTTPException(413, f"image too large ({w}x{h}); max {MAX_PIXELS // 1_000_000} MP")
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)   # honours EXIF rotation
-    if img is None:
-        raise HTTPException(400, "not an image")
+    if img is None or img.shape[0] * img.shape[1] > MAX_PIXELS:          # check what was actually decoded
+        raise HTTPException(400, "not an image (or too large)")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 def cell(v) -> str:
     """CSV field safe to open in a spreadsheet (no formula injection)."""
-    v = str(v)[:200]
-    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
+    v = re.sub(r"[\x00-\x1f\x7f]", " ", str(v))[:200]
+    return "'" + v if v.lstrip()[:1] in ("=", "+", "-", "@", "|", "＝", "＋", "－", "＠") else v
 
 
 def b64png(rgb: np.ndarray, max_side: int | None = None, dpi: float | None = None) -> str:
