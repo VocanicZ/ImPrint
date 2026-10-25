@@ -25,9 +25,10 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765   # web UI: encode / decode / strength ladder
 scripts/ci-local.sh                                      # self-check (also what Harness agents run)
 .venv/bin/python sim.py --trials 2 photo1.png            # simulated print->photo benchmark
+nice .venv/bin/python sim.py --acceptance                # PRD #1 criteria table, PASS/FAIL (--quick: kodim23, 1 trial)
 ```
 
-`sim.py` simulates print (AM halftone, dot gain, grayscale option) and photo (pinhole 3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; the real printer/phone decides. Current status, open problems and acceptance targets live in the PRD issue on GitHub.
+`sim.py` simulates print (AM halftone, dot gain, grayscale option) and photo (pinhole 3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; the real printer/phone decides. Current status, open problems and acceptance targets live in the PRD issue on GitHub. `--acceptance` scores every PRD criterion (5 trials over `testdata/`; `--trials`, `--presets` and image paths override) and writes `acceptance.json`, each image's encoded copy, ×10 difference view and strength ladder to `--out` (default `results/acceptance`). It exits 0 only on PASS.
 
 ---
 

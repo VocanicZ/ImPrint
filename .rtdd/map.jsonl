@@ -1,0 +1,11 @@
+{"t":"test_imprint_cam.py::test_acceptance_criteria_fail_just_past_threshold","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":2,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_acceptance_criteria_pass_on_threshold","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":2,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_acceptance_criteria_unmeasured_is_incomplete_not_pass","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":2,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_acceptance_run_writes_report_and_images","f":["imprint_cam.py","sim.py","test_imprint_cam.py"],"c":"480aa1f","d":3269,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_acceptance_table_and_json","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":23,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_acceptance_views_crop_is_60_percent_area","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":175,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_cli_acceptance_defaults_and_overrides","f":["sim.py","test_imprint_cam.py"],"c":"480aa1f","d":95,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_cli_matrix_defaults","f":["imprint_cam.py","sim.py","test_imprint_cam.py"],"c":"480aa1f","d":46,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_found_without_border_any_orientation","f":["imprint_cam.py","test_imprint_cam.py"],"c":"f37c4d1","d":364710,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_same_size_no_markers","f":["imprint_cam.py","test_imprint_cam.py"],"c":"f37c4d1","d":24773,"s":"pass","a":"python"}
+{"t":"test_imprint_cam.py::test_survives_simulated_print_and_photo","f":["imprint_cam.py","sim.py","test_imprint_cam.py"],"c":"f37c4d1","d":1789949,"s":"pass","a":"python"}

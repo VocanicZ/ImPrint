@@ -1,12 +1,17 @@
 """Simulated print -> photo channel, and a BER benchmark over strength/axis.
 
 Usage: python sim.py [images...] [--deltas 1.5,2] [--presets easy,hard,curled,gray] [--trials 2]
+       nice python sim.py --acceptance [--quick] [--trials 5] [--presets ...] [--out results/acceptance]
 
 A predictor only: real printers/phones decide. Use it to pick starting values,
 then confirm with the printed test sheet.
 """
 import argparse
 import glob
+import inspect
+import json
+import os
+import sys
 
 import cv2
 import numpy as np
@@ -152,15 +157,132 @@ def channel(rgb, rng, preset, print_w=1772, paper=0.08):
     return camera(halftone(img, rng=rng, mono=mono), rng, **cam)
 
 
+# ---------------------------------------------------------------- PRD #1 acceptance benchmark
+
+SSIM_MIN, MEAN_DL_MAX = 0.95, 1.0
+GEOMETRY = ("clean", "rot90", "rot180", "rot270", "mirror", "crop60")   # must decode 100%
+PRINT_MIN = {   # image -> preset -> minimum simulated print+photo decode rate
+    "kodim23": dict(easy=0.8, gray=0.8, hard=0.8, curled=0.8),
+    "kodim05": dict(easy=0.6, gray=0.6),
+    "kodim08": dict(easy=0.6, gray=0.6),
+}
+PAYLOAD = b"IMPRINT1"
+
+
+def _rate_row(image, name, m, need):
+    if m is None:
+        return dict(image=image, criterion=name, measured="not run", threshold=f">= {need:.2f}", passed=None)
+    r = m["ok"] / m["n"]
+    return dict(image=image, criterion=name, measured=f"{m['ok']}/{m['n']} ({r:.2f})",
+                threshold=f">= {need:.2f}", passed=r >= need)
+
+
+def criteria(results: dict) -> tuple[list[dict], str]:
+    """Score measured results against every PRD #1 criterion.
+
+    results: image -> dict(ssim, mean_dL, geometry={view: {ok, n}}, print={preset: {ok, n}}).
+    Returns (rows, verdict). A row's passed is None when it was not measured; the verdict is
+    FAIL if any row fails, INCOMPLETE if some were not measured, else PASS."""
+    rows = []
+    for image, r in results.items():
+        rows.append(dict(image=image, criterion="SSIM", measured=f"{r['ssim']:.4f}",
+                         threshold=f">= {SSIM_MIN}", passed=r["ssim"] >= SSIM_MIN))
+        rows.append(dict(image=image, criterion="mean dL", measured=f"{r['mean_dL']:.2f}",
+                         threshold=f"<= {MEAN_DL_MAX}", passed=r["mean_dL"] <= MEAN_DL_MAX))
+        rows += [_rate_row(image, f"decode {v}", r["geometry"].get(v), 1.0) for v in GEOMETRY]
+        rows += [_rate_row(image, f"print {p}", r["print"].get(p), need)
+                 for p, need in PRINT_MIN.get(image, {}).items()]
+    passed = [x["passed"] for x in rows]
+    verdict = "FAIL" if False in passed else "INCOMPLETE" if None in passed else "PASS"
+    return rows, verdict
+
+
+def format_table(rows: list[dict], verdict: str) -> str:
+    out = ["| image | criterion | measured | threshold | result |", "|---|---|---|---|---|"]
+    out += [f"| {x['image']} | {x['criterion']} | {x['measured']} | {x['threshold']} | "
+            f"{ {True: 'PASS', False: 'FAIL', None: 'SKIP'}[x['passed']] } |" for x in rows]
+    return "\n".join(out) + f"\n\nverdict: {verdict}\n"
+
+
+def write_report(out_dir, config: dict, results: dict) -> tuple[list[dict], str]:
+    rows, verdict = criteria(results)
+    with open(os.path.join(out_dir, "acceptance.json"), "w") as f:
+        json.dump(dict(config=config, verdict=verdict, criteria=rows, results=results), f, indent=1)
+    return rows, verdict
+
+
+def views(enc: np.ndarray, rng) -> dict:
+    """The geometric views that must decode: turned, mirrored, and a random 60%-area crop."""
+    h, w = enc.shape[:2]
+    ch, cw = int(h * 0.6 ** 0.5), int(w * 0.6 ** 0.5)
+    y, x = rng.integers(0, h - ch + 1), rng.integers(0, w - cw + 1)
+    return dict(clean=enc, rot90=np.rot90(enc), rot180=np.rot90(enc, 2), rot270=np.rot90(enc, 3),
+                mirror=enc[:, ::-1], crop60=enc[y:y + ch, x:x + cw])
+
+
+def _decodes(img: np.ndarray) -> bool:
+    return any(f["payload"] == PAYLOAD for f in ic.decode(np.ascontiguousarray(img))["found"])
+
+
+def measure(path: str, trials: int, presets: list[str], print_cm: float, out_dir: str) -> dict:
+    """Encode one image at default strength; measure visibility, geometric and print+photo decode
+    rates; write the encoded image, its x10 difference view and its strength ladder."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    log = lambda *a: print(f"[{name}]", *a, file=sys.stderr, flush=True)
+    img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB)
+    enc, st = ic.encode(img, PAYLOAD, subblock_px=ic.subblock_for_print(img.shape[1], print_cm * 10))
+    diff = np.clip(np.abs(enc.astype(int) - img.astype(int)) * 10, 0, 255).astype(np.uint8)
+    for tag, im in (("enc", enc), ("diff_x10", diff), ("ladder", ic.make_ladder(img)[0])):
+        cv2.imwrite(os.path.join(out_dir, f"{name}_{tag}.png"), cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
+    log(f"SSIM {st['ssim']}  mean dL {st['mean_dL']}")
+    geometry = {v: dict(ok=0, n=0) for v in GEOMETRY}
+    for t in range(trials):   # decode is deterministic: only the random crop changes between trials
+        for v, im in views(enc, np.random.default_rng(t + 1)).items():
+            if t == 0 or v == "crop60":
+                geometry[v]["ok"] += _decodes(im)
+                geometry[v]["n"] += 1
+    log("geometry", {v: f"{m['ok']}/{m['n']}" for v, m in geometry.items()})
+    prints = {}
+    for p in [p for p in presets if p in PRINT_MIN.get(name, {})]:
+        ok = sum(_decodes(channel(enc, np.random.default_rng(t + 1), p, print_w=int(print_cm / 2.54 * 300)))
+                 for t in range(trials))
+        prints[p] = dict(ok=int(ok), n=trials)
+        log(f"print {p} {ok}/{trials}")
+    return dict(st, geometry=geometry, print=prints)
+
+
+def acceptance(images: list[str], trials: int, presets: list[str], print_cm: float, out_dir: str) -> str:
+    """Run the PRD #1 benchmark; print the criteria table; write acceptance.json and images."""
+    os.makedirs(out_dir, exist_ok=True)
+    config = dict(images=images, trials=trials, presets=presets, print_cm=print_cm,
+                  delta=inspect.signature(ic.encode).parameters["delta"].default)
+    results = {os.path.splitext(os.path.basename(p))[0]: measure(p, trials, presets, print_cm, out_dir)
+               for p in images}
+    rows, verdict = write_report(out_dir, config, results)
+    print(format_table(rows, verdict), flush=True)
+    return verdict
+
+
 def main():
     """Decode-rate matrix: images x strengths x presets, through the simulated print+photo."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("images", nargs="*", default=sorted(glob.glob("testdata/*.png")))
+    ap.add_argument("images", nargs="*")
     ap.add_argument("--deltas", default="1.5,2")
-    ap.add_argument("--presets", default=",".join(PRESETS))
-    ap.add_argument("--trials", type=int, default=2)
+    ap.add_argument("--presets")
+    ap.add_argument("--trials", type=int)
     ap.add_argument("--print-cm", type=float, default=15.0)
+    ap.add_argument("--acceptance", action="store_true", help="score every PRD #1 criterion (5 trials)")
+    ap.add_argument("--quick", action="store_true", help="acceptance on kodim23 only, 1 trial")
+    ap.add_argument("--out", default="results/acceptance", help="acceptance output dir")
     args = ap.parse_args()
+    if args.acceptance or args.quick:
+        images = args.images or (["testdata/kodim23.png"] if args.quick else sorted(glob.glob("testdata/*.png")))
+        trials = args.trials or (1 if args.quick else 5)
+        presets = args.presets.split(",") if args.presets else list(PRESETS)
+        sys.exit(acceptance(images, trials, presets, args.print_cm, args.out) != "PASS")
+    args.images = args.images or sorted(glob.glob("testdata/*.png"))
+    args.presets = args.presets or ",".join(PRESETS)
+    args.trials = args.trials or 2
     print("| image | delta | SSIM | mean dL | clean file | " + " | ".join(args.presets.split(",")) + " |")
     print("|---|---|---|---|---|" + "---|" * len(args.presets.split(",")))
     for path in args.images:
