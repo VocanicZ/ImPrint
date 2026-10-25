@@ -310,6 +310,21 @@ Open issues with:
 
 The code is intentionally modular; PRs that improve determinism, decoding robustness, or human-factors are welcome.
 
+### Test loop (rtdd → ci-local)
+
+The suite is slow (each test encodes/decodes a full image), so don't rerun all of it on every edit. [rtdd](https://github.com/VocanicZ/rtdd) keeps a per-test coverage map (`.rtdd/map.jsonl`, committed) and runs only the tests that cover your change:
+
+```bash
+rtdd which --base origin/camera-robust   # tests covering your diff + changed lines nothing covers; runs nothing
+rtdd run   --base origin/camera-robust   # run just those tests, refresh their map rows
+scripts/ci-local.sh                      # full gate before you push/merge
+```
+
+* `rtdd` runs pytest through `scripts/rtdd-pytest.sh` (adapter: `.rtdd/adapters/python.yaml`, which overrides rtdd's built-in `python` adapter). It reuses ci-local's `.venv`, adds `pytest-cov` + `pytest-reportlog`, and runs under `nice -n 10`.
+* An empty selection is not green. The map knows nothing about that change, so run `scripts/ci-local.sh`.
+* Keep `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` at **4 or lower**. Both scripts default to 4. Run sims under `nice` too, e.g. `OMP_NUM_THREADS=4 nice -n 10 .venv/bin/python sim.py --trials 2 photo1.png`. Several agents share the box, and unbounded BLAS threads stall every other run.
+* After adding or renaming tests, re-seed with `rtdd seed` (one full instrumented run) and commit `.rtdd/map.jsonl`. Never commit `.rtdd/junit.xml`, `.rtdd/meta.json` or `.coverage`.
+
 ---
 
 ## License
