@@ -9,9 +9,13 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   the spectrum, with no border or picture outline. The encoder first notches the image's own
   content at those three frequencies so busy texture can't drown them. Matched-filter phase gives
   the exact cell offset; the decoder then tracks the pilot outward and fits perspective + curl.
-* one DATA bit per cell - the sign of a per-cell +-1 sub-block pattern. Bits come in tiles of
-  T x T cells repeated over the whole picture, so any big-enough piece decodes (crop-robust); the
-  decoder tries every tile phase and both 180-degree twins, Reed-Solomon + CRC-32 confirm.
+* one DATA bit per cell, carried by the cell's correlation with its own +-1 sub-block pattern,
+  quantized onto a lattice (QIM): the bit is the sign near zero and flips every QIM_STEP pilot
+  amplitudes beyond, so whatever the host texture already holds there, the encoder only nudges it
+  to the nearest point that reads right - no cell is ever too busy to carry its bit. Bits come in
+  tiles of T x T cells repeated over the whole picture, so any big-enough piece decodes
+  (crop-robust); the decoder tries every tile phase and both 180-degree twins, Reed-Solomon +
+  CRC-32 confirm.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
 smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows local texture
@@ -34,7 +38,9 @@ SUBBLOCK_MM = 0.8           # target printed sub-block size
 ACT_REF = 2.0               # local |Laplacian| of L* that gets 1x strength
 MASK_LO, MASK_HI = 0.6, 2.0
 PILOT_HI = 1.5              # pilot's mask ceiling (busy texture hides it)
-SKIP = 3.0                  # skip cells whose host needs > SKIP x target to overcome
+QIM_STEP = 2.8              # data lattice: a cell's bit flips every QIM_STEP pilot amplitudes
+DATA_GAIN = 0.85            # decoder's data correlation per lattice unit (its sub-block means see a
+                            # little less of the data window than the encoder's)
 RAMP = np.arange(K) - (K - 1) / 2
 
 
@@ -131,6 +137,32 @@ def inner(b: int) -> slice:
 
 def gain(b: int) -> float:
     return float(window(b)[inner(b), inner(b)].mean())
+
+
+def qim_soft(u: np.ndarray, step: float = QIM_STEP) -> np.ndarray:
+    """Soft bit of a lattice coordinate: positive on (0, step), negative on (step, 2 step), period
+    2 step; a triangle peaking at +-step/2, so |value| is the distance to the nearest flip."""
+    return step / 2 - np.abs(np.mod(u - step / 2 + step, 2 * step) - step)
+
+
+def qim_target(u: np.ndarray, bits: np.ndarray, margin: np.ndarray, step: float = QIM_STEP) -> np.ndarray:
+    """Nearest coordinate to u whose soft bit has the sign of bits and is at least margin (capped
+    at step/2, the most a lattice cell holds): the least change that makes the cell read right."""
+    half = np.maximum(step / 2 - margin, 0.0)                    # half-width of each right zone
+    centre = bits * step / 2
+    k = np.round((u - centre) / (2 * step))
+    best = None
+    for dk in (-1, 0, 1):
+        c = centre + (k + dk) * 2 * step
+        t = np.clip(u, c - half, c + half)
+        best = t if best is None else np.where(np.abs(t - u) < np.abs(best - u), t, best)
+    return best
+
+
+def pilot_amp(chan: np.ndarray, rows: int, cols: int, c: int) -> np.ndarray:
+    """Pilot amplitude per cell (matched to the pilot's own cell shape). chan: (rows*c, cols*c)."""
+    tpl = _pilot_cell(c)
+    return (_cells(chan, c).reshape(rows * cols, c, c) * tpl).sum(axis=(1, 2)) / (np.linalg.norm(tpl) ** 2)
 
 
 def subblock_means(chan: np.ndarray, rows: int, cols: int, b: int) -> np.ndarray:
@@ -248,16 +280,18 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.0, subblock_px: int
     notch = (lum_n - lum) * room                              # only where there's room to change
     h = measure(lum + notch + pil, rows, cols, b, D)          # pilot + notch are part of what data must beat
     g = measure(field(np.ones(n, np.float32), rows, cols, b, D) * m, rows, cols, b, D)
-    dc = delta * g / gain(b)                                  # target: delta where mask = 1
-    # Informed embedding: add only what the host lacks; where it fights hard (or there is no
-    # room) skip the cell - repetition and Reed-Solomon cover it - instead of a visible push.
-    need = np.maximum(0.0, dc - s * h)
-    ok = (g > 1e-6) & (need <= SKIP * dc)
-    a = np.where(ok, s * need / np.where(ok, g, 1.0), 0.0).astype(np.float32)
-    region[..., 0] += field(a, rows, cols, b, D) * m + pil + notch
+    dc = delta * g / gain(b)                                  # margin: delta where mask = 1
+    # The lattice unit is the median pilot amplitude: the decoder measures the same median.
+    pa = pilot_amp(pil, rows, cols, c)
+    unit = float(np.median(pa[pa > 0])) if (pa > 0).any() else delta
+    # Host-interference rejection (QIM): move each cell's correlation to the nearest lattice point
+    # that reads its bit, so a busy host costs at most step/2 + margin, never a skipped cell.
+    ok = g > 1e-6                                             # no room (clipped) -> leave the cell
+    a = np.where(ok, (qim_target(h / unit, s, dc / unit) * unit - h) / np.where(ok, g, 1.0), 0.0)
+    region[..., 0] += field(a.astype(np.float32), rows, cols, b, D) * m + pil + notch
     out = to_rgb(lab)
 
-    got = s * measure(to_lab(out)[:rows * c, :cols * c, 0], rows, cols, b, D)
+    got = s * qim_soft(measure(to_lab(out)[:rows * c, :cols * c, 0], rows, cols, b, D) / unit)
     stats = dict(rows=rows, cols=cols, tile=T, tiles=round(n / T ** 2, 1), subblock_px=b, bits=nbits,
                  wrong_cells=round(float((got <= 0).mean()), 4), **visibility(rgb, out))
     return out, stats
@@ -542,10 +576,57 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, coh_min:
     return fmap, ext, len(L_)
 
 
-def read(lum: np.ndarray, model, r: int = 6) -> dict | None:
-    """Rectify the tracked lattice, align cells on the pilot, remove it, then try every payload
-    length and tile phase: soft-combine repeats, Reed-Solomon, CRC."""
+def refine(lum: np.ndarray, model, passes: int = 3, **kw):
+    """Tracking only needs enough probes to lock on; the data lattice needs every px right. Each
+    pass re-measures the pilot on a dense grid of small windows (reaching `grow` cells past the
+    area fitted so far) and refits the map to all of them; stop once a pass adds nothing."""
+    for _ in range(passes):
+        n0, model = model[2], _refine_pass(lum, model, **kw)
+        if model[2] <= n0:
+            break
+    return model
+
+
+def _refine_pass(lum: np.ndarray, model, r: int = 6, nc: int = 6, grow: float = 8,
+                 coh_min: float = 0.7, snr_min: float = 2.5):
     fmap, (x0, x1, y0, y1), nprobe = model
+    S = K * r
+    lat, pho = [], []
+    h = nc // 2                       # windows start on whole cells: pilot phase is measured from there
+    for cy in range(int(np.ceil(y0 - grow)) + h, int(y1 + grow) - h + 1, h):
+        for cx in range(int(np.ceil(x0 - grow)) + h, int(x1 + grow) - h + 1, h):
+            q = fmap(np.array([[cx, cy], [cx - h, cy - h], [cx + h, cy - h], [cx - h, cy + h], [cx + h, cy + h]]))
+            if not ((q >= 0) & (q < [lum.shape[1], lum.shape[0]])).all():
+                continue                                          # whole window in the photo: no edge bias
+            p = q[0]
+            off, coh, snr = pilot_phase(resample(lum, fmap, cx - h, cy - h, nc, nc, S), nc, S)
+            if coh >= coh_min and snr >= snr_min:
+                lat.append(np.array([cx, cy]) + (off + 0.5) % 1 - 0.5)   # the map is already close
+                pho.append(p)
+    if len(lat) < 8:
+        return model
+    L_, P_ = np.array(lat), np.array(pho)
+    o, e1, e2 = fmap(np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]))
+    (ax, ay), (bx, by) = e1 - o, e2 - o
+    cell = np.sqrt(abs(ax * by - ay * bx))                        # photo px per cell
+    H, inl = cv2.findHomography(L_, P_, cv2.RANSAC, 0.1 * cell)
+    keep = inl.ravel().astype(bool) if H is not None else np.zeros(len(L_), bool)
+    fm = fit_map(L_[keep], P_[keep], cubic=keep.sum() >= 30) if keep.sum() >= 8 else None
+    if fm is None:                                                # refit failed: keep the tracked map
+        return model
+    L_ = L_[keep]
+    return fm, (L_[:, 0].min() - nc / 2, L_[:, 0].max() + nc / 2, L_[:, 1].min() - nc / 2, L_[:, 1].max() + nc / 2), \
+        int(keep.sum())
+
+
+def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 8):
+    """Rectify the tracked lattice, align cells on the pilot and remove it. The tracked extent grows
+    by `grow` cells per side (probes near the photo edge or in busy texture fail, but the fitted map
+    still holds there); cells that don't map wholly inside the photo are dropped.
+    Returns (m (cells, K*K) pilot-free sub-block means, w per-cell trust, used, rows, cols, unit) or
+    None; unit is the median pilot amplitude, the scale of the data lattice."""
+    fmap, (x0, x1, y0, y1), nprobe = model
+    x0, x1, y0, y1 = x0 - grow, x1 + grow, y0 - grow, y1 + grow
     S = K * r
     xs, ys = np.floor(x0), np.floor(y0)                           # lattice coords are true cell coords
     ncols, nrows = int(np.ceil(x1 - xs)), int(np.ceil(y1 - ys))
@@ -574,15 +655,47 @@ def read(lum: np.ndarray, model, r: int = 6) -> dict | None:
                 better = (e > best_e)[bid]
                 best_m[better], best_p[better] = m[better], pc[better]
                 best_e = np.maximum(best_e, e)
+    q = 0.25                                                      # margin: covers the fine shifts above
+    cy, cx = np.mgrid[0:rows, 0:cols].reshape(2, -1) + np.array([ys, xs])[:, None]
+    inside = np.ones(rows * cols, bool)
+    for ox, oy in ((-q, -q), (1 + q, -q), (-q, 1 + q), (1 + q, 1 + q)):
+        p = fmap(np.c_[cx + ox, cy + oy].astype(np.float64))
+        inside &= (p[:, 0] >= 0) & (p[:, 0] < lum.shape[1]) & (p[:, 1] >= 0) & (p[:, 1] < lum.shape[0])
+    best_p = np.where(inside, best_p, 0.0)
     pos = best_p[best_p > 0]
     med = np.median(pos) if len(pos) else 1.0
-    w = np.clip(best_p / (med + 1e-9), 0, 2)                      # pilot strength = cell trust
+    # pilot strength = cell trust, averaged over neighbours: one cell's pilot reading is swamped by
+    # busy texture, the pilot's local level is not
+    blur = lambda a: cv2.GaussianBlur(a.reshape(rows, cols).astype(np.float32), (0, 0), 1.0).ravel()
+    local = blur(best_p) / np.maximum(blur(inside.astype(np.float32)), 1e-3)
+    w = np.where(inside, np.clip(local / (med + 1e-9), 0, 2), 0.0)
     m = best_m.reshape(rows * cols, K * K)
     used = w > 0.2
     if used.sum() < 16:
         return None
     m = m - np.average(m[used], axis=0, weights=w[used])          # remove the pilot (same in every cell)
+    return m, w, used, rows, cols, float(med)
 
+
+def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -> float:
+    """Decoder correlation per lattice unit. Starts from the pilot (unit * DATA_GAIN), then fits the lattice
+    itself within +-40% (print blur and the camera treat data and pilot a bit differently): the
+    scale at which the most cells sit clear of a bit flip."""
+    s0 = unit * DATA_GAIN
+    ks = np.arange(-6, 7)
+    fit = [float((w[used] * np.clip(np.abs(qim_soft(c[used] / (s0 * 2 ** (k / 12)))) / 0.5, 0, 1)).sum())
+           - 1e-6 * abs(k) for k in ks]                       # ties go to the pilot's estimate
+    return s0 * 2 ** (ks[int(np.argmax(fit))] / 12)
+
+
+def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
+    """Try every payload length and tile phase on the pilot-free cells: soft-combine repeats,
+    Reed-Solomon, CRC."""
+    cm = cell_means(lum, model, r, grow)
+    if cm is None:
+        return None
+    m, w, used, rows, cols, unit = cm
+    nprobe = model[2]
     ii, jj = np.mgrid[0:rows, 0:cols]
     ii, jj = ii.ravel(), jj.ravel()
     for nb in range(1, MAX_BYTES + 1):
@@ -591,7 +704,8 @@ def read(lum: np.ndarray, model, r: int = 6) -> dict | None:
             break
         D = pats(T * T).reshape(T * T, K * K)
         bm = bit_map(T * T, nbits)
-        V = (m @ D.T) / (K * K) * w[:, None]                     # cell x tile-position correlation
+        C = (m @ D.T) / (K * K)                                  # cell x tile-position correlation
+        V = C * w[:, None]
         lim = np.median(np.abs(V[used])) + 1e-9               # soft limiter: no single cell outvotes its repeats
         V = np.clip(V, -lim, lim)
         cand = []
@@ -602,12 +716,17 @@ def read(lum: np.ndarray, model, r: int = 6) -> dict | None:
                 cand.append((float(np.abs(soft).sum()), soft, t))
         cand.sort(key=lambda c: -c[0])
         for _, soft, t in cand[:3]:
-            payload = read_soft(soft, nb)
-            if payload:
-                s = to_bits(payload)[bm[t]]
-                v = V[np.arange(len(t)), t]
-                return dict(payload=payload, raw_ber=round(float((s[used] * v[used] <= 0).mean()), 4),
-                            cells=int(used.sum()), tiles=round(used.sum() / T ** 2, 1), probes=nprobe)
+            c = C[np.arange(len(t)), t]
+            q = qim_soft(c / lattice_scale(c, w, used, unit)) * w   # lattice soft bits (primary)
+            for v in (q, V[np.arange(len(t)), t]):               # then plain sign + limiter
+                soft = np.bincount(bm[t], v, nbits)
+                payload = read_soft(soft, nb)
+                if payload:
+                    bits = to_bits(payload)
+                    s = bits[bm[t]]
+                    return dict(payload=payload, raw_ber=round(float((s[used] * v[used] <= 0).mean()), 4),
+                                bit_ber=round(float((np.sign(soft) != bits).mean()), 4),
+                                cells=int(used.sum()), tiles=round(used.sum() / T ** 2, 1), probes=nprobe)
     return None
 
 
@@ -625,6 +744,7 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
         res = None
         for sgn in (1, -1):
             model = track(lum, seed, sgn)
+            model = refine(lum, model) if model else None
             res = read(lum, model) if model else None
             if res:
                 break
