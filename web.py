@@ -22,11 +22,29 @@ LOG = ROOT / "results" / "decode_log.csv"
 app = FastAPI(title="ImPrint")
 
 
+MAX_UPLOAD = 60 * 1024 * 1024      # bytes
+MAX_PIXELS = 50_000_000            # a 50 MP phone photo is fine; a decompression bomb is not
+
+
 def read_rgb(data: bytes) -> np.ndarray:
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(413, "file too large")
+    try:
+        w, h = Image.open(io.BytesIO(data)).size       # header only: check before decoding pixels
+    except Exception:
+        raise HTTPException(400, "not an image")
+    if w * h > MAX_PIXELS:
+        raise HTTPException(413, f"image too large ({w}x{h}); max {MAX_PIXELS // 1_000_000} MP")
     img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)   # honours EXIF rotation
     if img is None:
         raise HTTPException(400, "not an image")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def cell(v) -> str:
+    """CSV field safe to open in a spreadsheet (no formula injection)."""
+    v = str(v)[:200]
+    return "'" + v if v[:1] in ("=", "+", "-", "@", "\t", "\r") else v
 
 
 def b64png(rgb: np.ndarray, max_side: int | None = None, dpi: float | None = None) -> str:
@@ -75,8 +93,8 @@ async def decode(file: UploadFile = File(...), label: str = Form("")):
         w = csv.writer(fh)
         if new:
             w.writerow(["time", "label", "photo", "found", "payloads", "raw_ber", "seconds"])
-        w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), label, f"{rgb.shape[1]}x{rgb.shape[0]}", len(found),
-                    " ".join(f["text"] for f in found), " ".join(str(f["raw_ber"]) for f in found), secs])
+        w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), cell(label), f"{rgb.shape[1]}x{rgb.shape[0]}", len(found),
+                    cell(" ".join(f["text"] for f in found)), " ".join(str(f["raw_ber"]) for f in found), secs])
     return dict(found=found, seeds=r["seeds"], tried=r["tried"], overlay=b64png(r["overlay"]),
                 seconds=secs, photo=f"{rgb.shape[1]}x{rgb.shape[0]}")
 
