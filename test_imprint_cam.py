@@ -119,16 +119,21 @@ def test_refine_and_read_fall_back_without_a_pilot(monkeypatch):
 
 def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
     """Both twins locked onto a dense refit and neither read: other seeds in that picture refit to
-    the same lattices, so they're skipped; a seed elsewhere (another picture) still gets its turn."""
-    seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300)]
+    the same lattices, so they're skipped; a seed elsewhere (another picture) still gets its turn.
+    Pictures: x < 200 both twins lock; x 200-400 neither; x > 400 one twin, and its turn-around."""
+    seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300, 500, 520)]
     monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
     tracked = []
     monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked.append(seed[1][0]) or
-                        (lambda q, c=seed[1]: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 9))
-    monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 40 if m[0](np.zeros((1, 2)))[0, 0] < 200 else 5))
+                        (lambda q, c=seed[1]: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 9 if sgn > 0 else 8))
+
+    def refine(lum, m):
+        x = m[0](np.zeros((1, 2)))[0, 0]
+        return m[0], m[1], 40 if x < 200 or (x > 400 and m[2] != 8) else 5
+    monkeypatch.setattr(ic, "refine", refine)
     monkeypatch.setattr(ic, "read", lambda lum, m: None)
-    r = ic.decode(np.zeros((100, 400, 3), np.uint8))
-    assert r["tried"] == 2 and tracked == [40, 40, 300, 300] and r["found"] == []
+    r = ic.decode(np.zeros((100, 600, 3), np.uint8))
+    assert r["tried"] == 3 and tracked == [40, 40, 300, 300, 500, 500] and r["found"] == []
 
 
 def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
