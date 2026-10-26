@@ -34,12 +34,133 @@ def test_found_without_border_any_orientation():
     for view in views:
         found = ic.decode(np.ascontiguousarray(view))["found"]
         assert found and found[0]["payload"] == b"hello", view.shape
+        assert found[0]["bit_ber"] == 0, found[0]                   # no bit wrong before Reed-Solomon
 
 
 def test_survives_simulated_print_and_photo():
     enc, _ = ic.encode(photo_like(), b"IMPRINT1", delta=2, subblock_px=6)
     found = ic.decode(sim.channel(enc, np.random.default_rng(3), "easy"))["found"]
     assert found and found[0]["payload"] == b"IMPRINT1"
+
+
+def test_qim_target_reads_right_at_bounded_cost():
+    rng = np.random.default_rng(0)
+    u = rng.uniform(-20, 20, 5000)                       # host projections far past several bit flips
+    bits = rng.choice([-1.0, 1.0], u.size)
+    margin = rng.uniform(0.2, 2.5, u.size)               # past step/2 = 1.5: capped
+    t = ic.qim_target(u, bits, margin)
+    got = bits * ic.qim_soft(t)
+    assert (got >= np.minimum(margin, ic.QIM_STEP / 2) - 1e-9).all()
+    assert (np.abs(t - u) <= ic.QIM_STEP / 2 + np.minimum(margin, ic.QIM_STEP / 2) + 1e-9).all()
+    fine = bits * ic.qim_soft(u) >= margin                # already reads right with margin: untouched
+    assert fine.any() and np.array_equal(t[fine], u[fine])
+
+
+def test_qim_soft_is_sign_near_zero_and_flips_every_step():
+    B = ic.QIM_STEP
+    u = np.array([0.1, B / 2, B - 0.1, B + 0.1, 1.5 * B, -0.1, -B / 2, 2 * B + 0.1])
+    assert np.array_equal(np.sign(ic.qim_soft(u)), [1, 1, 1, -1, -1, -1, -1, 1])
+    assert ic.qim_soft(np.array([B / 2]))[0] == B / 2 and abs(ic.qim_soft(np.array([B]))[0]) < 1e-12
+
+
+def test_adversarial_host_still_decodes():
+    """A host whose texture IS the data patterns, opposing every payload bit at several times the
+    embedding strength: sign margins would have to skip every cell; the lattice just steps over."""
+    payload = b"hello"
+    img = photo_like()
+    h, w = img.shape[:2]
+    b = 6
+    c = ic.K * b
+    rows, cols, T = h // c, w // c, ic.tile_size(len(payload))
+    ii, jj = np.mgrid[0:rows, 0:cols]
+    t = ((ii % T) * T + (jj % T)).ravel()
+    s = ic.to_bits(payload)[ic.bit_map(T * T, 8 * ic.frame_len(len(payload)))[t]]
+    lab = ic.to_lab(img)
+    lab[:rows * c, :cols * c, 0] += ic.field((-12 * s).astype(np.float32), rows, cols, b, ic.pats(T * T)[t])
+    host = ic.to_rgb(lab)
+    enc, st = ic.encode(host, payload, delta=2, subblock_px=b)
+    assert st["wrong_cells"] < 0.02, st
+    found = ic.decode(enc)["found"]
+    assert found and found[0]["payload"] == payload and found[0]["bit_ber"] == 0
+
+
+def test_lattice_scale_recovers_decoder_gain():
+    rng = np.random.default_rng(1)
+    n = 3000
+    bits = rng.choice([-1.0, 1.0], n)
+    u = ic.qim_target(rng.normal(0, 2.5, n), bits, rng.uniform(0.6, 1.5, n))
+    w, used = rng.uniform(0.3, 2, n), np.ones(n, bool)
+    for gain in (0.8, 1.0, 1.25):                       # print blur / camera: data vs pilot gain drifts
+        c = u * 2.0 * ic.DATA_GAIN * gain + rng.normal(0, 0.05, n)
+        assert abs(ic.lattice_scale(c, w, used, 2.0) / (2.0 * ic.DATA_GAIN * gain) - 1) < 0.07, gain
+
+
+def test_refine_snaps_map_onto_the_pilot():
+    enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
+    lum = ic.to_lab(enc)[..., 0]
+    c = ic.K * 6
+    truth = lambda q: q * c - 0.5
+    off = lambda q: truth(q * 1.004 + [0.12, -0.08])     # 0.4% scale and ~3 px off
+    model = ic.refine(lum, (off, (8, 14, 8, 14), 4))       # small tracked extent: refine reaches out
+    g = np.stack(np.meshgrid(np.arange(2, 42, 4.0), np.arange(2, 28, 4.0)), -1).reshape(-1, 2)
+    assert model[2] >= 30 and np.abs(model[0](g) - truth(g)).max() < 0.6
+    assert model[1][1] - model[1][0] > 30                   # extent now covers most of the picture
+
+
+def test_refine_and_read_fall_back_without_a_pilot(monkeypatch):
+    flat = np.full((400, 600), 50.0, np.float32)          # no pilot anywhere: nothing to refit to
+    model = (lambda q: q * 24 - 0.5, (2.0, 20.0, 2.0, 12.0), 4)
+    assert ic.refine(flat, model) is model
+    assert ic.read(flat, (model[0], (0.0, 2.0, 0.0, 2.0), 4), grow=0) is None   # too few cells
+    monkeypatch.setattr(ic, "pilot_phase", lambda patch, nc, S: (np.zeros(2), 1.0, 9.0))
+    monkeypatch.setattr(ic.cv2, "findHomography", lambda *a, **k: (None, None))
+    assert ic.refine(flat, model) is model                # coherent windows, but the refit fails
+
+
+def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
+    """Both twins locked onto a dense refit and neither read: other seeds in that picture refit to
+    the same lattices, so they're skipped; a seed elsewhere (another picture) still gets its turn.
+    Pictures: x < 200 both twins lock; x 200-400 neither; x > 400 one twin, and its turn-around."""
+    seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300, 500, 520)]
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    tracked = []
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked.append(seed[1][0]) or
+                        (lambda q, c=seed[1]: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 9 if sgn > 0 else 8))
+
+    def refine(lum, m):
+        x = m[0](np.zeros((1, 2)))[0, 0]
+        return m[0], m[1], 40 if x < 200 or (x > 400 and m[2] != 8) else 5
+    monkeypatch.setattr(ic, "refine", refine)
+    monkeypatch.setattr(ic, "read", lambda lum, m: None)
+    r = ic.decode(np.zeros((100, 600, 3), np.uint8))
+    assert r["tried"] == 3 and tracked == [40, 40, 300, 300, 500, 500] and r["found"] == []
+
+
+def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
+    """Only the wrong 180-degree twin locks on; the right one tracks badly. decode refits the
+    locked lattice turned around, and that reads."""
+    c = np.array([100.0, 50.0])
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [(9.0, c, np.array([10.0, 0]), np.array([0, 10.0]))])
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: (lambda q: c + 10 * q if sgn > 0 else c + 3 - 10 * q,
+                                                             (-5.0, 5.0, -5.0, 5.0), 9))
+    monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 5 if m[0](np.zeros((1, 2)))[0, 0] != c[0] else 40))
+    right = lambda m: np.allclose(m[0](np.array([[0.0, 0.0], [1.0, 0.0]])), [c, c - [10, 0]])
+    monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"twin") if right(m) else None)
+    found = ic.decode(np.zeros((100, 400, 3), np.uint8))["found"]
+    assert [f["payload"] for f in found] == [b"twin"]
+    assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
+
+
+def test_cell_means_grows_but_drops_cells_outside_the_photo():
+    enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
+    lum = ic.to_lab(enc)[..., 0]
+    c = ic.K * 6
+    model = (lambda q: q * c - 0.5, (0.0, 10.0, 0.0, 10.0), 4)     # tracked: one corner of the picture
+    m, w, used, rows, cols, unit = ic.cell_means(lum, model, grow=8)
+    assert (rows, cols) == (26, 26) and unit > 0
+    inside = np.zeros((rows, cols), bool)
+    inside[8:, 8:] = True                                 # lattice -8..18: cells < 0 lie off the photo
+    assert not used.reshape(rows, cols)[~inside].any() and used.reshape(rows, cols)[inside].mean() > 0.5
 
 
 def _passing(img="kodim23"):
@@ -101,7 +222,7 @@ def _fake_codec(monkeypatch):
 
     def decode(rgb, *a, **k):
         calls.append(rgb.shape)
-        return dict(found=[] if rgb.shape[:2] == (99, 99) else [dict(payload=sim.PAYLOAD)])
+        return dict(found=[] if rgb.shape[:2] == (99, 99) else [dict(payload=sim.PAYLOAD, bit_ber=0.0125)])
     monkeypatch.setattr(ic, "decode", decode)
     monkeypatch.setattr(sim, "channel", lambda enc, rng, preset, print_w: np.zeros((99, 99, 3), np.uint8))
     return calls
@@ -120,6 +241,7 @@ def test_acceptance_run_writes_report_and_images(tmp_path, monkeypatch, capsys):
     r = rep["results"]["kodim23"]
     assert r["geometry"]["clean"] == dict(ok=1, n=1) and r["geometry"]["crop60"] == dict(ok=2, n=2)
     assert r["print"] == dict(easy=dict(ok=0, n=2), hard=dict(ok=0, n=2))
+    assert r["bit_ber"] == {v: 0.0125 for v in sim.GEOMETRY}      # reported for every decoded view
     assert rep["config"]["trials"] == 2 and rep["config"]["delta"] == 2.0 and rep["verdict"] == "FAIL"
     assert "| kodim23 | print gray | not run |" in capsys.readouterr().out
     img = cv2.imread(str(src)).astype(int)

@@ -220,8 +220,9 @@ def views(enc: np.ndarray, rng) -> dict:
                 mirror=enc[:, ::-1], crop60=enc[y:y + ch, x:x + cw])
 
 
-def _decodes(img: np.ndarray) -> bool:
-    return any(f["payload"] == PAYLOAD for f in ic.decode(np.ascontiguousarray(img))["found"])
+def _decodes(img: np.ndarray) -> dict | None:
+    """The decode that found PAYLOAD (raw_ber, bit_ber, ...), or None."""
+    return next((f for f in ic.decode(np.ascontiguousarray(img))["found"] if f["payload"] == PAYLOAD), None)
 
 
 def measure(path: str, trials: int, presets: list[str], print_cm: float, out_dir: str) -> dict:
@@ -236,19 +237,25 @@ def measure(path: str, trials: int, presets: list[str], print_cm: float, out_dir
         cv2.imwrite(os.path.join(out_dir, f"{name}_{tag}.png"), cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
     log(f"SSIM {st['ssim']}  mean dL {st['mean_dL']}")
     geometry = {v: dict(ok=0, n=0) for v in GEOMETRY}
+    ber = {}                  # bit error rate after combining repeats, before Reed-Solomon (decoded views)
     for t in range(trials):   # decode is deterministic: only the random crop changes between trials
         for v, im in views(enc, np.random.default_rng(t + 1)).items():
             if t == 0 or v == "crop60":
-                geometry[v]["ok"] += _decodes(im)
+                f = _decodes(im)
+                geometry[v]["ok"] += f is not None
                 geometry[v]["n"] += 1
+                if f and f.get("bit_ber") is not None:
+                    ber.setdefault(v, []).append(f["bit_ber"])
     log("geometry", {v: f"{m['ok']}/{m['n']}" for v, m in geometry.items()})
+    ber = {v: round(float(np.mean(b)), 4) for v, b in ber.items()}
+    log("bit BER after combining", ber)
     prints = {}
     for p in [p for p in presets if p in PRINT_MIN.get(name, {})]:
         ok = sum(_decodes(channel(enc, np.random.default_rng(t + 1), p, print_w=int(print_cm / 2.54 * 300)))
-                 for t in range(trials))
+                 is not None for t in range(trials))
         prints[p] = dict(ok=int(ok), n=trials)
         log(f"print {p} {ok}/{trials}")
-    return dict(st, geometry=geometry, print=prints)
+    return dict(st, geometry=geometry, print=prints, bit_ber=ber)
 
 
 def acceptance(images: list[str], trials: int, presets: list[str], print_cm: float, out_dir: str) -> str:
