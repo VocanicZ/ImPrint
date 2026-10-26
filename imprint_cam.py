@@ -19,8 +19,10 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   confirm.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
-smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows local texture
-and gamut headroom: flat areas get little, clipped areas (pure black/white, saturated) get nothing.
+smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows a perceptual
+visibility threshold (luminance adaptation, the CSF at the printed pattern's frequency, contrast
+masking) and gamut headroom: flat areas get little, clipped areas (pure black/white, saturated) get
+nothing.
 """
 from __future__ import annotations
 
@@ -35,9 +37,11 @@ SEED = 0x1A9
 MAX_BYTES = 32
 PILOT = 1.0                 # pilot (sync) amplitude relative to the data strength
 SUBBLOCK_MM = 0.8           # target printed sub-block size
-ACT_REF = 2.0               # local |Laplacian| of L* that gets 1x strength
-MASK_LO, MASK_HI = 0.6, 2.0
-PILOT_HI = 1.5              # pilot's mask ceiling (busy texture hides it)
+VIEW_MM = 350.0             # viewing distance the perceptual mask assumes (a print at arm's length)
+JND_FLAT = 0.2              # printed grating's flat-area threshold, x Chou-Li's display JND
+JND_REF = 1.0               # visibility threshold (L*) that gets 1x strength
+MASK_LO, MASK_HI = 0.6, 3.2 # flat floor: a QIM cell on a flat host costs only its margin
+PILOT_HI = 1.5              # pilot's mask ceiling: it sets the data lattice unit, so more costs energy
 QIM_STEP = 2.8              # data lattice: a cell's bit flips every QIM_STEP pilot amplitudes
 DATA_GAIN = 0.85            # decoder's data correlation per lattice unit (its sub-block means see a
                             # little less of the data window than the encoder's)
@@ -184,13 +188,53 @@ def field(amps: np.ndarray, rows: int, cols: int, b: int, p: np.ndarray) -> np.n
     return f.reshape(rows * K * b, cols * K * b)
 
 
-def mask(lum: np.ndarray, b: int, hi: float = MASK_HI) -> np.ndarray:
-    """Per-pixel strength multiplier: high in real texture, low in flat areas."""
-    act = cv2.GaussianBlur(np.abs(cv2.Laplacian(lum, cv2.CV_32F)), (0, 0), b / 2)
-    return cv2.GaussianBlur(np.clip(act / ACT_REF, MASK_LO, hi), (0, 0), b / 2)
+def _lstar(gray: np.ndarray) -> np.ndarray:
+    """sRGB gray level (0..255) -> L*."""
+    v = np.clip(gray, 0, 255) / 255
+    y = np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+    return np.where(y > 0.008856, 116 * np.cbrt(y) - 16, 903.3 * y)
 
 
-def headroom(lab: np.ndarray, amp: float) -> np.ndarray:
+def _gray(lum: np.ndarray) -> np.ndarray:
+    """L* -> sRGB gray level (0..255)."""
+    y = np.where(lum > 8, ((lum + 16) / 116) ** 3, lum / 903.3)
+    return 255 * np.where(y <= 0.0031308, 12.92 * y, 1.055 * np.cbrt(y) ** (3 / 2.4) - 0.055)
+
+
+def csf(f: float) -> float:
+    """Mannos-Sakrison contrast sensitivity at f cycles/degree (peak ~1 near 8 cpd)."""
+    return 2.6 * (0.0192 + 0.114 * f) * np.exp(-(0.114 * f) ** 1.1)
+
+
+def jnd(lum: np.ndarray, b: int) -> np.ndarray:
+    """Per-pixel visibility threshold (L*) of the b-px sub-block pattern, printed at SUBBLOCK_MM and
+    seen from VIEW_MM:
+    * luminance adaptation: Chou & Li's (1995) threshold on the local background gray (dark and
+      bright backgrounds hide more), converted to L*;
+    * the CSF at the pattern's own frequency (period two sub-blocks) scales that base threshold:
+      what the eye needs to see THIS grating, not a flat step;
+    * contrast masking: the image's own band at the pattern's scale (sub-block to two sub-blocks)
+      raises the threshold in proportion to its local RMS once it exceeds the base (Legge & Foley
+      1980, exponent 1).
+    Pooled over a quarter sub-block, so smooth pixels next to texture don't borrow its masking."""
+    lum = lum.astype(np.float32)
+    g = _gray(cv2.GaussianBlur(lum, (0, 0), b))
+    t_gray = np.where(g <= 127, 17 * (1 - np.sqrt(np.maximum(g, 0) / 127)) + 3, 3 / 128 * (g - 127) + 3)
+    f = VIEW_MM * np.pi / 180 / (2 * SUBBLOCK_MM)              # cycles/degree of the data pattern
+    t0 = JND_FLAT * float(csf(8.0) / csf(f)) * (_lstar(g + t_gray / 2) - _lstar(g - t_gray / 2))
+    band = cv2.GaussianBlur(lum, (0, 0), b / 4) - cv2.GaussianBlur(lum, (0, 0), b / 2)
+    contrast = np.sqrt(cv2.GaussianBlur(band * band, (0, 0), b / 4))
+    return np.maximum(t0, contrast).astype(np.float32)
+
+
+def mask(lum: np.ndarray, b: int) -> np.ndarray:
+    """Per-pixel strength multiplier: the visibility threshold in units of JND_REF - high in real
+    texture, low in flat areas. Pooled over a sub-block: print blur and the decoder's sub-block
+    means wash out finer modulation, so it would cost energy and carry nothing."""
+    return cv2.GaussianBlur(np.clip(jnd(lum, b) / JND_REF, MASK_LO, MASK_HI), (0, 0), b)
+
+
+def headroom(lab: np.ndarray, amp: float | np.ndarray) -> np.ndarray:
     """Fraction (0..1) of a +-amp L* swing each pixel can take symmetrically before RGB clips.
     A one-sided swing (pure black can't go down) would just shift brightness: visible, no signal."""
     l0 = to_lab(to_rgb(lab))[..., 0]
@@ -313,7 +357,7 @@ def subblock_for_print(width_px: int, print_mm: float) -> int:
     return max(4, int(round(width_px * SUBBLOCK_MM / print_mm)))
 
 
-def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.0, subblock_px: int = 8):
+def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.2, subblock_px: int = 8):
     """Embed payload into an RGB uint8 image. Returns (image of the same size, stats)."""
     nb = len(payload)
     if not 1 <= nb <= MAX_BYTES:
@@ -334,11 +378,15 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.0, subblock_px: int
     lab = to_lab(rgb)
     region = lab[:rows * c, :cols * c]                         # whole cells only; view into lab
     lum = region[..., 0].copy()
-    room = headroom(region, (2.5 * MASK_HI + PILOT * PILOT_HI) * delta)
+    m = mask(lum, b)
+    pm = np.minimum(m, PILOT_HI)
+    room = headroom(region, (2.5 * m + PILOT * pm) * delta)   # the swing this pixel will get
     room = -cv2.dilate(-room, np.ones((b, b), np.uint8))      # erode: whole sub-block must have room
-    m = mask(lum, b) * room
-    # the smooth pilot may go stronger where heavy texture hides it; flat areas stay as faint
-    pil = PILOT * delta * pilot_field(rows * c, cols * c, c) * mask(lum, b, PILOT_HI) * room
+    pm = pm * room
+    m = m * room
+    # the pilot follows the same mask, but only up to PILOT_HI: it sets the lattice unit, and a
+    # bigger unit makes every cell's QIM nudge bigger
+    pil = PILOT * delta * pilot_field(rows * c, cols * c, c) * pm
     lum_n = notch_pilot(lum, c)
     notch = (lum_n - lum) * room                              # only where there's room to change
     h = measure(lum + notch + pil, rows, cols, b, D)          # pilot + notch are part of what data must beat
@@ -787,8 +835,10 @@ def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
                 if payload:
                     bits = to_bits(payload)
                     s = bits[bm[t]]
+                    e = bits * soft / np.maximum(np.bincount(bm[t], minlength=nbits), 1)  # per-bit evidence
                     return dict(payload=payload, raw_ber=round(float((s[used] * v[used] <= 0).mean()), 4),
                                 bit_ber=round(float((np.sign(soft) != bits).mean()), 4),
+                                bit_snr=round(float(e.mean() / (e.std() + 1e-9)), 2),
                                 cells=int(used.sum()), tiles=round(used.sum() / T ** 2, 1), probes=nprobe)
     return None
 

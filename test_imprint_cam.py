@@ -238,6 +238,38 @@ def test_cell_means_grows_but_drops_cells_outside_the_photo():
     assert not used.reshape(rows, cols)[~inside].any() and used.reshape(rows, cols)[inside].mean() > 0.5
 
 
+def zones(h=288, w=576, seed=0):
+    """Three side-by-side zones: flat mid-gray | texture at the pattern's scale | clipped (pure white
+    over pure black)."""
+    rng = np.random.default_rng(seed)
+    z = w // 3
+    img = np.full((h, w, 3), 128.0)
+    img[:, z:2 * z] += cv2.GaussianBlur(rng.normal(0, 50, (h, z)), (0, 0), 1.5)[..., None]
+    img[:h // 2, 2 * z:], img[h // 2:, 2 * z:] = 255, 0
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def test_energy_goes_to_texture_not_flat_or_clipped():
+    img = zones()
+    enc, _ = ic.encode(img, b"hi", delta=2, subblock_px=6)
+    d = np.abs(ic.to_lab(enc)[..., 0] - ic.to_lab(img)[..., 0])
+    z, m = img.shape[1] // 3, 24                                     # zone width, one-cell margin at seams
+    flat, tex, clipped = d[:, m:z - m], d[:, z + m:2 * z - m], d[:, 2 * z + m:]
+    assert clipped.max() == 0
+    # flat keeps only the floor (it carries the cheapest margin: a flat host needs no QIM nudge);
+    # texture gets far more. The Laplacian mask gave flat 0.64x texture here.
+    assert flat.mean() < 0.55 * tex.mean(), (flat.mean(), tex.mean())
+
+
+def test_jnd_follows_luminance_and_texture():
+    b, flat = 6, np.full((96, 96), 50, np.float32)
+    mid, dark = ic.jnd(flat, b).mean(), ic.jnd(flat - 40, b).mean()
+    assert dark > mid                                                # luminance adaptation: dark hides more
+    rng = np.random.default_rng(0)
+    tex = flat + cv2.GaussianBlur(rng.normal(0, 30, flat.shape).astype(np.float32), (0, 0), 1.5)
+    assert ic.jnd(tex, b)[24:-24, 24:-24].mean() > 3 * mid           # contrast masking
+
+
 def _passing(img="kodim23"):
     """Synthetic measurements that just meet every PRD #1 threshold for img."""
     return dict(ssim=0.95, mean_dL=1.0, geometry={v: dict(ok=5, n=5) for v in sim.GEOMETRY},
@@ -317,7 +349,7 @@ def test_acceptance_run_writes_report_and_images(tmp_path, monkeypatch, capsys):
     assert r["geometry"]["clean"] == dict(ok=1, n=1) and r["geometry"]["crop60"] == dict(ok=2, n=2)
     assert r["print"] == dict(easy=dict(ok=0, n=2), hard=dict(ok=0, n=2))
     assert r["bit_ber"] == {v: 0.0125 for v in sim.GEOMETRY}      # reported for every decoded view
-    assert rep["config"]["trials"] == 2 and rep["config"]["delta"] == 2.0 and rep["verdict"] == "FAIL"
+    assert rep["config"]["trials"] == 2 and rep["config"]["delta"] == 2.2 and rep["verdict"] == "FAIL"
     assert "| kodim23 | print gray | not run |" in capsys.readouterr().out
     img = cv2.imread(str(src)).astype(int)
     enc, diff = (cv2.imread(str(out / f"kodim23_{t}.png")).astype(int) for t in ("enc", "diff_x10"))
