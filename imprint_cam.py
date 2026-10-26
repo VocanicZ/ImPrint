@@ -733,6 +733,12 @@ def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
     return None
 
 
+def _twin(model):
+    """The same lattice turned 180 degrees (refit from scratch: n = 0)."""
+    fmap, (x0, x1, y0, y1), _ = model
+    return (lambda q: fmap(-q)), (-x1, -x0, -y1, -y0), 0
+
+
 def _quad(model) -> np.ndarray:
     fmap, (x0, x1, y0, y1), _ = model
     return fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
@@ -749,7 +755,7 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
         if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
             continue                                                # inside a picture already read
         tried += 1
-        res = locked = None
+        res, locked = None, []
         for sgn in (1, -1):
             model = track(lum, seed, sgn)
             model = refine(lum, model) if model else None
@@ -757,11 +763,18 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
             if res:
                 break
             if model and model[2] >= 30:
-                locked = model
-        if not res and locked:
-            # the dense refit locked onto this picture's lattice and it still didn't read: other
-            # seeds inside it would refit to the same lattice, so don't spend them there
-            regions.append(_quad(locked))
+                locked.append(model)
+        if not res and len(locked) == 1:
+            # one twin locked, the other tracked badly: the pilot alone can't tell twins apart, so
+            # the locked one may be the wrong one - turn its lattice 180 degrees and refit that
+            model = refine(lum, _twin(locked[0]))
+            res = read(lum, model)
+            if not res and model[2] >= 30:
+                locked.append(model)
+        if not res and len(locked) == 2:
+            # both twins locked onto this picture's lattice and neither read: other seeds inside
+            # it would refit to the same lattices, so don't spend them there
+            regions.append(_quad(locked[0]))
         if res:
             poly = _quad(model)
             e1, e2 = seed[2], seed[3]

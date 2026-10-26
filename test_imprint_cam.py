@@ -118,8 +118,8 @@ def test_refine_and_read_fall_back_without_a_pilot(monkeypatch):
 
 
 def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
-    """A failed read on a densely refit lattice: other seeds in that picture refit to the same
-    lattice, so they're skipped; a seed elsewhere (another picture) still gets its turn."""
+    """Both twins locked onto a dense refit and neither read: other seeds in that picture refit to
+    the same lattices, so they're skipped; a seed elsewhere (another picture) still gets its turn."""
     seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300)]
     monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
     tracked = []
@@ -129,6 +129,21 @@ def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
     monkeypatch.setattr(ic, "read", lambda lum, m: None)
     r = ic.decode(np.zeros((100, 400, 3), np.uint8))
     assert r["tried"] == 2 and tracked == [40, 40, 300, 300] and r["found"] == []
+
+
+def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
+    """Only the wrong 180-degree twin locks on; the right one tracks badly. decode refits the
+    locked lattice turned around, and that reads."""
+    c = np.array([100.0, 50.0])
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [(9.0, c, np.array([10.0, 0]), np.array([0, 10.0]))])
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: (lambda q: c + 10 * q if sgn > 0 else c + 3 - 10 * q,
+                                                             (-5.0, 5.0, -5.0, 5.0), 9))
+    monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 5 if m[0](np.zeros((1, 2)))[0, 0] != c[0] else 40))
+    right = lambda m: np.allclose(m[0](np.array([[0.0, 0.0], [1.0, 0.0]])), [c, c - [10, 0]])
+    monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"twin") if right(m) else None)
+    found = ic.decode(np.zeros((100, 400, 3), np.uint8))["found"]
+    assert [f["payload"] for f in found] == [b"twin"]
+    assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
 
 
 def test_cell_means_grows_but_drops_cells_outside_the_photo():
