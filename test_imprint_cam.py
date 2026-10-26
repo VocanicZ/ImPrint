@@ -1,4 +1,5 @@
 """Run: .venv/bin/python test_imprint_cam.py  (also works under pytest)"""
+import binascii
 import glob
 import json
 import sys
@@ -6,6 +7,7 @@ import sys
 import cv2
 import numpy as np
 import pytest
+from reedsolo import ReedSolomonError, RSCodec
 
 import imprint_cam as ic
 import sim
@@ -34,7 +36,7 @@ def test_found_without_border_any_orientation():
     for view in views:
         found = ic.decode(np.ascontiguousarray(view))["found"]
         assert found and found[0]["payload"] == b"hello", view.shape
-        assert found[0]["bit_ber"] == 0, found[0]                   # no bit wrong before Reed-Solomon
+        assert found[0]["bit_ber"] == 0, found[0]                   # no bit wrong before LDPC
 
 
 def test_survives_simulated_print_and_photo():
@@ -61,6 +63,79 @@ def test_qim_soft_is_sign_near_zero_and_flips_every_step():
     u = np.array([0.1, B / 2, B - 0.1, B + 0.1, 1.5 * B, -0.1, -B / 2, 2 * B + 0.1])
     assert np.array_equal(np.sign(ic.qim_soft(u)), [1, 1, 1, -1, -1, -1, -1, 1])
     assert ic.qim_soft(np.array([B / 2]))[0] == B / 2 and abs(ic.qim_soft(np.array([B]))[0]) < 1e-12
+
+
+def _rs_bits(payload):
+    """The #6 code, for comparison: payload + CRC-32, rate-1/2 Reed-Solomon."""
+    msg = payload + binascii.crc32(payload).to_bytes(4, "big")
+    return np.unpackbits(np.frombuffer(bytes(RSCodec(len(msg)).encode(msg)), np.uint8)).astype(np.float32) * 2 - 1
+
+
+def _rs_read(soft, nbytes):
+    """The #6 decoder: hard bytes, least-confident bytes as erasures, CRC-32."""
+    wire, nsym = np.packbits(soft > 0).tobytes(), nbytes + 4
+    weak = np.argsort(np.abs(soft).reshape(-1, 8).min(1))
+    for ne in range(0, nsym + 1, 2):
+        try:
+            msg = bytes(RSCodec(nsym).decode(wire, erase_pos=[int(i) for i in weak[:ne]] or None)[0])
+        except ReedSolomonError:
+            continue
+        if binascii.crc32(msg[:nbytes]).to_bytes(4, "big") == msg[nbytes:]:
+            return msg[:nbytes]
+    return None
+
+
+def test_soft_decision_code_beats_reed_solomon_on_awgn_and_bsc():
+    """Same rate, same tile: at 2 dB Es/N0 (AWGN, soft) and 6% raw BER (BSC, hard +-1) the LDPC
+    code decodes nearly always where Reed-Solomon nearly never does."""
+    rng = np.random.default_rng(7)
+    n = 20
+    for nb in (8, 32):
+        payload = bytes(rng.integers(0, 256, nb, dtype=np.uint8))
+        rates = {}
+        for name, bits, dec in (("ldpc", ic.to_bits, ic.read_soft), ("rs", _rs_bits, _rs_read)):
+            x = bits(payload)
+            assert x.size == 8 * ic.frame_len(nb)
+            awgn = sum(dec(x + rng.normal(0, 10 ** (-2 / 20), x.size), nb) == payload for _ in range(n))
+            bsc = sum(dec(x * np.where(rng.random(x.size) < 0.06, -1, 1), nb) == payload for _ in range(n))
+            rates[name] = (awgn / n, bsc / n)
+        assert rates["ldpc"][0] >= 0.85 and rates["rs"][0] <= 0.1, (nb, rates)
+        assert rates["ldpc"][1] >= 0.85 and rates["rs"][1] <= 0.4, (nb, rates)
+
+
+def test_ldpc_round_trips_every_payload_length():
+    rng = np.random.default_rng(2)
+    for nb in range(1, ic.MAX_BYTES + 1):
+        payload = bytes(rng.integers(0, 256, nb, dtype=np.uint8))
+        x = ic.to_bits(payload)
+        cw = (x > 0).astype(np.uint8)
+        chk, bit, slots = ic.ldpc(8 * (nb + 4), x.size)
+        assert not (np.bincount(chk, cw[bit], x.size - 8 * (nb + 4)) % 2).any()      # every check holds
+        H = np.zeros((x.size - 8 * (nb + 4), x.size), int)
+        H[chk, bit] = 1
+        assert (H.T @ H)[~np.eye(x.size, dtype=bool)].max() == 1                      # no 4-cycles
+        assert np.packbits(cw[:8 * nb]).tobytes() == payload                       # systematic
+        assert ic.read_soft(x * rng.uniform(0.1, 3, x.size), nb) == payload
+        assert ic.read_soft(x, nb + 1 if nb < ic.MAX_BYTES else nb - 1) is None      # wrong length
+
+
+def test_unencoded_images_yield_no_payload(monkeypatch):
+    rng = np.random.default_rng(4)
+    for _ in range(20):                                   # noise of any scale, every payload length
+        for nb in range(1, ic.MAX_BYTES + 1):
+            soft = rng.normal(0, 1, 8 * ic.frame_len(nb)) * rng.choice([1e-3, 1, 1e3])
+            assert ic.read_soft(soft, nb) is None
+    for nb in (1, 8, 32):
+        assert ic.read_soft(np.zeros(8 * ic.frame_len(nb)), nb) is None
+    img = photo_like(360, 540)
+    assert ic.decode(img)["found"] == []
+    assert ic.decode(rng.integers(0, 256, img.shape, np.uint8))["found"] == []
+    lab = ic.to_lab(img)                                  # a pilot but no data: lattice found, cells read
+    lab[..., 0] += 3 * ic.pilot_field(*lab.shape[:2], ic.K * 6)
+    calls = []
+    real = ic.read_soft
+    monkeypatch.setattr(ic, "read_soft", lambda soft, nb: calls.append(nb) or real(soft, nb))
+    assert ic.decode(ic.to_rgb(lab), max_seeds=2)["found"] == [] and len(set(calls)) >= 10   # many lengths tried
 
 
 def test_adversarial_host_still_decodes():

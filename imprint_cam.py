@@ -14,8 +14,9 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   amplitudes beyond, so whatever the host texture already holds there, the encoder only nudges it
   to the nearest point that reads right - no cell is ever too busy to carry its bit. Bits come in
   tiles of T x T cells repeated over the whole picture, so any big-enough piece decodes
-  (crop-robust); the decoder tries every tile phase and both 180-degree twins, Reed-Solomon +
-  CRC-32 confirm.
+  (crop-robust); the decoder tries every tile phase and both 180-degree twins, then a rate-1/2
+  LDPC code, decoded by belief propagation on the soft cell values of every repeat, and CRC-32
+  confirm.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
 smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows local texture
@@ -28,7 +29,6 @@ import functools
 
 import cv2
 import numpy as np
-from reedsolo import ReedSolomonError, RSCodec
 
 K = 4                       # sub-blocks per cell side
 SEED = 0x1A9
@@ -204,8 +204,13 @@ def headroom(lab: np.ndarray, amp: float) -> np.ndarray:
 
 # ---------------------------------------------------------------- payload
 
+LDPC_COL_W = 4              # parity checks per message bit
+LDPC_ITERS = 60             # belief-propagation iterations before giving up
+LDPC_ALPHA = 0.85           # normalized min-sum: scale on check messages (tames min-sum's overconfidence)
+
+
 def frame_len(nbytes: int) -> int:
-    """Bytes on the wire for a payload: payload + CRC-32, then rate-1/2 Reed-Solomon."""
+    """Bytes on the wire for a payload: payload + CRC-32, then a rate-1/2 LDPC code."""
     return 2 * (nbytes + 4)
 
 
@@ -214,10 +219,72 @@ def tile_size(nbytes: int) -> int:
     return int(np.ceil(np.sqrt(8 * frame_len(nbytes))))
 
 
+@functools.cache
+def ldpc(k: int, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rate k/n LDPC code (irregular repeat-accumulate): message bits first, each in LDPC_COL_W of
+    the n - k parity checks (rows balanced, no two bits sharing two checks: no 4-cycles),
+    then n - k parity bits on a staircase (check i holds parity bits i-1 and i), so encoding is a
+    running XOR. Depends only on (k, n). Returns the Tanner graph's edges as (check, bit) arrays,
+    and the bits of each check as an (n - k, max degree) array padded with n."""
+    m = n - k
+    rng = np.random.default_rng(SEED + k * 1000 + n)
+    deg = np.zeros(m, int)
+    rows: list[set] = []
+    for _ in range(k):
+        mine: set = set()
+        for _ in range(LDPC_COL_W):
+            near = set().union(*(r for r in rows if r & mine))      # checks that would close a 4-cycle,
+            near |= {i + s for i in mine for s in (-1, 1)}         # also with a staircase parity bit
+            pool = [i for i in range(m) if i not in mine and i not in near]
+            low = min(deg[pool])
+            i = int(rng.choice([i for i in pool if deg[i] == low]))
+            mine.add(i)
+            deg[i] += 1
+        rows.append(mine)
+    chk = np.array([i for r in rows for i in sorted(r)] + list(range(m)) + list(range(1, m)))
+    bit = np.array([j for j, r in enumerate(rows) for _ in r] + list(range(k, n)) + list(range(k, n - 1)))
+    d = np.bincount(chk, minlength=m)
+    slots = np.full((m, d.max()), n)
+    slots[np.repeat(np.arange(m), d), np.concatenate([np.arange(x) for x in d])] = bit[np.argsort(chk, kind="stable")]
+    return chk, bit, slots
+
+
+def ldpc_encode(msg: np.ndarray, n: int) -> np.ndarray:
+    """0/1 message bits -> 0/1 codeword (message, then parity)."""
+    chk, bit, _ = ldpc(len(msg), n)
+    s = np.bincount(chk[bit < len(msg)], msg[bit[bit < len(msg)]], n - len(msg)).astype(int) % 2
+    return np.concatenate([msg, np.cumsum(s) % 2]).astype(np.uint8)
+
+
+def ldpc_decode(soft: np.ndarray, k: int) -> np.ndarray | None:
+    """Soft bits (positive = 1, any scale) -> 0/1 codeword by normalized min-sum belief propagation,
+    or None if it doesn't converge to a codeword. Min-sum needs no noise estimate: the scale cancels."""
+    n = len(soft)
+    slots = ldpc(k, n)[2]
+    rows, first = np.arange(len(slots)), np.arange(slots.shape[1])
+    ch = np.append(-np.asarray(soft, np.float64), np.inf)       # LLR (positive = 0); padding: sure 0
+    c2v = np.zeros(slots.shape)
+    tot = ch
+    for _ in range(LDPC_ITERS):
+        hard = tot < 0
+        if not (hard[slots].sum(1) % 2).any():                    # every parity check holds
+            return hard[:n].astype(np.uint8)
+        v2c = tot[slots] - c2v
+        sg = np.where(v2c < 0, -1.0, 1.0)
+        mag = np.abs(v2c)
+        i1 = mag.argmin(1)
+        m1 = mag[rows, i1]
+        mag[rows, i1] = np.inf
+        m2 = mag.min(1)                                           # each check: own min excluded
+        c2v = np.where(first == i1[:, None], m2[:, None], m1[:, None]) * sg * sg.prod(1, keepdims=True)
+        c2v *= LDPC_ALPHA
+        tot = ch + np.bincount(slots.ravel(), c2v.ravel(), n + 1) * (np.arange(n + 1) < n)
+    return None
+
+
 def to_bits(payload: bytes) -> np.ndarray:
-    msg = payload + binascii.crc32(payload).to_bytes(4, "big")
-    wire = bytes(RSCodec(len(msg)).encode(msg))
-    return np.unpackbits(np.frombuffer(wire, np.uint8)).astype(np.float32) * 2 - 1
+    msg = np.unpackbits(np.frombuffer(payload + binascii.crc32(payload).to_bytes(4, "big"), np.uint8))
+    return ldpc_encode(msg, 8 * frame_len(len(payload))).astype(np.float32) * 2 - 1
 
 
 def bit_map(n_cells: int, n_bits: int) -> np.ndarray:
@@ -228,21 +295,14 @@ def bit_map(n_cells: int, n_bits: int) -> np.ndarray:
     return idx
 
 
-_rs = functools.cache(RSCodec)                # building a codec costs about a decode
-
-
 def read_soft(soft: np.ndarray, nbytes: int) -> bytes | None:
-    """Soft bits -> Reed-Solomon (least-confident bytes as erasures) -> CRC-32."""
-    wire = np.packbits(soft > 0).tobytes()
-    nsym = nbytes + 4
-    weak = np.argsort(np.abs(soft).reshape(-1, 8).min(1))
-    for ne in range(0, nsym + 1, 2):
-        try:
-            msg = bytes(_rs(nsym).decode(wire, erase_pos=[int(i) for i in weak[:ne]] or None)[0])
-        except ReedSolomonError:
-            continue
-        if binascii.crc32(msg[:nbytes]).to_bytes(4, "big") == msg[nbytes:]:
-            return msg[:nbytes]
+    """Soft bits -> LDPC belief propagation -> CRC-32."""
+    cw = ldpc_decode(soft, 8 * (nbytes + 4))
+    if cw is None:
+        return None
+    msg = np.packbits(cw[:8 * (nbytes + 4)]).tobytes()
+    if binascii.crc32(msg[:nbytes]).to_bytes(4, "big") == msg[nbytes:]:
+        return msg[:nbytes]
     return None
 
 
@@ -693,7 +753,7 @@ def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -
 
 def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
     """Try every payload length and tile phase on the pilot-free cells: soft-combine repeats,
-    Reed-Solomon, CRC."""
+    LDPC belief propagation, CRC."""
     cm = cell_means(lum, model, r, grow)
     if cm is None:
         return None

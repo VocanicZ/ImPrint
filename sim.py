@@ -237,7 +237,7 @@ def measure(path: str, trials: int, presets: list[str], print_cm: float, out_dir
         cv2.imwrite(os.path.join(out_dir, f"{name}_{tag}.png"), cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
     log(f"SSIM {st['ssim']}  mean dL {st['mean_dL']}")
     geometry = {v: dict(ok=0, n=0) for v in GEOMETRY}
-    ber = {}                  # bit error rate after combining repeats, before Reed-Solomon (decoded views)
+    ber = {}                  # bit error rate after combining repeats, before LDPC (decoded views)
     for t in range(trials):   # decode is deterministic: only the random crop changes between trials
         for v, im in views(enc, np.random.default_rng(t + 1)).items():
             if t == 0 or v == "crop60":
