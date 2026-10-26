@@ -228,6 +228,9 @@ def bit_map(n_cells: int, n_bits: int) -> np.ndarray:
     return idx
 
 
+_rs = functools.cache(RSCodec)                # building a codec costs about a decode
+
+
 def read_soft(soft: np.ndarray, nbytes: int) -> bytes | None:
     """Soft bits -> Reed-Solomon (least-confident bytes as erasures) -> CRC-32."""
     wire = np.packbits(soft > 0).tobytes()
@@ -235,7 +238,7 @@ def read_soft(soft: np.ndarray, nbytes: int) -> bytes | None:
     weak = np.argsort(np.abs(soft).reshape(-1, 8).min(1))
     for ne in range(0, nsym + 1, 2):
         try:
-            msg = bytes(RSCodec(nsym).decode(wire, erase_pos=[int(i) for i in weak[:ne]] or None)[0])
+            msg = bytes(_rs(nsym).decode(wire, erase_pos=[int(i) for i in weak[:ne]] or None)[0])
         except ReedSolomonError:
             continue
         if binascii.crc32(msg[:nbytes]).to_bytes(4, "big") == msg[nbytes:]:
@@ -730,6 +733,11 @@ def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
     return None
 
 
+def _quad(model) -> np.ndarray:
+    fmap, (x0, x1, y0, y1), _ = model
+    return fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
+
+
 def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
     """Find and decode every ImPrint in a photo or file: no border or outline needed."""
     lum = to_lab(rgb)[..., 0]
@@ -741,16 +749,21 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
         if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
             continue                                                # inside a picture already read
         tried += 1
-        res = None
+        res = locked = None
         for sgn in (1, -1):
             model = track(lum, seed, sgn)
             model = refine(lum, model) if model else None
             res = read(lum, model) if model else None
             if res:
                 break
+            if model and model[2] >= 30:
+                locked = model
+        if not res and locked:
+            # the dense refit locked onto this picture's lattice and it still didn't read: other
+            # seeds inside it would refit to the same lattice, so don't spend them there
+            regions.append(_quad(locked))
         if res:
-            fmap, (x0, x1, y0, y1), _ = model
-            poly = fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
+            poly = _quad(model)
             e1, e2 = seed[2], seed[3]
             res.update(quad=poly, mirrored=bool(e1[0] * e2[1] - e1[1] * e2[0] < 0),
                        photo_px_per_subblock=round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K, 1))

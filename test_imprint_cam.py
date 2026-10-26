@@ -117,6 +117,20 @@ def test_refine_and_read_fall_back_without_a_pilot(monkeypatch):
     assert ic.refine(flat, model) is model                # coherent windows, but the refit fails
 
 
+def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
+    """A failed read on a densely refit lattice: other seeds in that picture refit to the same
+    lattice, so they're skipped; a seed elsewhere (another picture) still gets its turn."""
+    seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300)]
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    tracked = []
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked.append(seed[1][0]) or
+                        (lambda q, c=seed[1]: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 9))
+    monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 40 if m[0](np.zeros((1, 2)))[0, 0] < 200 else 5))
+    monkeypatch.setattr(ic, "read", lambda lum, m: None)
+    r = ic.decode(np.zeros((100, 400, 3), np.uint8))
+    assert r["tried"] == 2 and tracked == [40, 40, 300, 300] and r["found"] == []
+
+
 def test_cell_means_grows_but_drops_cells_outside_the_photo():
     enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
     lum = ic.to_lab(enc)[..., 0]
