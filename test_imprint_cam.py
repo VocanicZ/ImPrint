@@ -45,6 +45,13 @@ def test_survives_simulated_print_and_photo():
     assert found and found[0]["payload"] == b"IMPRINT1"
 
 
+def test_survives_simulated_grayscale_print_and_photo():
+    """K-only print (one 45-degree screen), tilted photo: a fixed-seed regression for `gray`."""
+    enc, _ = ic.encode(photo_like(), b"IMPRINT1", delta=2, subblock_px=6)
+    found = ic.decode(sim.channel(enc, np.random.default_rng(3), "gray"))["found"]
+    assert found and found[0]["payload"] == b"IMPRINT1"
+
+
 def test_pilot_frequencies_align_uniquely_without_symmetry():
     """The pilot set must fix the cell grid exactly once per cell, show no rotation/mirror
     symmetry beyond the 180-degree turn no cosine can see, and leave no near-ambiguous offset:
@@ -234,13 +241,64 @@ def test_track_and_refine_lock_onto_a_faint_pilot():
     on_grid = []
     for sgn in (1, -1):
         model = ic.track(lum, seed, sgn)
-        assert model is not None and model[2] >= 3, sgn
+        assert model is not None and model[2] >= 30, sgn               # enough probes to fit curl
         dense = ic._refine_pass(lum, model)
-        assert dense[2] > model[2], sgn
+        assert dense[2] >= 8, sgn                                       # the dense re-measure fits
         p = (dense[0](g) + 0.5) / c
         on_grid.append((np.abs((p + 0.5) % 1 - 0.5).max() < 0.02, dense))
     assert sum(ok for ok, _ in on_grid) == 1
     assert ic.read(lum, next(m for ok, m in on_grid if ok))["payload"] == b"hi"
+
+
+def test_pilot_warp_finds_a_few_percent_scale_and_shear():
+    """A probe sampled through a map whose local cell vectors are a few % off (a tilted page, one
+    step from the last fitted point) smears the pilot: its phase no longer reads. pilot_warp finds
+    the warp from where all four lines really are, even with the pilot far under the noise."""
+    rng = np.random.default_rng(0)
+    nc, S = 8, 24
+    y, x = np.mgrid[0:nc * S, 0:nc * S]
+    s = np.stack([(x + 0.5) / S - nc / 2, (y + 0.5) / S - nc / 2], -1)    # sampled lattice coords
+    noise = rng.normal(0, 3, x.shape)
+    seen = lambda u: (sum(np.cos(2 * np.pi * (u @ f) + ph) for f, ph in zip(ic.PILOT_FREQS, ic.PILOT_PHASES))
+                      + noise).astype(np.float32)
+    for M in (np.array([[1.06, 0.03], [-0.02, 0.95]]), np.array([[0.92, -0.05], [0.05, 1.06]])):
+        patch = seen(s @ M)                                            # true lattice = M^T sampled
+        assert ic.pilot_phase(patch, nc, S)[2] < ic.SNR_MIN            # smeared: the probe fails
+        est = ic.pilot_warp(patch, nc, S)
+        assert est is not None and np.abs(est - M).max() <= 0.021, (est, M)   # coarse grid: 0.02 steps
+        assert ic.pilot_phase(seen(s @ np.linalg.inv(est) @ M), nc, S)[2] > 2 * ic.SNR_MIN   # re-aimed
+
+
+def tilted(img, deg, f=1400.0):
+    """img seen by a pinhole camera (focal length f px) with the page turned deg about its
+    vertical axis: one side recedes, cells shrink across the page. Returns (photo, homography)."""
+    h, w = img.shape[:2]
+    r = np.deg2rad(deg)
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    P = np.c_[src - [w / 2, h / 2], np.zeros(4)] @ np.array([[np.cos(r), 0, -np.sin(r)], [0, 1, 0],
+                                                            [np.sin(r), 0, np.cos(r)]]).T
+    P[:, 2] += f
+    H = cv2.getPerspectiveTransform(src, (f * P[:, :2] / P[:, 2:] + [w / 2, h / 2]).astype(np.float32))
+    return cv2.warpPerspective(img, H, (w, h), borderValue=(255, 255, 255)), H
+
+
+def test_track_follows_a_steeply_tilted_page():
+    """Page turned 40 degrees: cells shrink by a third across it, and a map that is right at the
+    seed is a few % off 8 cells out. Growing probe by probe, each from its neighbours' local map
+    and re-aimed when smeared, the tracker covers the page from a seed of the true local grid,
+    and one twin reads. (Following the seed's affine map outward, it got no further than the seed.)"""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    img, H = tilted(enc, 40)
+    lum = ic.to_lab(img)[..., 0]
+    c = ic.K * 6
+    p = cv2.perspectiveTransform(np.array([[[540, 360], [540 + c, 360], [540, 360 + c]]], np.float64), H)[0]
+    seed = (0, p[0], p[1] - p[0], p[2] - p[0])
+    reads = []
+    for sgn in (1, -1):
+        model = ic.track(lum, seed, sgn)
+        assert model is not None and model[2] >= 100, sgn
+        reads.append((ic.read(lum, ic.refine(lum, model)) or {}).get("payload"))
+    assert b"hi" in reads
 
 
 def test_deridge_keeps_spikes_and_flattens_streaks():

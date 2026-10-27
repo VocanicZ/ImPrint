@@ -8,7 +8,8 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   so the decoder finds the grid - spacing, angle, mirror, perspective - anywhere in a photo from
   the spectrum, with no border or picture outline. The encoder first notches the image's own
   content at those frequencies so busy texture can't drown them. Matched-filter phase gives
-  the exact cell offset; the decoder then tracks the pilot outward and fits perspective + curl.
+  the exact cell offset; the decoder then tracks the pilot outward probe by probe (each from its
+  neighbours' local grid, re-aimed when a tilt smears it) and fits perspective + curl.
 * one DATA bit per cell, carried by the cell's correlation with its own +-1 sub-block pattern,
   quantized onto a lattice (QIM): the bit is the sign near zero and flips every QIM_STEP pilot
   amplitudes beyond, so whatever the host texture already holds there, the encoder only nudges it
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import binascii
 import functools
+import heapq
 
 import cv2
 import numpy as np
@@ -656,6 +658,51 @@ def _ref_basis(nc: int, S: int) -> np.ndarray:
     return np.stack(rows)
 
 
+@functools.cache
+def _zoom_basis(nc: int, S: int, span: float, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """1-D DFT rows at each pilot frequency +- span cycles/cell (n steps), for x and for y."""
+    u = (np.arange(nc * S) + 0.5) / S
+    d = np.linspace(-span, span, n)
+    ex = np.exp(-2j * np.pi * (PILOT_FREQS[:, 0, None, None] + d[None, :, None]) * u)   # (lines, n, px)
+    ey = np.exp(-2j * np.pi * (PILOT_FREQS[:, 1, None, None] + d[None, :, None]) * u)
+    return ex.astype(np.complex64), ey.astype(np.complex64)
+
+
+@functools.cache
+def _warp_grid(span: float, n: int, lim: float = 0.12, steps: int = 13) -> tuple[np.ndarray, np.ndarray]:
+    """Candidate local warps M = I + E (all four entries of E on a grid), and where each puts
+    every pilot line on the zoomed DFT grid: (cand, 2, 2), (cand, line, 2) as (y, x) indices."""
+    e = np.linspace(-lim, lim, steps)
+    M = np.eye(2) + np.stack(np.meshgrid(e, e, e, e, indexing="ij"), -1).reshape(-1, 2, 2)
+    d = (M @ PILOT_FREQS.T).transpose(0, 2, 1) - PILOT_FREQS     # frequency shift of every line
+    idx = np.rint((d + span) / (2 * span) * (n - 1)).astype(int)[..., ::-1]
+    assert idx.min() >= 0 and idx.max() < n, "warp grid exceeds the zoomed DFT span"
+    return M, idx
+
+
+WARP_COARSE = (0.12, 13, 0.75, 49)   # pilot_warp search: +-lim, steps per entry, DFT +-span, DFT steps
+WARP_FINE = (0.025, 11, 0.15, 61)
+
+
+def pilot_warp(patch: np.ndarray, nc: int, S: int, grid: tuple = WARP_COARSE) -> np.ndarray | None:
+    """Where the pilot lines really are in a resampled patch: a map whose local scale/turn/shear is
+    off by a few % moves every line off its nominal frequency f, to M f, and smears the patch's
+    phase. Scores each candidate M by the summed amplitude it finds on all lines at once (a zoomed
+    DFT around each line, looked up), so one consistent warp must explain every line: noise can
+    fake one line's peak, not four. The true lattice around the patch centre is M^T times the
+    sampled one. Returns M, or None if the best is on the search's rim."""
+    lim, steps, span, n = grid
+    x = (patch - patch.mean()).astype(np.complex64)
+    ex, ey = _zoom_basis(nc, S, span, n)
+    R = np.abs(np.stack([ey[k] @ x @ ex[k].T for k in range(len(PILOT_FREQS))]))   # (line, dy, dx)
+    M, idx = _warp_grid(span, n, lim, steps)
+    score = R[np.arange(len(PILOT_FREQS)), idx[..., 0], idx[..., 1]].sum(1)
+    best = int(np.argmax(score))
+    if np.abs(M[best] - np.eye(2)).max() >= lim - 1e-9:
+        return None
+    return M[best]
+
+
 def _pilot_shift(mc: np.ndarray, tpl: np.ndarray):
     """Circular cross-correlation of a mean cell with the pilot cell: (shift_yx, ncc)."""
     mc = mc - mc.mean()
@@ -666,68 +713,98 @@ def _pilot_shift(mc: np.ndarray, tpl: np.ndarray):
 
 # ---------------------------------------------------------------- decode
 
-def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, coh_min: float = 0.7,
-          snr_min: float = SNR_MIN):
-    """From one seed window, lock onto the pilot phase (sub-cell offset) and follow it outward over
-    the picture, refitting a lattice->photo map (perspective + curl) as it grows. Lattice coords =
-    true cell coords up to a whole-cell shift. sgn picks one of the two 180-degree twins that
-    cosine lines can't tell apart (the caller tries both; the CRC decides).
+def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: int = 2,
+          coh_min: float = 0.7, snr_min: float = SNR_MIN):
+    """From one seed window, lock onto the pilot phase (sub-cell offset) and grow outward over the
+    picture probe by probe, `step` cells apart, strongest first; then fit a lattice->photo map
+    (perspective + curl) to every probe. Lattice coords = true cell coords up to a whole-cell
+    shift. sgn picks one of the two 180-degree twins that cosine lines can't tell apart (the caller
+    tries both; the CRC decides).
+    No single affine map reaches far under a strong tilt (its scale is off a few % some 8 cells
+    out, enough to smear an 8-cell probe's phase), so every probe carries its own local map: its
+    lattice point, its photo px and its local cell vectors, refit from the probes around it. A
+    neighbour is predicted one step from there; a probe still smeared is re-aimed (pilot_warp).
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
     S = K * r
-    e1, e2 = sgn * e1, sgn * e2
+    cell = float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0])))
 
-    def probe(fm, cx, cy):
-        return pilot_phase(resample(lum, fm, cx - nc / 2, cy - nc / 2, nc, nc, S), nc, S)
+    def probe(q, Q, P, J):
+        """Probe the patch centred on lattice point q of the local map x -> P + (x - Q) J^T.
+        Returns (true lattice point, its photo px, local J, snr) or None."""
+        g = lambda x: P + (x - Q) @ J.T
+        patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
+        off, coh, snr = pilot_phase(patch, nc, S)
+        for grid in (WARP_COARSE, WARP_FINE):                     # smeared: re-aim at where the lines are
+            if coh >= coh_min and snr >= snr_min:
+                break
+            M = pilot_warp(patch, nc, S, grid)
+            if M is None:
+                return None
+            J = J @ np.linalg.inv(M).T
+            g = lambda x: P + (x - Q) @ J.T
+            patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
+            off, coh, snr = pilot_phase(patch, nc, S)
+        if coh < coh_min or snr < snr_min:
+            return None
+        return q + (off + 0.5) % 1 - 0.5, g(q[None])[0], J, snr
 
-    fmap = lambda q: c0 + q[:, :1] * e1 + q[:, 1:2] * e2
-    off0, coh0, snr0 = probe(fmap, 0.0, 0.0)
-    if coh0 < coh_min or snr0 < snr_min:
+    first = probe(np.zeros(2), np.zeros(2), np.asarray(c0, np.float64), sgn * np.c_[e1, e2])
+    if first is None:
         return None
-    lat, pho = [off0.copy()], [c0.copy()]
-    expect = off0.copy()                # offset the current map should show (0 once it's in true coords)
-    done, ring = {(0, 0)}, 1
-    while ring < 60:
-        added = inside = 0
-        for i in range(-ring, ring + 1):
-            for j in range(-ring, ring + 1):
-                if max(abs(i), abs(j)) != ring or (i, j) in done:
-                    continue
-                done.add((i, j))
-                cx, cy = i * nc, j * nc
-                p = fmap(np.array([[cx, cy]], np.float64))[0]
-                if not (0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]):
-                    continue
-                inside += 1
-                off, coh, snr = probe(fmap, cx, cy)
-                if coh < coh_min or snr < snr_min:
-                    continue
-                off = expect + (off - expect + 0.5) % 1 - 0.5          # unwrap next to the expected offset
-                lat.append(np.array([cx, cy]) + off)
-                pho.append(p)
-                added += 1
-        if inside == 0:                                         # whole ring outside the photo
-            break
-        if added == 0:                                          # faint area (flat image region): keep going
-            ring += 1
+    nodes = {(0, 0): first}
+    heap, done = [], {(0, 0)}
+
+    def push(key):
+        for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            k = (key[0] + di, key[1] + dj)
+            if k not in done:
+                heapq.heappush(heap, (-nodes[key][3], k, key))
+
+    push((0, 0))
+    while heap and len(done) < 4000:
+        _, key, parent = heapq.heappop(heap)
+        if key in done:
             continue
-        L_, P_ = np.array(lat), np.array(pho)
-        if len(L_) >= 6:
-            H, inl = cv2.findHomography(L_, P_, cv2.RANSAC, 0.3 * np.linalg.norm(e1))
-            if H is not None:
-                keep = inl.ravel().astype(bool)
-                lat, pho = list(L_[keep]), list(P_[keep])
-                fm = fit_map(np.array(lat), np.array(pho), cubic=len(lat) >= 30)
-                if fm is not None:
-                    fmap, expect = fm, np.zeros(2)          # map now speaks true lattice coords
-        ring += 1
-    L_ = np.array(lat)
-    if len(L_) >= 4:                                            # final fit in true lattice coords
-        fm = fit_map(L_, np.array(pho), cubic=len(L_) >= 30)
-        if fm is not None:
-            fmap = fm
-    else:                                                       # seed only: shift the affine
-        fmap = lambda q, f0=fmap, o=off0: f0(q - o)
+        Q, P, J, _ = nodes[parent]
+        q = np.array(key, np.float64) * step
+        p = P + (q - Q) @ J.T
+        if not (0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]):
+            done.add(key)
+            continue
+        res = probe(q, Q, P, J)
+        done.add(key)
+        if res is None:
+            continue
+        Qn, Pn, Jn, snr = res
+        near = [nodes[k] for k in ((key[0] + di, key[1] + dj) for di in range(-2, 3) for dj in range(-2, 3))
+                if k in nodes]
+        if len(near) >= 3:                                        # local cell vectors from the neighbours
+            dQ = np.array([n[0] for n in near]) - Qn
+            dP = np.array([n[1] for n in near]) - Pn
+            if abs(np.linalg.det(dQ.T @ dQ)) > 1e-3 * step ** 4:
+                Jn = np.linalg.lstsq(dQ, dP, rcond=None)[0].T
+        nodes[key] = (Qn, Pn, Jn, snr)
+        push(key)
+    L_ = np.array([n[0] for n in nodes.values()])
+    P_ = np.array([n[1] for n in nodes.values()])
+    fmap = None
+    if len(L_) >= 6:
+        H, inl = cv2.findHomography(L_, P_, cv2.RANSAC, 0.5 * cell)
+        keep = inl.ravel().astype(bool) if H is not None else np.ones(len(L_), bool)
+        for _ in range(2):                                        # perspective inliers, then whatever curl fits
+            fm = fit_map(L_[keep], P_[keep], cubic=keep.sum() >= 30) if keep.sum() >= 4 else None
+            if fm is None:
+                break
+            fmap, keep = fm, np.linalg.norm(fm(L_) - P_, axis=1) < 0.3 * cell
+        if fmap is not None:
+            L_ = L_[keep] if keep.sum() >= 4 else L_
+    elif len(L_) >= 4:
+        fmap = fit_map(L_, P_, cubic=False)
+    if fmap is None:                                              # seed only: its local map
+        Q, P, J, _ = first
+        fmap = lambda x: P + (x - Q) @ J.T
+        L_ = L_[:1]
     ext = (L_[:, 0].min() - nc / 2, L_[:, 0].max() + nc / 2, L_[:, 1].min() - nc / 2, L_[:, 1].max() + nc / 2)
     return fmap, ext, len(L_)
 
