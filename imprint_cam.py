@@ -35,7 +35,9 @@ import numpy as np
 K = 4                       # sub-blocks per cell side
 SEED = 0x1A9
 MAX_BYTES = 32
-PILOT = 0.7                 # pilot (sync) amplitude relative to the data strength
+PILOT = 1.0                 # pilot (sync) amplitude relative to the data strength, shared by the
+                            # PILOT_FREQS lines: four lines make each one 3/4 as strong as three did
+                            # (0.85 or less loses print sync: kodim05 `easy` drops below the base)
 SUBBLOCK_MM = 0.8           # target printed sub-block size
 VIEW_MM = 350.0             # viewing distance the perceptual mask assumes (a print at arm's length)
 JND_FLAT = 0.2              # printed grating's flat-area threshold, x Chou-Li's display JND

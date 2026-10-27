@@ -223,7 +223,7 @@ def test_whitened_spectrum_takes_regions_between_n_and_2n():
 
 
 def test_track_and_refine_lock_onto_a_faint_pilot():
-    """At the default (faint) pilot, a seed tracks outward and a refine pass densifies the map.
+    """At the default pilot (four lines share it, so each is fainter than three were), a seed tracks outward and a refine pass densifies the map.
     Of the two 180-degree twins, exactly one puts every lattice point on a cell corner of the
     encoded grid (the other mirrors it about a point off the corners), and that one reads."""
     enc, _ = ic.encode(photo_like(360, 540), b"hi", delta=2, subblock_px=6)
