@@ -45,6 +45,33 @@ def test_survives_simulated_print_and_photo():
     assert found and found[0]["payload"] == b"IMPRINT1"
 
 
+def test_pilot_frequencies_align_uniquely_without_symmetry():
+    """The pilot set must fix the cell grid exactly once per cell, show no rotation/mirror
+    symmetry beyond the 180-degree turn no cosine can see, and leave no near-ambiguous offset:
+    the matched filter's best wrong peak stays well under the true one."""
+    import itertools
+    import math
+    F = ic.PILOT_FREQS.astype(int)
+    assert len(F) == len(ic.PILOT_PHASES) and len({tuple(f) for f in F} | {tuple(-f) for f in F}) == 2 * len(F)
+    g = 0
+    for a, b in itertools.combinations(F, 2):
+        g = math.gcd(g, int(abs(a[0] * b[1] - a[1] * b[0])))
+    assert g == 1                                        # the lines repeat together once per cell
+    lines = {tuple(f) for f in F} | {tuple(-f) for f in F}
+    for m in ([[0, -1], [1, 0]], [[0, 1], [-1, 0]], [[1, 0], [0, -1]], [[-1, 0], [0, 1]],
+              [[0, 1], [1, 0]], [[0, -1], [-1, 0]]):
+        assert {tuple(np.array(m) @ f) for f in lines} != lines, m
+    n = 240                                              # matched-filter score over every offset
+    d = np.arange(n) / n
+    off = np.stack(np.meshgrid(d, d), -1).reshape(-1, 2)
+    s = np.cos(2 * np.pi * off @ F.T).mean(1).reshape(n, n)
+    peak = np.ones_like(s, bool)
+    for dy, dx in itertools.product(range(-2, 3), repeat=2):
+        peak &= s >= np.roll(s, (dy, dx), (0, 1))
+    peak[0, 0] = False                                   # the true alignment
+    assert s[peak].max() <= ic.PILOT_ALIAS_MAX
+
+
 def test_qim_target_reads_right_at_bounded_cost():
     rng = np.random.default_rng(0)
     u = rng.uniform(-20, 20, 5000)                       # host projections far past several bit flips
@@ -168,6 +195,45 @@ def test_lattice_scale_recovers_decoder_gain():
     for gain in (0.8, 1.0, 1.25):                       # print blur / camera: data vs pilot gain drifts
         c = u * 2.0 * ic.DATA_GAIN * gain + rng.normal(0, 0.05, n)
         assert abs(ic.lattice_scale(c, w, used, 2.0) / (2.0 * ic.DATA_GAIN * gain) - 1) < 0.07, gain
+
+
+def test_deridge_keeps_spikes_and_flattens_streaks():
+    """A straight edge is a streak through the spectrum with strong local maxima all along it;
+    a pilot line is an isolated spike. Only the spike may survive as a candidate line."""
+    rng = np.random.default_rng(5)
+    R = rng.gamma(9, 1 / 9, (128, 128)).astype(np.float32)   # Welch-averaged whitened texture: ~1
+    R[40, 20:110] += 25 + 5 * np.cos(np.arange(90))          # streak with bumps along it
+    R[90, 70] += 8                                           # faint isolated line
+    D = ic._deridge(R)
+    assert D[90, 70] == pytest.approx(R[90, 70], rel=0.3)    # the spike keeps its strength
+    assert D[40, 30:100].max() < 4 < D[90, 70]                # the streak drops to texture level
+
+
+def test_data_lattice_does_not_scale_with_the_pilot(monkeypatch):
+    """The lattice unit is the pilot amplitude at PILOT = 1, so a fainter pilot leaves the data's
+    lattice (its robustness) unchanged, and the decoder measures the same unit."""
+    img = photo_like(360, 540)
+    units = []
+    for p in (1.0, 0.5):
+        monkeypatch.setattr(ic, "PILOT", p)
+        enc, st = ic.encode(img, b"hi", delta=2, subblock_px=6)
+        assert st["wrong_cells"] < 0.02, (p, st)
+        units.append(ic.cell_means(ic.to_lab(enc)[..., 0], (lambda q: q * 24 - 0.5, (2.0, 20.0, 2.0, 12.0), 4))[5])
+    assert units[1] == pytest.approx(units[0], rel=0.15)
+
+
+def test_small_image_scanned_with_large_spectral_windows(monkeypatch):
+    """Images under 512 px a side still get 256-px spectral windows (the line's power over the
+    texture grows with the window area); regions shrink to fit and the last one sits flush."""
+    assert ic._starts(594, 512, 128) == [0, 82] and ic._starts(512, 512, 128) == [0]
+    calls = []
+    real = ic.sync_in_region
+    monkeypatch.setattr(ic, "sync_in_region", lambda reg, n: calls.append((reg.shape, n)) or real(reg, n))
+    enc, _ = ic.encode(photo_like(400, 560), b"hi", delta=2, subblock_px=6)
+    seeds = ic.find_seeds(ic.to_lab(enc)[..., 0])
+    assert calls[0] == ((400, 512), 256)
+    cell = np.sqrt(abs(np.linalg.det(np.c_[seeds[0][2], seeds[0][3]])))
+    assert cell == pytest.approx(24, rel=0.03)
 
 
 def test_refine_snaps_map_onto_the_pilot():

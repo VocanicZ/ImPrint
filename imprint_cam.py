@@ -3,11 +3,11 @@
 The encoded image IS the original image (same size, no frame, no markers) plus a faint lightness
 texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
 
-* the PILOT (hidden sync, the invisible stand-in for a QR code's finder patterns): three faint
+* the PILOT (hidden sync, the invisible stand-in for a QR code's finder patterns): four faint
   cosines locked to the cell grid (PILOT_FREQS, cycles per cell). Each is one sharp spectral line,
   so the decoder finds the grid - spacing, angle, mirror, perspective - anywhere in a photo from
   the spectrum, with no border or picture outline. The encoder first notches the image's own
-  content at those three frequencies so busy texture can't drown them. Matched-filter phase gives
+  content at those frequencies so busy texture can't drown them. Matched-filter phase gives
   the exact cell offset; the decoder then tracks the pilot outward and fits perspective + curl.
 * one DATA bit per cell, carried by the cell's correlation with its own +-1 sub-block pattern,
   quantized onto a lattice (QIM): the bit is the sign near zero and flips every QIM_STEP pilot
@@ -35,7 +35,7 @@ import numpy as np
 K = 4                       # sub-blocks per cell side
 SEED = 0x1A9
 MAX_BYTES = 32
-PILOT = 1.0                 # pilot (sync) amplitude relative to the data strength
+PILOT = 0.7                 # pilot (sync) amplitude relative to the data strength
 SUBBLOCK_MM = 0.8           # target printed sub-block size
 VIEW_MM = 350.0             # viewing distance the perceptual mask assumes (a print at arm's length)
 JND_FLAT = 0.2              # printed grating's flat-area threshold, x Chou-Li's display JND
@@ -75,12 +75,21 @@ def visibility(orig: np.ndarray, enc: np.ndarray) -> dict:
 
 # ---------------------------------------------------------------- patterns
 
-# Pilot: three faint cosines locked to the cell grid, frequencies in cycles per cell (x, y).
-# Their 2x2 determinants (10, -11, -3) share no factor, so together they repeat exactly once
-# per cell (unique cell alignment), and the set has no rotation/mirror symmetry (unique
-# orientation). Each is one sharp spectral line: easy to find under any image texture.
-PILOT_FREQS = np.array([[3.0, 1.0], [-1.0, 3.0], [2.0, -3.0]])
-PILOT_PHASES = np.array([0.3, 1.7, 4.1])
+# Pilot: four faint cosines locked to the cell grid, frequencies in cycles per cell (x, y).
+# Their 2x2 determinants (10, -11, 7, -3, ...) share no factor, so together they repeat exactly
+# once per cell (unique cell alignment), and the set has no rotation/mirror symmetry beyond the
+# 180-degree turn no cosine can see (unique orientation). Each is one sharp spectral line: easy to
+# find under any image texture. The 4th line, (2, 3), makes the alignment robust: the first three
+# alone nearly repeat at a wrong offset (all three phases within 0.1 cycle of the truth there:
+# the matched filter scores it 0.97 of the true peak), so a faint pilot under busy texture
+# locked onto it; with (2, 3) the best wrong offset scores <= PILOT_ALIAS_MAX. It stays off the
+# spectrum's axes, where natural images keep most of their texture.
+PILOT_FREQS = np.array([[3.0, 1.0], [-1.0, 3.0], [2.0, -3.0], [2.0, 3.0]])
+PILOT_PHASES = np.array([0.3, 1.7, 4.1, 2.8])       # 4th phase: lowest peak of the summed field
+PILOT_ALIAS_MAX = 0.85
+SYNC_MIN_SIDE = 320         # smallest image/level side scanned with 256-px spectral windows
+SNR_MIN = 2.0               # a pilot probe counts when its lines stand this far above their
+                            # neighbours (a 4-line fit rejects wrong offsets, so a lower bar is safe)
 
 
 def pilot_field(h: int, w: int, c: float, x0: float = 0.0, y0: float = 0.0) -> np.ndarray:
@@ -92,7 +101,7 @@ def pilot_field(h: int, w: int, c: float, x0: float = 0.0, y0: float = 0.0) -> n
 
 
 def notch_pilot(lum: np.ndarray, c: float, sigma_cells: float = 1.0) -> np.ndarray:
-    """Remove the image's own content at the three pilot frequencies (a notch ~1 cell wide in
+    """Remove the image's own content at the pilot frequencies (a notch ~1 cell wide in
     frequency), so after embedding those lines carry only the pilot: the decoder then finds it
     even under busy texture. Taking out a sliver of texture at exact frequencies is imperceptible."""
     h, w = lum.shape
@@ -392,9 +401,10 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.2, subblock_px: int
     h = measure(lum + notch + pil, rows, cols, b, D)          # pilot + notch are part of what data must beat
     g = measure(field(np.ones(n, np.float32), rows, cols, b, D) * m, rows, cols, b, D)
     dc = delta * g / gain(b)                                  # margin: delta where mask = 1
-    # The lattice unit is the median pilot amplitude: the decoder measures the same median.
+    # The lattice unit is the median pilot amplitude at PILOT = 1: the decoder measures the same
+    # median, so a fainter pilot leaves the data lattice (and the data's robustness) unchanged.
     pa = pilot_amp(pil, rows, cols, c)
-    unit = float(np.median(pa[pa > 0])) if (pa > 0).any() else delta
+    unit = float(np.median(pa[pa > 0])) / PILOT if (pa > 0).any() else delta
     # Host-interference rejection (QIM): move each cell's correlation to the nearest lattice point
     # that reads its bit, so a busy host costs at most step/2 + margin, never a skipped cell.
     ok = g > 1e-6                                             # no room (clipped) -> leave the cell
@@ -460,15 +470,35 @@ def _subpixel(R: np.ndarray, y: int, x: int) -> tuple[float, float]:
 
 
 def _whitened_spectrum(region: np.ndarray, n: int = 256) -> np.ndarray:
-    """Welch-averaged power spectrum of a 2n x 2n region (3x3 overlapping n-windows), divided by
-    its local geometric mean: image texture -> ~1, random spikes average down, pilot lines stay."""
+    """Welch-averaged power spectrum of a region of n..2n px per side (3x3 overlapping n-windows,
+    spread over it), divided by its local geometric mean: image texture -> ~1, random spikes
+    average down, pilot lines stay."""
     P = 0
-    for y in (0, n // 2, n):
-        for x in (0, n // 2, n):
+    for y in np.linspace(0, region.shape[0] - n, 3).astype(int):
+        for x in np.linspace(0, region.shape[1] - n, 3).astype(int):
             w = region[y:y + n, x:x + n]
             P = P + np.abs(np.fft.fft2((w - w.mean()) * _hann(n))) ** 2
     P = np.fft.fftshift(P).astype(np.float32)
     return P / np.exp(cv2.blur(np.log(P + 1e-9), (9, 9)))
+
+
+@functools.cache
+def _ring_pairs(r: int = 3) -> tuple:
+    """Half of the ring of bins at Chebyshev distance r: each with its mirror makes one pair."""
+    return tuple((dx, dy) for dx in range(-r, r + 1) for dy in range(0, r + 1)
+                 if max(abs(dx), dy) == r and (dy > 0 or dx > 0))
+
+
+def _deridge(R: np.ndarray) -> np.ndarray:
+    """Divide out ridges. A straight edge in the picture (page border, clutter, a horizon) is a
+    streak through the spectrum, and a streak has strong local maxima all along it that can pass
+    for pilot lines. A pilot line is an isolated spike: across it, both sides drop to the
+    texture level. The ridge level at a bin is the best min(R(p + d), R(p - d)) over opposite
+    ring bins 3 away: ~1 beside a spike, the streak's own level on a streak."""
+    ridge = np.zeros_like(R)
+    for dx, dy in _ring_pairs():
+        ridge = np.maximum(ridge, np.minimum(np.roll(R, (dy, dx), (0, 1)), np.roll(R, (-dy, -dx), (0, 1))))
+    return R / np.maximum(ridge, 1.0)
 
 
 def _plausible(A: np.ndarray) -> bool:
@@ -479,9 +509,10 @@ def _plausible(A: np.ndarray) -> bool:
 
 
 def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
-    """Find the three pilot lines in a region's spectrum and solve the cell grid.
+    """Find the pilot lines in a region's spectrum and solve the cell grid: any two strong peaks
+    fix a candidate grid, the other lines must show up where it predicts them.
     Returns (score, A) with A: cell coords -> px offsets (columns = cell vectors), or None."""
-    R = _whitened_spectrum(region, n)
+    R = _deridge(_whitened_spectrum(region, n))
     c = n // 2
     loc = (R == cv2.dilate(R, np.ones((3, 3), np.uint8))) & (R > 3)
     yy, xx = np.nonzero(loc)
@@ -503,51 +534,63 @@ def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
             return 1e-3
         return float(R[yi - 1:yi + 2, xi - 1:xi + 2].max())
 
-    best = None
+    best, nf = None, len(PILOT_FREQS)
     for a in range(len(obs)):
         for b in range(len(obs)):
             if a == b or a % (len(obs) // 2) == b % (len(obs) // 2):
                 continue
-            for i in range(3):
-                for j in range(3):
+            for i in range(nf):
+                for j in range(nf):
                     if i == j:
                         continue
                     F2 = PILOT_FREQS[[i, j]]
                     Mt = np.linalg.solve(F2, obs[[a, b]])            # obs = F @ Mt
-                    k = 3 - i - j
-                    third = PILOT_FREQS[k] @ Mt
                     A = np.linalg.inv(Mt)
                     cell = np.sqrt(abs(np.linalg.det(A)))
                     if not 12 <= cell <= n / 3 or not _plausible(A):
                         continue
-                    rk = r_at(third)
-                    if rk < 4:
+                    rest = [k for k in range(nf) if k not in (i, j)]
+                    pred = PILOT_FREQS[rest] @ Mt
+                    lr = np.log([r_at(f) for f in pred])
+                    if lr.mean() < np.log(4):                         # the other lines, on average
                         continue
-                    score = float(logR[a] + logR[b] + np.log(rk))
+                    score = float(logR[a] + logR[b] + lr.sum())
                     if best is None or score > best[0]:
-                        best = (score, Mt, (a, b, i, j, third))
+                        best = (score, Mt, (a, b, i, j, rest, pred, lr))
     if best is None:
         return None
-    # refine with all three lines (sub-pixel position of the predicted third)
-    score, Mt, (a, b, i, j, third) = best
-    xi, yi = int(round(c + third[0] * n)), int(round(c + third[1] * n))
-    y3, x3 = _subpixel(R, yi, xi)
-    fo = np.array([obs[a], obs[b], [(x3 - c) / n, (y3 - c) / n]])
-    Mt, *_ = np.linalg.lstsq(PILOT_FREQS[[i, j, 3 - i - j]], fo, rcond=None)
+    # refine with every line that shows (sub-pixel positions of the predicted ones)
+    score, Mt, (a, b, i, j, rest, pred, lr) = best
+    fo, used = [obs[a], obs[b]], [i, j]
+    for k, f, l in zip(rest, pred, lr):
+        if l >= np.log(2):
+            yk, xk = _subpixel(R, int(round(c + f[1] * n)), int(round(c + f[0] * n)))
+            fo.append([(xk - c) / n, (yk - c) / n])
+            used.append(k)
+    Mt, *_ = np.linalg.lstsq(PILOT_FREQS[used], np.array(fo), rcond=None)
     return score, np.linalg.inv(Mt)
 
 
+def _starts(size: int, span: int, step: int) -> list[int]:
+    """Offsets of span-long windows every step px over size px, the last one flush with the end."""
+    out = list(range(0, size - span + 1, step))
+    return out if out[-1] == size - span else out + [size - span]
+
+
 def find_seeds(lum: np.ndarray) -> list:
-    """Scan the photo (all pyramid levels) in 2n x 2n regions for the pilot (n = 256, or 128 when
-    the image/level is small). Returns [(score, centre_xy, e1, e2)] in full-res px, best first."""
+    """Scan the photo (all pyramid levels) for the pilot in regions of up to 2n x 2n px, n-px
+    spectral windows. A line's power over the texture grows with the window's area, so n = 256
+    wherever it fits (n = 128 only on small images/levels). Returns [(score, centre_xy, e1, e2)]
+    in full-res px, best first."""
     seeds, img, f = [], lum.astype(np.float32), 1
     while min(img.shape) >= 256:
-        n = 256 if min(img.shape) >= 512 else 128
-        for y in range(0, img.shape[0] - 2 * n + 1, n // 2):
-            for x in range(0, img.shape[1] - 2 * n + 1, n // 2):
-                r = sync_in_region(img[y:y + 2 * n, x:x + 2 * n], n)
+        n = 256 if min(img.shape) >= SYNC_MIN_SIDE else 128
+        h, w = min(2 * n, img.shape[0]), min(2 * n, img.shape[1])
+        for y in _starts(img.shape[0], h, n // 2):
+            for x in _starts(img.shape[1], w, n // 2):
+                r = sync_in_region(img[y:y + h, x:x + w], n)
                 if r:
-                    seeds.append((r[0], np.array([x + n, y + n]) * f, r[1][:, 0] * f, r[1][:, 1] * f))
+                    seeds.append((r[0], np.array([x + w / 2, y + h / 2]) * f, r[1][:, 0] * f, r[1][:, 1] * f))
         img, f = cv2.pyrDown(img), f * 2
     # the real code yields many nearby seeds with the same grid; clutter spikes are loners
     out = []
@@ -588,7 +631,7 @@ def _offset_grid(n: int = 48) -> tuple[np.ndarray, np.ndarray]:
 
 
 def pilot_phase(patch: np.ndarray, nc: int, S: int):
-    """Matched filter at the three pilot frequencies only (data and image live elsewhere).
+    """Matched filter at the pilot frequencies only (data and image live elsewhere).
     Returns (offset in cells (dx, dy): true lattice = sampled + offset, coherence 0..1, snr)."""
     x = (patch - patch.mean()).ravel()
     cf = _pilot_basis(nc, S) @ x                                 # complex coefficient per pilot line
@@ -622,7 +665,7 @@ def _pilot_shift(mc: np.ndarray, tpl: np.ndarray):
 # ---------------------------------------------------------------- decode
 
 def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, coh_min: float = 0.7,
-          snr_min: float = 2.5):
+          snr_min: float = SNR_MIN):
     """From one seed window, lock onto the pilot phase (sub-cell offset) and follow it outward over
     the picture, refitting a lattice->photo map (perspective + curl) as it grows. Lattice coords =
     true cell coords up to a whole-cell shift. sgn picks one of the two 180-degree twins that
@@ -699,7 +742,7 @@ def refine(lum: np.ndarray, model, passes: int = 3, **kw):
 
 
 def _refine_pass(lum: np.ndarray, model, r: int = 6, nc: int = 6, grow: float = 8,
-                 coh_min: float = 0.7, snr_min: float = 2.5):
+                 coh_min: float = 0.7, snr_min: float = SNR_MIN):
     fmap, (x0, x1, y0, y1), nprobe = model
     S = K * r
     lat, pho = [], []
@@ -735,7 +778,7 @@ def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 8):
     by `grow` cells per side (probes near the photo edge or in busy texture fail, but the fitted map
     still holds there); cells that don't map wholly inside the photo are dropped.
     Returns (m (cells, K*K) pilot-free sub-block means, w per-cell trust, used, rows, cols, unit) or
-    None; unit is the median pilot amplitude, the scale of the data lattice."""
+    None; unit is the median pilot amplitude at PILOT = 1, the scale of the data lattice."""
     fmap, (x0, x1, y0, y1), nprobe = model
     x0, x1, y0, y1 = x0 - grow, x1 + grow, y0 - grow, y1 + grow
     S = K * r
@@ -785,7 +828,7 @@ def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 8):
     if used.sum() < 16:
         return None
     m = m - np.average(m[used], axis=0, weights=w[used])          # remove the pilot (same in every cell)
-    return m, w, used, rows, cols, float(med)
+    return m, w, used, rows, cols, float(med) / PILOT
 
 
 def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -> float:
