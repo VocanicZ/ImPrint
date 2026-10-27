@@ -197,6 +197,52 @@ def test_lattice_scale_recovers_decoder_gain():
         assert abs(ic.lattice_scale(c, w, used, 2.0) / (2.0 * ic.DATA_GAIN * gain) - 1) < 0.07, gain
 
 
+def test_pilot_phase_locks_the_offset_under_heavy_noise():
+    """The 4th line makes the matched filter robust: under noise 6x the pilot's amplitude, the
+    3-line set misses the offset on ~1 in 5 patches (it drifts toward its near-repeat); 4 lines
+    recover nearly every one."""
+    rng = np.random.default_rng(1)
+    nc, S, ok = 6, 24, 0
+    for _ in range(100):
+        o = rng.uniform(0, 1, 2)
+        patch = ic.pilot_field(nc * S, nc * S, S, o[0] * S, o[1] * S) + rng.normal(0, 6, (nc * S, nc * S))
+        off, coh, snr = ic.pilot_phase(patch.astype(np.float32), nc, S)
+        ok += np.abs((off - o + 0.5) % 1 - 0.5).max() < 0.05
+    assert ok >= 95
+
+
+def test_whitened_spectrum_takes_regions_between_n_and_2n():
+    """Regions shrink to fit small images: the 3x3 windows spread over whatever is there, and a
+    line still stands far above the whitened texture (~1)."""
+    rng = np.random.default_rng(2)
+    yy, xx = np.mgrid[0:400, 0:320]
+    region = rng.normal(0, 4, (400, 320)) + np.cos(2 * np.pi * (20 * xx + 9 * yy) / 256)
+    R = ic._whitened_spectrum(region.astype(np.float32), 256)
+    assert R.shape == (256, 256)
+    assert R[128 + 9, 128 + 20] > 20 and np.median(R) < 1.5
+
+
+def test_track_and_refine_lock_onto_a_faint_pilot():
+    """At the default (faint) pilot, a seed tracks outward and a refine pass densifies the map.
+    Of the two 180-degree twins, exactly one puts every lattice point on a cell corner of the
+    encoded grid (the other mirrors it about a point off the corners), and that one reads."""
+    enc, _ = ic.encode(photo_like(360, 540), b"hi", delta=2, subblock_px=6)
+    lum = ic.to_lab(enc)[..., 0]
+    c = ic.K * 6
+    seed = ic.find_seeds(lum)[0]
+    g = np.stack(np.meshgrid(np.arange(-4, 5, 2.0), np.arange(-3, 4, 2.0)), -1).reshape(-1, 2)
+    on_grid = []
+    for sgn in (1, -1):
+        model = ic.track(lum, seed, sgn)
+        assert model is not None and model[2] >= 3, sgn
+        dense = ic._refine_pass(lum, model)
+        assert dense[2] > model[2], sgn
+        p = (dense[0](g) + 0.5) / c
+        on_grid.append((np.abs((p + 0.5) % 1 - 0.5).max() < 0.02, dense))
+    assert sum(ok for ok, _ in on_grid) == 1
+    assert ic.read(lum, next(m for ok, m in on_grid if ok))["payload"] == b"hi"
+
+
 def test_deridge_keeps_spikes_and_flattens_streaks():
     """A straight edge is a streak through the spectrum with strong local maxima all along it;
     a pilot line is an isolated spike. Only the spike may survive as a candidate line."""
