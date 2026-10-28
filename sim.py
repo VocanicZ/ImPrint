@@ -8,7 +8,6 @@ then confirm with the printed test sheet.
 """
 import argparse
 import glob
-import inspect
 import json
 import os
 import sys
@@ -235,7 +234,7 @@ def measure(path: str, trials: int, presets: list[str], print_cm: float, out_dir
     diff = np.clip(np.abs(enc.astype(int) - img.astype(int)) * 10, 0, 255).astype(np.uint8)
     for tag, im in (("enc", enc), ("diff_x10", diff), ("ladder", ic.make_ladder(img)[0])):
         cv2.imwrite(os.path.join(out_dir, f"{name}_{tag}.png"), cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
-    log(f"SSIM {st['ssim']}  mean dL {st['mean_dL']}")
+    log(f"delta {st['delta']}  SSIM {st['ssim']}  mean dL {st['mean_dL']}")
     geometry = {v: dict(ok=0, n=0) for v in GEOMETRY}
     ber = {}                  # bit error rate after combining repeats, before LDPC (decoded views)
     for t in range(trials):   # decode is deterministic: only the random crop changes between trials
@@ -262,7 +261,7 @@ def acceptance(images: list[str], trials: int, presets: list[str], print_cm: flo
     """Run the PRD #1 benchmark; print the criteria table; write acceptance.json and images."""
     os.makedirs(out_dir, exist_ok=True)
     config = dict(images=images, trials=trials, presets=presets, print_cm=print_cm,
-                  delta=inspect.signature(ic.encode).parameters["delta"].default)
+                  delta="auto", budget=dict(ssim=ic.VIS_SSIM, mean_dL=ic.VIS_DL))   # each image's delta: results
     results = {os.path.splitext(os.path.basename(p))[0]: measure(p, trials, presets, print_cm, out_dir)
                for p in images}
     rows, verdict = write_report(out_dir, config, results)

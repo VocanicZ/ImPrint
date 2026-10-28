@@ -52,8 +52,8 @@
     <label>Payload text (max 32 bytes; shorter = more robust)</label>
     <input type="text" id="e-text" value="IMPRINT1">
     <div class="row">
-      <div><label>Strength δ: <span id="e-dv">2</span> (lower = less visible)</label>
-        <input type="range" id="e-delta" min="1" max="4" step="0.25" value="2" style="width:100%"></div>
+      <div><label>Strength δ: <span id="e-dv">auto</span> (auto = strongest that stays invisible; lower = less visible)</label>
+        <input type="range" id="e-delta" min="0" max="4" step="0.25" value="0" style="width:100%"></div>
       <div><label>Print width (cm), sets the cell size</label><input type="number" id="e-width" value="15" min="3" step="0.5"></div>
     </div>
     <button class="go" id="e-go">Encode</button>
@@ -70,7 +70,7 @@
   </section>
 
   <section id="lad">
-    <p>Makes one A4 page with your picture encoded at strengths 1, 1.5, 2 and 3, labelled with plain text.
+    <p>Makes one A4 page with your picture encoded at strengths 0.75, 1, 1.5 and 2 (the default picks ~0.8 for busy pictures, ~1.2 for smooth ones), labelled with plain text.
        Print it at <b>100% / actual size</b>, check which ones you can see, then photograph the page and
        decode it: each decoded copy reports its strength (payload <code>d1.5…</code>).</p>
     <label>Image</label>
@@ -88,7 +88,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $(b.dataset.tab).classList.add('on');
 });
-$('e-delta').oninput = e => $('e-dv').textContent = e.target.value;
+$('e-delta').oninput = e => $('e-dv').textContent = +e.target.value ? e.target.value : 'auto';
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const kv = o => '<div class="kv">' + Object.entries(o).map(([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join('') + '</div>';
 const pct = x => (x * 100).toFixed(1) + '%';
