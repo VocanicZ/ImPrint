@@ -9,7 +9,11 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   the spectrum, with no border or picture outline. The encoder first notches the image's own
   content at those frequencies so busy texture can't drown them. Matched-filter phase gives
   the exact cell offset; the decoder then tracks the pilot outward probe by probe (each from its
-  neighbours' local grid, re-aimed when a tilt smears it) and fits perspective + curl.
+  neighbours' local grid or their homography, re-aimed when a tilt smears it) and fits
+  perspective + curl. When no
+  spectral peak leads anywhere (a steep tilt smears every window's lines into the noise), a grid
+  search scores every plausible local grid on all four lines at once and keeps those that probes
+  confirm as a lattice.
 * one DATA bit per cell, carried by the cell's correlation with its own +-1 sub-block pattern,
   quantized onto a lattice (QIM): the bit is the sign near zero and flips every QIM_STEP pilot
   amplitudes beyond, so whatever the host texture already holds there, the encoder only nudges it
@@ -17,13 +21,18 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   tiles of T x T cells repeated over the whole picture, so any big-enough piece decodes
   (crop-robust); the decoder tries every tile phase and both 180-degree twins, then a rate-1/2
   LDPC code, decoded by belief propagation on the soft cell values of every repeat, and CRC-32
-  confirm.
+  confirm. Encoder and decoder average the same span of every sub-block and both leave the pilot
+  out, so a clean file reads back the values the encoder set; the decoder reads only the picture
+  (the rectangle of cells that carries the pilot, a few cells past the tracked area).
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
 smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows a perceptual
 visibility threshold (luminance adaptation, the CSF at the printed pattern's frequency, contrast
 masking) and gamut headroom: flat areas get little, clipped areas (pure black/white, saturated) get
-nothing.
+nothing. The overall strength delta is per picture by default: the strongest that keeps SSIM and
+mean dL* inside a visibility budget (a smooth picture shows what a busy one hides, a busy one's
+lattice nudges cost more dL*). The pilot is twice the data strength: at a busy picture's low delta
+the data still reads, and the sync needs the extra amplitude to be found at all.
 """
 from __future__ import annotations
 
@@ -37,9 +46,10 @@ import numpy as np
 K = 4                       # sub-blocks per cell side
 SEED = 0x1A9
 MAX_BYTES = 32
-PILOT = 1.0                 # pilot (sync) amplitude relative to the data strength, shared by the
-                            # PILOT_FREQS lines: four lines make each one 3/4 as strong as three did
-                            # (0.85 or less loses print sync: kodim05 `easy` drops below the base)
+PILOT = 2.0                 # pilot (sync) amplitude relative to the data strength, shared by the
+                            # PILOT_FREQS lines. Under the visibility budget a busy picture's delta
+                            # drops to ~0.8: the data still reads there, but at 1.0 half the pilot
+                            # probes of a print photo fail; 2.0 locks ~all for ~0.1 mean dL
 SUBBLOCK_MM = 0.8           # target printed sub-block size
 VIEW_MM = 350.0             # viewing distance the perceptual mask assumes (a print at arm's length)
 JND_FLAT = 0.2              # printed grating's flat-area threshold, x Chou-Li's display JND
@@ -47,7 +57,7 @@ JND_REF = 1.0               # visibility threshold (L*) that gets 1x strength
 MASK_LO, MASK_HI = 0.6, 3.2 # flat floor: a QIM cell on a flat host costs only its margin
 PILOT_HI = 1.5              # pilot's mask ceiling: it sets the data lattice unit, so more costs energy
 QIM_STEP = 2.8              # data lattice: a cell's bit flips every QIM_STEP pilot amplitudes
-DATA_GAIN = 0.85            # decoder's data correlation per lattice unit (its sub-block means see a
+DATA_GAIN = 0.9             # decoder's data correlation per lattice unit (its sub-block means see a
                             # little less of the data window than the encoder's)
 RAMP = np.arange(K) - (K - 1) / 2
 
@@ -147,13 +157,20 @@ def window(b: int) -> np.ndarray:
     return np.outer(w, w).astype(np.float32)
 
 
-def inner(b: int) -> slice:
-    """Central half of a sub-block: what the decoder averages (tolerates blur/misalignment)."""
-    return slice(b // 4, b - b // 4)
+@functools.cache
+def inner(b: int) -> np.ndarray:
+    """Weights (sum 1) of the central half of a b-px sub-block, [b/4, 3b/4), each px by its overlap:
+    what both the encoder and the decoder average (tolerates blur/misalignment). The same span at
+    any b, so the decoder, resampling at its own px per sub-block, sees exactly the encoder's
+    window: a narrower or wider one would see a busy host's texture differently, and that
+    difference reads as noise the lattice can't remove."""
+    x = np.arange(b)
+    w = np.clip(np.minimum(x + 1, 3 * b / 4) - np.maximum(x, b / 4), 0, 1)
+    return w / w.sum()
 
 
 def gain(b: int) -> float:
-    return float(window(b)[inner(b), inner(b)].mean())
+    return float(inner(b) @ window(b) @ inner(b))
 
 
 def qim_soft(u: np.ndarray, step: float = QIM_STEP) -> np.ndarray:
@@ -184,8 +201,8 @@ def pilot_amp(chan: np.ndarray, rows: int, cols: int, c: int) -> np.ndarray:
 
 def subblock_means(chan: np.ndarray, rows: int, cols: int, b: int) -> np.ndarray:
     """(rows*cols, K, K) inner means of every sub-block. chan: (rows*K*b, cols*K*b)."""
-    s = inner(b)
-    m = chan.reshape(rows, K, b, cols, K, b)[:, :, s, :, :, s].mean(axis=(2, 5))
+    w = inner(b)
+    m = np.einsum("ikajlb,a,b->ikjl", chan.reshape(rows, K, b, cols, K, b), w, w)
     return m.transpose(0, 2, 1, 3).reshape(rows * cols, K, K)
 
 
@@ -370,8 +387,33 @@ def subblock_for_print(width_px: int, print_mm: float) -> int:
     return max(4, int(round(width_px * SUBBLOCK_MM / print_mm)))
 
 
-def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.2, subblock_px: int = 8):
-    """Embed payload into an RGB uint8 image. Returns (image of the same size, stats)."""
+# Default strength: a visibility budget, not a fixed delta. A smooth picture shows the pattern at a
+# delta a busy one hides, while a busy one's QIM nudges cost more L*: the encoder takes the
+# strongest delta (up to DELTA_MAX) that keeps both measures inside the budget.
+VIS_SSIM = 0.955            # SSIM floor (PRD: >= 0.95)
+VIS_DL = 0.99               # mean |dL*| ceiling (PRD: <= 1.0; measured rounded to 0.01)
+DELTA_MIN, DELTA_MAX = 0.5, 2.4
+
+
+def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock_px: int = 8):
+    """Embed payload into an RGB uint8 image. Returns (image of the same size, stats).
+    delta None: the strongest within the visibility budget (VIS_SSIM, VIS_DL), by bisection."""
+    if delta is not None:
+        return _embed(rgb, payload, delta, subblock_px)
+    lo, hi, best = DELTA_MIN, DELTA_MAX, None
+    for i in range(7):
+        d = hi if i == 0 else (lo + hi) / 2                     # the cap first: often within budget
+        out, st = _embed(rgb, payload, d, subblock_px)
+        if st["ssim"] >= VIS_SSIM and st["mean_dL"] <= VIS_DL:
+            best, lo = (out, st), d
+            if i == 0:
+                break
+        else:
+            hi = d
+    return best or _embed(rgb, payload, DELTA_MIN, subblock_px)
+
+
+def _embed(rgb: np.ndarray, payload: bytes, delta: float, subblock_px: int):
     nb = len(payload)
     if not 1 <= nb <= MAX_BYTES:
         raise ValueError(f"payload must be 1..{MAX_BYTES} bytes")
@@ -402,7 +444,10 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.2, subblock_px: int
     pil = PILOT * delta * pilot_field(rows * c, cols * c, c) * pm
     lum_n = notch_pilot(lum, c)
     notch = (lum_n - lum) * room                              # only where there's room to change
-    h = measure(lum + notch + pil, rows, cols, b, D)          # pilot + notch are part of what data must beat
+    # pilot + notch are part of what the data must beat, less the mean cell: the decoder takes
+    # that out (it is the pilot, the same in every cell) before it reads the data
+    mean_cell = _cells(pil, c).mean(axis=(0, 1))
+    h = measure(lum + notch + pil - np.tile(mean_cell, (rows, cols)), rows, cols, b, D)
     g = measure(field(np.ones(n, np.float32), rows, cols, b, D) * m, rows, cols, b, D)
     dc = delta * g / gain(b)                                  # margin: delta where mask = 1
     # The lattice unit is the median pilot amplitude at PILOT = 1: the decoder measures the same
@@ -417,8 +462,8 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float = 2.2, subblock_px: int
     out = to_rgb(lab)
 
     got = s * qim_soft(measure(to_lab(out)[:rows * c, :cols * c, 0], rows, cols, b, D) / unit)
-    stats = dict(rows=rows, cols=cols, tile=T, tiles=round(n / T ** 2, 1), subblock_px=b, bits=nbits,
-                 wrong_cells=round(float((got <= 0).mean()), 4), **visibility(rgb, out))
+    stats = dict(delta=round(float(delta), 3), rows=rows, cols=cols, tile=T, tiles=round(n / T ** 2, 1),
+                 subblock_px=b, bits=nbits, wrong_cells=round(float((got <= 0).mean()), 4), **visibility(rgb, out))
     return out, stats
 
 
@@ -711,6 +756,141 @@ def _pilot_shift(mc: np.ndarray, tpl: np.ndarray):
     return np.array([dy, dx]), float(C[dy, dx] / (np.linalg.norm(mc) * np.linalg.norm(tpl) + 1e-12))
 
 
+def pilot_probe(lum: np.ndarray, q, Q, P, J, nc: int = 8, S: int = K * 6, coh_min: float = 0.7,
+                snr_min: float = SNR_MIN):
+    """Probe the nc x nc-cell patch centred on lattice point q of the local map x -> P + (x - Q) J^T
+    (J: columns = cell vectors in px), re-aimed by pilot_warp if the map's local warp smears it.
+    Returns (true lattice point, its photo px, local J, snr) or None."""
+    g = lambda x: P + (x - Q) @ J.T
+    patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
+    off, coh, snr = pilot_phase(patch, nc, S)
+    for grid in (WARP_COARSE, WARP_FINE):                         # smeared: re-aim at where the lines are
+        if coh >= coh_min and snr >= snr_min:
+            break
+        M = pilot_warp(patch, nc, S, grid)
+        if M is None:
+            return None
+        J = J @ np.linalg.inv(M).T
+        g = lambda x: P + (x - Q) @ J.T
+        patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
+        off, coh, snr = pilot_phase(patch, nc, S)
+    if coh < coh_min or snr < snr_min:
+        return None
+    return q + (off + 0.5) % 1 - 0.5, g(q[None])[0], J, snr
+
+
+def map_probe(lum: np.ndarray, q, g, nc: int = 8, S: int = K * 6, coh_min: float = 0.7, snr_min: float = SNR_MIN):
+    """Probe the patch centred on lattice point q through the map g (lattice -> photo px).
+    Returns like pilot_probe, or None."""
+    off, coh, snr = pilot_phase(resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S), nc, S)
+    if coh < coh_min or snr < snr_min:
+        return None
+    p = g(np.array([q, q + [1, 0], q + [0, 1]], np.float64))
+    return q + (off + 0.5) % 1 - 0.5, p[0], np.c_[p[1] - p[0], p[2] - p[0]], snr
+
+
+def _homography_map(lat, photo, ransac: float = 0.0):
+    H, _ = cv2.findHomography(np.asarray(lat, np.float64), np.asarray(photo, np.float64),
+                              cv2.RANSAC if ransac else 0, ransac)
+    return None if H is None else (lambda x: (lambda p: p[:, :2] / p[:, 2:])(np.c_[x, np.ones(len(x))] @ H.T))
+
+
+def homography_probe(lum: np.ndarray, q, near: list, nc: int = 8, S: int = K * 6, coh_min: float = 0.7,
+                     snr_min: float = SNR_MIN):
+    """Probe the patch centred on lattice point q through the homography of the probes around it
+    (near: their (lattice point, photo px, ...)). Under a steep tilt the cell size changes a few %
+    per cell, so across an 8-cell patch any affine map is off at the edges and smears the lines
+    (a probe's snr halves); the neighbours' perspective is not. Returns like pilot_probe, or None."""
+    g = _homography_map([n[0] for n in near], [n[1] for n in near])
+    return None if g is None else map_probe(lum, q, g, nc, S, coh_min, snr_min)
+
+
+# Grid seed search: the fallback when no spectral seed reads. Under a steep tilt the cell size
+# changes ~2x across the page, so a window's pilot lines smear to near the spectrum's noise and
+# its strongest peaks are clutter. Instead of peaks, score every plausible local grid at once.
+GRID_ROT = 2.0                          # turn step (deg)
+GRID_ANIS = (1.0, 1.15, 1.3, 1.5)       # foreshortening ratios (any direction, GRID_DIR steps)
+GRID_DIR = 15.0
+GRID_SCALE = 1.03                       # cell-size step
+GRID_TOP = 60                           # best distinct grids verified per window
+GRID_SNR = 2.0                          # a verified seed's probe must beat this (its neighbours must agree too)
+
+
+@functools.cache
+def _grid_bases() -> tuple[np.ndarray, np.ndarray]:
+    """Unit-size candidate cell grids: a square cell at every turn, both mirror images, and every
+    foreshortening up to 1.5:1 in any direction. Returns (B: (n, 2, 2), columns = cell vectors;
+    G = PILOT_FREQS @ inv(B): (n, lines, 2), each line's frequency for a 1-px cell)."""
+    rot = lambda a: np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+    out = []
+    for mir in (1, -1):
+        for th in np.deg2rad(np.arange(0, 180, GRID_ROT)):      # a 180-degree turn looks the same
+            for a in GRID_ANIS:
+                for ph in np.deg2rad(np.arange(0, 180, GRID_DIR)) if a > 1 else [0.0]:
+                    U = rot(ph)
+                    out.append(rot(th) @ U @ np.diag([np.sqrt(a), 1 / np.sqrt(a)]) @ U.T @ np.diag([1, mir]))
+    B = np.array(out)
+    return B, PILOT_FREQS @ np.linalg.inv(B)
+
+
+def grid_candidates(region: np.ndarray, n: int = 256, top: int = GRID_TOP) -> list[np.ndarray]:
+    """Every candidate grid (bases x cell sizes 12 px .. n/3) scored by the whitened log power at
+    all four of its lines (a 3x3-bin max: the lines smear). Returns the best `top` cell-vector
+    matrices A (px), one per distinct set of line positions, best first."""
+    R = _deridge(_whitened_spectrum(region, n))
+    L = np.log(np.maximum(cv2.dilate(R, np.ones((3, 3), np.uint8)), 0.3))
+    c = n // 2
+    scales = 12 * GRID_SCALE ** np.arange(int(np.log(n / 36) / np.log(GRID_SCALE)) + 1)
+    B, G = _grid_bases()
+    nu = G[:, None] / scales[None, :, None, None]                 # (bases, scales, lines, 2)
+    xi, yi = (np.rint(c + nu[..., i] * n).astype(int) for i in (0, 1))
+    score = L[np.clip(yi, 0, n - 1), np.clip(xi, 0, n - 1)].sum(-1)
+    score[(np.hypot(nu[..., 0], nu[..., 1]) > 1 / 2.3).any(-1)] = -np.inf
+    out, lines = [], []
+    for o in np.argsort(-score.ravel()):
+        bi, si = divmod(int(o), len(scales))
+        if len(out) >= top or not np.isfinite(score[bi, si]):
+            break
+        f = np.c_[xi[bi, si], yi[bi, si]]
+        if any(np.abs(f - g).max() <= 2 or np.abs(f - (2 * c - g)).max() <= 2 for g in lines):
+            continue                                              # same lines (or the 180-degree twin)
+        lines.append(f)
+        out.append(B[bi] * scales[si])
+    return out
+
+
+def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
+    """Seeds from the grid search: 256-px windows on a 3x3 grid over the middle of the photo, at
+    full and half resolution. A candidate counts when the probe at the window centre locks
+    (GRID_SNR) and so do at least two of the four probes `step` cells away along its cell vectors,
+    each finding its cells where the centre's lattice puts them: noise or an alias grid that
+    catches some of the lines can fake one probe, not a lattice. Returns [(score, centre_xy, e1, e2)], best first."""
+    seeds, img, f = [], lum.astype(np.float32), 1
+    for _ in range(2):
+        if min(img.shape) < n:
+            break
+        for fy in (0.35, 0.5, 0.65):
+            for fx in (0.35, 0.5, 0.65):
+                x = min(max(int(fx * img.shape[1]) - n // 2, 0), img.shape[1] - n)
+                y = min(max(int(fy * img.shape[0]) - n // 2, 0), img.shape[0] - n)
+                ctr = np.array([x + n / 2, y + n / 2]) * f - 0.5
+                for A in grid_candidates(img[y:y + n, x:x + n], n):
+                    hit = pilot_probe(lum, np.zeros(2), np.zeros(2), ctr, A * f, snr_min=GRID_SNR)
+                    if hit is None:
+                        continue
+                    Q, P, J, snr = hit
+                    good = 0
+                    for d in step * np.array([[1, 0], [-1, 0], [0, 1], [0, -1]], np.float64):
+                        r = pilot_probe(lum, d, np.zeros(2), P, J)
+                        # a true lattice predicts where the neighbour's cells start, an alias doesn't
+                        good += r is not None and np.abs((r[0] - d - Q + 0.5) % 1 - 0.5).max() < 0.25
+                    if good >= 2:
+                        seeds.append((good + snr, P, J[:, 0], J[:, 1]))
+                        break                                     # this window has its seed
+        img, f = cv2.pyrDown(img), f * 2
+    return sorted(seeds, key=lambda s: -s[0])
+
+
 # ---------------------------------------------------------------- decode
 
 def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: int = 2,
@@ -724,36 +904,22 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     out, enough to smear an 8-cell probe's phase), so every probe carries its own local map: its
     lattice point, its photo px and its local cell vectors, refit from the probes around it. A
     neighbour is predicted one step from there; a probe still smeared is re-aimed (pilot_warp).
+    Once four probes surround a point it is sampled through their homography instead: across an
+    8-cell patch even the exact local affine map is off where the cells shrink. A probe that fails
+    is retried when more neighbours have locked, and when the frontier runs dry it is probed once
+    more through the homography of every probe so far.
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
     S = K * r
     cell = float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0])))
 
-    def probe(q, Q, P, J):
-        """Probe the patch centred on lattice point q of the local map x -> P + (x - Q) J^T.
-        Returns (true lattice point, its photo px, local J, snr) or None."""
-        g = lambda x: P + (x - Q) @ J.T
-        patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
-        off, coh, snr = pilot_phase(patch, nc, S)
-        for grid in (WARP_COARSE, WARP_FINE):                     # smeared: re-aim at where the lines are
-            if coh >= coh_min and snr >= snr_min:
-                break
-            M = pilot_warp(patch, nc, S, grid)
-            if M is None:
-                return None
-            J = J @ np.linalg.inv(M).T
-            g = lambda x: P + (x - Q) @ J.T
-            patch = resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S)
-            off, coh, snr = pilot_phase(patch, nc, S)
-        if coh < coh_min or snr < snr_min:
-            return None
-        return q + (off + 0.5) % 1 - 0.5, g(q[None])[0], J, snr
+    probe = lambda q, Q, P, J: pilot_probe(lum, q, Q, P, J, nc, S, coh_min, snr_min)
 
     first = probe(np.zeros(2), np.zeros(2), np.asarray(c0, np.float64), sgn * np.c_[e1, e2])
     if first is None:
         return None
     nodes = {(0, 0): first}
-    heap, done = [], {(0, 0)}
+    heap, done, tried = [], {(0, 0)}, {}          # tried: a failed probe's neighbour count (it retries with more)
 
     def push(key):
         for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
@@ -761,22 +927,9 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             if k not in done:
                 heapq.heappush(heap, (-nodes[key][3], k, key))
 
-    push((0, 0))
-    while heap and len(done) < 4000:
-        _, key, parent = heapq.heappop(heap)
-        if key in done:
-            continue
-        Q, P, J, _ = nodes[parent]
-        q = np.array(key, np.float64) * step
-        p = P + (q - Q) @ J.T
-        if not (0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]):
-            done.add(key)
-            continue
-        res = probe(q, Q, P, J)
-        done.add(key)
-        if res is None:
-            continue
+    def accept(key, res):
         Qn, Pn, Jn, snr = res
+        done.add(key)
         near = [nodes[k] for k in ((key[0] + di, key[1] + dj) for di in range(-2, 3) for dj in range(-2, 3))
                 if k in nodes]
         if len(near) >= 3:                                        # local cell vectors from the neighbours
@@ -786,6 +939,50 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
                 Jn = np.linalg.lstsq(dQ, dP, rcond=None)[0].T
         nodes[key] = (Qn, Pn, Jn, snr)
         push(key)
+
+    def grow_from_heap():
+        while heap and len(done) + len(tried) < 6000:
+            _, key, parent = heapq.heappop(heap)
+            if key in done:
+                continue
+            Q, P, J, _ = nodes[parent]
+            q = np.array(key, np.float64) * step
+            p = P + (q - Q) @ J.T
+            if not (0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]):
+                done.add(key)
+                continue
+            around = [nodes[k] for k in ((key[0] + di, key[1] + dj) for di in range(-3, 4) for dj in range(-3, 4))
+                      if k in nodes]
+            if len(around) < tried.get(key, -9) + 3:
+                continue                                          # failed here before, with about as much to go on
+            tried[key] = len(around)
+            res = homography_probe(lum, q, around, nc, S, coh_min, snr_min) if len(around) >= 4 else None
+            res = res or probe(q, Q, P, J)
+            if res is not None:
+                accept(key, res)
+
+    push((0, 0))
+    while True:
+        grow_from_heap()
+        # out of frontier: probes where the cells shrink fade before their neighbours' local maps
+        # reach them, so retry the frontier once through the perspective of every probe so far
+        if len(nodes) < 8:
+            break
+        g = _homography_map([n[0] for n in nodes.values()], [n[1] for n in nodes.values()], 0.5 * cell)
+        added = 0
+        for key in {(k[0] + di, k[1] + dj) for k in nodes for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1))} - done:
+            if g is None or tried.get(key, 0) >= 99:
+                continue
+            tried[key] = 99                                           # the global map gets one try per key
+            q = np.array(key, np.float64) * step
+            p = g(q[None])[0]
+            on = 0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]
+            res = map_probe(lum, q, g, nc, S, coh_min, snr_min) if on else None
+            if res:
+                accept(key, res)
+                added += 1
+        if not added:
+            break
     L_ = np.array([n[0] for n in nodes.values()])
     P_ = np.array([n[1] for n in nodes.values()])
     fmap = None
@@ -852,10 +1049,12 @@ def _refine_pass(lum: np.ndarray, model, r: int = 6, nc: int = 6, grow: float = 
         int(keep.sum())
 
 
-def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 8):
+def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 4):
     """Rectify the tracked lattice, align cells on the pilot and remove it. The tracked extent grows
     by `grow` cells per side (probes near the photo edge or in busy texture fail, but the fitted map
-    still holds there); cells that don't map wholly inside the photo are dropped.
+    still holds there); cells that don't map wholly inside the photo are dropped. The dense tracker
+    reaches the picture's edges, so a few cells is enough: every cell past the edge is clutter
+    whose texture only adds noise (8 cost busy pictures their print reads).
     Returns (m (cells, K*K) pilot-free sub-block means, w per-cell trust, used, rows, cols, unit) or
     None; unit is the median pilot amplitude at PILOT = 1, the scale of the data lattice."""
     fmap, (x0, x1, y0, y1), nprobe = model
@@ -902,12 +1101,40 @@ def cell_means(lum: np.ndarray, model, r: int = 6, grow: float = 8):
     blur = lambda a: cv2.GaussianBlur(a.reshape(rows, cols).astype(np.float32), (0, 0), 1.0).ravel()
     local = blur(best_p) / np.maximum(blur(inside.astype(np.float32)), 1e-3)
     w = np.where(inside, np.clip(local / (med + 1e-9), 0, 2), 0.0)
+    # the encoded picture is one rectangle of cells: off it (paper, clutter, the cells `grow` adds
+    # past a picture edge) the pilot is gone, and those cells would only add noise and pull the
+    # unit down
+    r0, r1, c0, c1 = pilot_rect(np.where(inside, local / (med + 1e-9), 0.0).reshape(rows, cols))
+    keep = np.zeros((rows, cols), bool)
+    keep[r0:r1, c0:c1] = True
+    w = np.where(keep.ravel(), w, 0.0)
+    pos = best_p[keep.ravel() & (best_p > 0)]
+    med = np.median(pos) if len(pos) else med
     m = best_m.reshape(rows * cols, K * K)
     used = w > 0.2
     if used.sum() < 16:
         return None
     m = m - np.average(m[used], axis=0, weights=w[used])          # remove the pilot (same in every cell)
     return m, w, used, rows, cols, float(med) / PILOT
+
+
+def pilot_rect(level: np.ndarray, floor: float = 0.5) -> tuple[int, int, int, int]:
+    """The rectangle of cells holding the most pilot above floor x the median: the largest-sum
+    subrectangle of level - floor. Returns (r0, r1, c0, c1)."""
+    a = level - floor
+    rows, cols = a.shape
+    cs = np.vstack([np.zeros(cols), np.cumsum(a, 0)])
+    r0, r1 = np.triu_indices(rows + 1, 1)                          # every row band
+    col = cs[r1] - cs[r0]
+    run, start = np.zeros(len(col)), np.zeros(len(col), int)
+    best, at = np.full(len(col), -np.inf), np.zeros((len(col), 2), int)
+    for j in range(cols):                                         # Kadane along the columns, all bands at once
+        fresh = run <= 0
+        run, start = np.where(fresh, 0.0, run) + col[:, j], np.where(fresh, j, start)
+        up = run > best
+        best, at[up] = np.where(up, run, best), np.c_[start, np.full(len(col), j + 1)][up]
+    i = int(np.argmax(best))
+    return int(r0[i]), int(r1[i]), int(at[i, 0]), int(at[i, 1])
 
 
 def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -> float:
@@ -921,7 +1148,7 @@ def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -
     return s0 * 2 ** (ks[int(np.argmax(fit))] / 12)
 
 
-def read(lum: np.ndarray, model, r: int = 6, grow: float = 8) -> dict | None:
+def read(lum: np.ndarray, model, r: int = 6, grow: float = 4) -> dict | None:
     """Try every payload length and tile phase on the pilot-free cells: soft-combine repeats,
     LDPC belief propagation, CRC."""
     cm = cell_means(lum, model, r, grow)
@@ -977,21 +1204,23 @@ def _quad(model) -> np.ndarray:
 
 
 def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
-    """Find and decode every ImPrint in a photo or file: no border or outline needed."""
+    """Find and decode every ImPrint in a photo or file: no border or outline needed. Spectral
+    seeds first; if none of them reads, the grid search's seeds (steep tilts)."""
     lum = to_lab(rgb)[..., 0]
     seeds = find_seeds(lum)
     found, regions, tried = [], [], 0
-    for seed in seeds:
-        if tried >= max_seeds:
-            break
-        if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
-            continue                                                # inside a picture already read
-        tried += 1
+
+    def attempt(seed):
         res, locked = None, []
         for sgn in (1, -1):
-            model = track(lum, seed, sgn)
-            model = refine(lum, model) if model else None
+            tracked = track(lum, seed, sgn)
+            model = refine(lum, tracked) if tracked else None
             res = read(lum, model) if model else None
+            if not res and tracked and model is not tracked:
+                # the tracker's own probes now outnumber a refine pass's small windows, and in busy
+                # texture its fit can be the better one
+                res = read(lum, tracked)
+                model = tracked if res else model
             if res:
                 break
             if model and model[2] >= 30:
@@ -1014,6 +1243,17 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
                        photo_px_per_subblock=round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K, 1))
             found.append(res)
             regions.append(poly)
+
+    for batch in (seeds, None):
+        for seed in grid_seeds(lum) if batch is None else batch:
+            if batch is not None and tried >= max_seeds:
+                break                                               # (the grid's few seeds all get a turn)
+            if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
+                continue                                            # inside a picture already read
+            tried += 1
+            attempt(seed)
+        if found:
+            break
     return dict(found=found, tried=tried, seeds=len(seeds), overlay=draw(rgb, found))
 
 
@@ -1030,7 +1270,7 @@ def draw(rgb: np.ndarray, found: list[dict]) -> np.ndarray:
 # ---------------------------------------------------------------- strength ladder (test page)
 
 LADDER_DPI, PAGE_W, PAGE_H = 300, 2480, 3508
-LADDER_DELTAS = (1.0, 1.5, 2.0, 3.0)
+LADDER_DELTAS = (0.75, 1.0, 1.5, 2.0)   # around the budget's defaults (busy ~0.8, smooth ~1.2)
 
 
 def make_ladder(rgb: np.ndarray, tag: str = "") -> tuple[np.ndarray, list[dict]]:
@@ -1049,5 +1289,5 @@ def make_ladder(rgb: np.ndarray, tag: str = "") -> tuple[np.ndarray, list[dict]]
         x, y = 150 + (i % 2) * (cw + 100), 260 + (i // 2) * (ch + 260)
         page[y:y + enc.shape[0], x:x + enc.shape[1]] = enc
         put(f"strength {d:g}   SSIM {st['ssim']}", x, y + enc.shape[0] + 60, 0.8)
-        stats.append(dict(delta=d, **st))
+        stats.append(st)
     return page, stats

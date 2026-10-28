@@ -22,10 +22,13 @@ def photo_like(h=720, w=1080, seed=0):
 
 
 def test_same_size_no_markers():
+    """Same size as the original, at any strength; at the default strength (the visibility budget,
+    which replaced a fixed delta = 2.2) inside the PRD's visibility bounds, not just near them."""
     img = photo_like()
-    enc, st = ic.encode(img, b"hello", delta=2, subblock_px=6)
+    enc, st = ic.encode(img, b"hello", subblock_px=6)
     assert enc.shape == img.shape
-    assert st["ssim"] > 0.9 and st["mean_dL"] < 1.5, st
+    assert st["ssim"] >= ic.VIS_SSIM >= 0.95 and st["mean_dL"] <= ic.VIS_DL <= 1.0, st
+    assert ic.encode(img, b"hello", delta=2, subblock_px=6)[0].shape == img.shape
 
 
 def test_found_without_border_any_orientation():
@@ -301,6 +304,65 @@ def test_track_follows_a_steeply_tilted_page():
     assert b"hi" in reads
 
 
+def test_homography_probe_reads_where_the_local_affine_smears():
+    """Page turned 50 degrees: across an 8-cell probe the cell size changes enough that even the
+    exact local affine map is off at the patch's edges, and the lines smear below the gate.
+    Through the homography of six probes beside it, the same patch reads clearly and the probe
+    lands on its lattice point."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    img, H = tilted(enc, 50)
+    img = np.clip(img + np.random.default_rng(0).normal(0, 6, img.shape), 0, 255).astype(np.uint8)
+    lum = ic.to_lab(img)[..., 0]
+    T = lambda q: cv2.perspectiveTransform((np.atleast_2d(q) * 24)[None].astype(np.float64), H)[0] - 0.5
+    for q in (np.array([10.0, 15.0]), np.array([30.0, 15.0])):
+        P = T(q)[0]
+        J = np.c_[T(q + [1, 0])[0] - P, T(q + [0, 1])[0] - P]
+        affine = ic.pilot_phase(ic.resample(lum, lambda x: P + (x - q) @ J.T, q[0] - 4, q[1] - 4, 8, 8, 24), 8, 24)
+        assert affine[2] < ic.SNR_MIN, affine
+        near = [(q + d, T(q + d)[0]) for d in np.array([[-4, 0], [-2, 0], [-4, 2], [-4, -2], [-2, 2], [-2, -2]], float)]
+        hit = ic.homography_probe(lum, q, near)
+        assert hit is not None and hit[3] > 4 * ic.SNR_MIN and np.abs(hit[0] - q).max() < 0.05, hit
+
+
+def test_grid_search_seeds_a_page_the_spectral_peaks_miss(monkeypatch):
+    """With no spectral seed at all (a steep tilt smears every window's lines to the noise), decode
+    falls back to the grid search: every plausible local grid scored on all four lines at once,
+    verified by a probe and its neighbours. On a page turned 40 degrees it finds the true local
+    grid, of the page and of its mirror image, and the page reads."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    img, H = tilted(enc, 40)
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [])
+    found = ic.decode(img)["found"]
+    assert found and found[0]["payload"] == b"hi"
+    flip = np.diag([-1.0, 1, 1])
+    flip[0, 2] = img.shape[1] - 1
+    for view, Hv in ((img, H), (np.ascontiguousarray(img[:, ::-1]), flip @ H)):
+        seeds = ic.grid_seeds(ic.to_lab(view)[..., 0])
+        assert seeds, "no grid seed"
+        _, P, e1, e2 = seeds[0]                      # the best: the true cell vectors there (either twin)
+        p = cv2.perspectiveTransform(np.array([[P]], np.float64), np.linalg.inv(Hv))[0, 0]
+        q = cv2.perspectiveTransform(np.array([[p, p + [24, 0], p + [0, 24]]], np.float64), Hv)[0]
+        J = np.c_[q[1] - q[0], q[2] - q[0]]
+        assert min(np.linalg.norm(np.c_[e1, e2] - s * J) for s in (1, -1)) < 0.05 * np.linalg.norm(J), (seeds[0], J)
+
+
+def test_default_strength_fits_the_visibility_budget():
+    """No delta given: the encoder takes the strongest delta inside the visibility budget. A busy
+    picture gets less than a smooth one, both stay inside it, and a little more would not."""
+    smooth = photo_like(360, 540)
+    rng = np.random.default_rng(3)
+    busy = np.clip(smooth + cv2.GaussianBlur(rng.normal(0, 60, smooth.shape), (0, 0), 1.0), 0, 255).astype(np.uint8)
+    inside = lambda st: st["ssim"] >= ic.VIS_SSIM and st["mean_dL"] <= ic.VIS_DL
+    deltas = []
+    for img in (smooth, busy):
+        enc, st = ic.encode(img, b"hi", subblock_px=6)
+        assert inside(st), st
+        assert st["delta"] == ic.DELTA_MAX or not inside(ic.encode(img, b"hi", st["delta"] * 1.1, 6)[1]), st
+        deltas.append(st["delta"])
+    assert ic.DELTA_MIN < deltas[1] < deltas[0], deltas
+    assert ic.encode(smooth, b"hi", delta=1.3, subblock_px=6)[1]["delta"] == 1.3
+
+
 def test_deridge_keeps_spikes_and_flattens_streaks():
     """A straight edge is a streak through the spectrum with strong local maxima all along it;
     a pilot line is an isolated spike. Only the spike may survive as a candidate line."""
@@ -406,6 +468,79 @@ def test_cell_means_grows_but_drops_cells_outside_the_photo():
     inside = np.zeros((rows, cols), bool)
     inside[8:, 8:] = True                                 # lattice -8..18: cells < 0 lie off the photo
     assert not used.reshape(rows, cols)[~inside].any() and used.reshape(rows, cols)[inside].mean() > 0.5
+
+
+def test_decoder_sees_the_cells_the_encoder_set_on_a_busy_host():
+    """Busy pictures at a busy picture's low strength, 4-px sub-blocks: the decoder resamples at
+    its own 6 px per sub-block. It averages the same span of each sub-block as the encoder, and the
+    encoder's target leaves out the mean cell it subtracts, so the clean file reads at the true
+    grid with few wrong cells. (A wider decoder window and a target that kept the pilot in left
+    7% / 4.6% of the cells wrong: busy texture seen through a different window is noise.)"""
+    for name, most in (("kodim08", 0.05), ("kodim05", 0.025)):
+        img = cv2.cvtColor(cv2.imread(f"testdata/{name}.png"), cv2.COLOR_BGR2RGB)
+        enc, st = ic.encode(img, b"IMPRINT1", delta=0.8, subblock_px=4)
+        lum = ic.to_lab(enc)[..., 0]
+        r = ic.read(lum, (lambda q: q * 16 - 0.5, (0.0, st["cols"], 0.0, st["rows"]), 100), grow=0)
+        assert r and r["payload"] == b"IMPRINT1" and r["raw_ber"] < most, (name, r)
+
+
+def test_inner_window_spans_the_same_half_of_a_sub_block_at_any_size():
+    """The averaged span is [b/4, 3b/4) at every sub-block size, each px weighted by its overlap,
+    so a 4-px encoder sub-block and a 6-px decoder resample see the same thing: the mean of a
+    linear ramp across the sub-block (the span's centre) and the window's mean over that span."""
+    for b in (4, 5, 6, 8):
+        w = ic.inner(b)
+        assert w.sum() == pytest.approx(1) and w.min() >= 0
+        x = (np.arange(b) + 0.5) / b                                  # px centres, as a fraction of the sub-block
+        assert w @ x == pytest.approx(0.5)
+        assert np.flatnonzero(w)[[0, -1]].tolist() == [int(b / 4), int(np.ceil(3 * b / 4)) - 1]
+    sin = lambda u: np.sin(np.pi * u)                                 # the window's profile
+    span = np.linspace(0.25, 0.75, 2001)
+    for b in (8, 16, 32):                                             # gain -> the window's mean over the span
+        assert np.sqrt(ic.gain(b)) == pytest.approx(sin(span).mean(), abs=0.01), b   # (small b: px sampling)
+    assert ic.gain(6) == pytest.approx(ic.inner(6) @ ic.window(6) @ ic.inner(6))
+
+
+def test_grid_bases_cover_every_turn_mirror_and_foreshortening():
+    """The grid search's candidate unit cells: area 1, both mirror images, every turn up to 180
+    degrees (a cosine can't see a 180-degree turn), foreshortening up to GRID_ANIS[-1]; G puts
+    each pilot line where that grid would."""
+    B, G = ic._grid_bases()
+    det = np.linalg.det(B)
+    assert np.allclose(np.abs(det), 1) and (det > 0).any() and (det < 0).any()
+    assert np.allclose(G, ic.PILOT_FREQS @ np.linalg.inv(B))
+    ratio = np.array([np.sqrt(np.linalg.eigvalsh(b.T @ b)[::-1][0] / np.linalg.eigvalsh(b.T @ b)[0]) for b in B])
+    assert ratio.max() == pytest.approx(ic.GRID_ANIS[-1]) and ratio.min() == pytest.approx(1)
+    rng = np.random.default_rng(0)
+    for _ in range(20):                                               # any similarity grid has a close base
+        th, mir = rng.uniform(0, 2 * np.pi), rng.choice([1, -1])
+        A = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]) @ np.diag([1, mir])
+        assert min(np.abs(b - s * A).max() for b in B for s in (1, -1)) < np.deg2rad(ic.GRID_ROT)
+
+
+def test_pilot_rect_finds_the_picture():
+    """Cells on the picture carry the pilot (~1 x the median), cells off it don't (paper, clutter);
+    a few noisy cells either way don't move the rectangle."""
+    rng = np.random.default_rng(0)
+    level = rng.uniform(0, 0.3, (40, 60))
+    level[6:30, 9:51] = rng.uniform(0.6, 1.6, (24, 42))
+    level[10, 20] = level[20, 30] = 0.0                       # weak cells inside
+    level[2, 2] = level[35, 55] = 2.0                         # strays outside
+    assert ic.pilot_rect(level) == (6, 30, 9, 51)
+
+
+def test_decode_reads_the_tracked_map_when_the_refit_misses(monkeypatch):
+    """The dense tracker can fit busy texture better than a refine pass of small windows: when the
+    refined map doesn't read, the tracked one gets its turn."""
+    c = np.array([100.0, 50.0])
+    tracked = (lambda q: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 200)
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [(9.0, c, np.array([10.0, 0]), np.array([0, 10.0]))])
+    monkeypatch.setattr(ic, "grid_seeds", lambda lum: [])
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked)
+    monkeypatch.setattr(ic, "refine", lambda lum, m: (lambda q: c + 3 + 10 * q, m[1], 40))
+    monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"trk") if m is tracked else None)
+    found = ic.decode(np.zeros((100, 400, 3), np.uint8))["found"]
+    assert [f["payload"] for f in found] == [b"trk"]
 
 
 def zones(h=288, w=576, seed=0):
@@ -519,7 +654,8 @@ def test_acceptance_run_writes_report_and_images(tmp_path, monkeypatch, capsys):
     assert r["geometry"]["clean"] == dict(ok=1, n=1) and r["geometry"]["crop60"] == dict(ok=2, n=2)
     assert r["print"] == dict(easy=dict(ok=0, n=2), hard=dict(ok=0, n=2))
     assert r["bit_ber"] == {v: 0.0125 for v in sim.GEOMETRY}      # reported for every decoded view
-    assert rep["config"]["trials"] == 2 and rep["config"]["delta"] == 2.2 and rep["verdict"] == "FAIL"
+    assert rep["config"]["trials"] == 2 and rep["config"]["delta"] == "auto" and rep["verdict"] == "FAIL"
+    assert ic.DELTA_MIN <= r["delta"] <= ic.DELTA_MAX                # the strength the budget picked
     assert "| kodim23 | print gray | not run |" in capsys.readouterr().out
     img = cv2.imread(str(src)).astype(int)
     enc, diff = (cv2.imread(str(out / f"kodim23_{t}.png")).astype(int) for t in ("enc", "diff_x10"))

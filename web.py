@@ -65,12 +65,13 @@ def index():
 
 
 @app.post("/api/encode")
-async def encode(file: UploadFile = File(...), text: str = Form(...), delta: float = Form(2.0),
+async def encode(file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
                  width_cm: float = Form(15.0)):
+    """delta <= 0: the encoder's default, the strongest within its visibility budget."""
     rgb = read_rgb(await file.read())
     b = ic.subblock_for_print(rgb.shape[1], width_cm * 10)
     try:
-        enc, st = ic.encode(rgb, text.encode(), delta=delta, subblock_px=b)
+        enc, st = ic.encode(rgb, text.encode(), delta=delta if delta > 0 else None, subblock_px=b)
     except ValueError as e:
         raise HTTPException(400, str(e))
     diff = np.clip(np.abs(enc.astype(int) - rgb.astype(int)) * 10, 0, 255).astype(np.uint8)
