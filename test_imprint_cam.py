@@ -2,6 +2,7 @@
 import binascii
 import glob
 import json
+import os
 import sys
 
 import cv2
@@ -668,9 +669,15 @@ def _passing(img="kodim23"):
                 print={p: dict(ok=round(r * 5), n=5) for p, r in sim.PRINT_MIN[img].items()})
 
 
+def _all_passing():
+    """Every PRD #1 image at 5 trials, each just meeting its thresholds."""
+    return {img: _passing(img) for img in sim.PRINT_MIN}
+
+
 def test_acceptance_criteria_pass_on_threshold():
-    rows, verdict = sim.criteria({"kodim23": _passing(), "kodim05": _passing("kodim05")})
+    rows, verdict = sim.criteria(_all_passing())
     assert verdict == "PASS" and all(r["passed"] for r in rows)
+    assert sorted({r["image"] for r in rows}) == sorted(sim.PRINT_MIN)
     k23 = [r["criterion"] for r in rows if r["image"] == "kodim23"]
     assert k23 == ["SSIM", "mean dL"] + [f"decode {v}" for v in sim.GEOMETRY] + \
         [f"print {p}" for p in ("easy", "gray", "hard", "curled")]
@@ -685,27 +692,64 @@ def test_acceptance_criteria_fail_just_past_threshold():
     r = _passing()
     r["geometry"]["crop60"] = dict(ok=4, n=5)            # geometry must be 100%
     r["print"]["hard"] = dict(ok=3, n=5)                 # kodim23 needs >= 4/5
-    rows, verdict = sim.criteria({"kodim23": r})
+    rows, verdict = sim.criteria(dict(_all_passing(), kodim23=r))
     assert verdict == "FAIL"
-    assert sorted(x["criterion"] for x in rows if not x["passed"]) == ["decode crop60", "print hard"]
-    assert sim.criteria({"kodim05": dict(_passing("kodim05"), print=dict(easy=dict(ok=3, n=5),
-                                                                          gray=dict(ok=2, n=5)))})[1] == "FAIL"
+    assert sorted(x["criterion"] for x in rows if x["passed"] is False) == ["decode crop60", "print hard"]
+    assert sim.criteria(dict(_all_passing(), kodim05=dict(_passing("kodim05"), print=dict(
+        easy=dict(ok=3, n=5), gray=dict(ok=2, n=5)))))[1] == "FAIL"
 
 
 def test_acceptance_criteria_unmeasured_is_incomplete_not_pass():
     r = _passing()
     del r["print"]["curled"]                             # e.g. --presets easy,gray,hard
-    rows, verdict = sim.criteria({"kodim23": r})
+    rows, verdict = sim.criteria(dict(_all_passing(), kodim23=r))
     assert verdict == "INCOMPLETE"
     assert [x["passed"] for x in rows if x["criterion"] == "print curled"] == [None]
     r["print"]["hard"] = dict(ok=0, n=5)
     assert sim.criteria({"kodim23": r})[1] == "FAIL"    # a measured failure beats a gap
     other = dict(_passing(), print={})                   # an image with no print requirement
-    assert sim.criteria({"photo1": other})[1] == "PASS"
+    assert sim.criteria(dict(_all_passing(), photo1=other))[1] == "PASS"
+    assert sim.criteria({"photo1": other})[1] == "INCOMPLETE"
+
+
+def test_acceptance_criteria_missing_images_are_incomplete():
+    rows, verdict = sim.criteria({})
+    assert verdict == "INCOMPLETE" and rows and all(x["passed"] is None for x in rows)
+    assert [x["image"] for x in rows if x["criterion"] == "SSIM"] == list(sim.PRINT_MIN)
+    rows, verdict = sim.criteria({"kodim23": _passing()})      # e.g. --acceptance testdata/kodim23.png
+    assert verdict == "INCOMPLETE"
+    assert all(x["passed"] for x in rows if x["image"] == "kodim23")
+    for img in ("kodim05", "kodim08"):
+        miss = [x for x in rows if x["image"] == img]
+        assert [x["criterion"] for x in miss] == ["SSIM", "mean dL"] + [f"decode {v}" for v in sim.GEOMETRY] + \
+            [f"print {p}" for p in sim.PRINT_MIN[img]]
+        assert all(x["passed"] is None and x["measured"] == "not run" for x in miss)
+    assert "| kodim05 | print easy | not run | >= 0.60 | SKIP |" in sim.format_table(rows, verdict)
+
+
+def test_acceptance_criteria_too_few_trials_are_incomplete():
+    one = lambda img: dict(_passing(img), geometry={v: dict(ok=1, n=1) for v in sim.GEOMETRY},
+                           print={p: dict(ok=1, n=1) for p in sim.PRINT_MIN[img]})
+    rows, verdict = sim.criteria({img: one(img) for img in sim.PRINT_MIN})   # --trials 1, all decoded
+    assert verdict == "INCOMPLETE"
+    assert {x["criterion"] for x in rows if x["passed"] is None} == \
+        {"decode crop60", "print easy", "print gray", "print hard", "print curled"}
+    assert "| kodim23 | print hard | 1/1 (1.00), < 5 trials | >= 0.80 | SKIP |" in sim.format_table(rows, verdict)
+    r = _passing()
+    r["print"]["hard"] = dict(ok=3, n=4)                 # 4/5 still reachable
+    assert sim.criteria(dict(_all_passing(), kodim23=r))[1] == "INCOMPLETE"
+    r["print"]["hard"] = dict(ok=2, n=4)                 # 3/5 at best: already failed
+    assert sim.criteria(dict(_all_passing(), kodim23=r))[1] == "FAIL"
+    r = _passing()
+    r["geometry"]["crop60"] = dict(ok=0, n=1)            # one missed crop already fails 100%
+    assert sim.criteria(dict(_all_passing(), kodim23=r))[1] == "FAIL"
+    r = _passing()
+    r["print"]["easy"] = dict(ok=8, n=10)                # more trials than needed is fine
+    assert sim.criteria(dict(_all_passing(), kodim23=r))[1] == "PASS"
 
 
 def test_acceptance_table_and_json(tmp_path):
-    results = {"kodim23": _passing()}
+    results = _all_passing()
     rows, verdict = sim.criteria(results)
     table = sim.format_table(rows, verdict)
     assert "| kodim23 | print curled | 4/5 (0.80) | >= 0.80 | PASS |" in table
@@ -758,18 +802,30 @@ def test_acceptance_views_crop_is_60_percent_area():
     assert 0.59 <= v["crop60"].shape[0] * v["crop60"].shape[1] / (300 * 400) <= 0.6
 
 
-def test_cli_acceptance_defaults_and_overrides(monkeypatch):
-    got = []
-    monkeypatch.setattr(sim, "acceptance", lambda *a: got.append(a) or ("PASS" if len(got) < 3 else "FAIL"))
-    for argv, want, code in (
-            (["--quick"], (["testdata/kodim23.png"], 1, list(sim.PRESETS)), 0),
-            (["--acceptance"], (sorted(glob.glob("testdata/*.png")), 5, list(sim.PRESETS)), 0),
-            (["--acceptance", "--trials", "2", "--presets", "easy,gray", "a.png"], (["a.png"], 2, ["easy", "gray"]), 1)):
+def test_cli_acceptance_defaults_and_overrides(monkeypatch, tmp_path):
+    got, verdict = [], []
+    monkeypatch.setattr(sim, "acceptance", lambda *a: got.append(a) or verdict[0])
+    monkeypatch.chdir(tmp_path)                          # testdata/ resolves next to sim.py, not the cwd
+    k23, every = [os.path.join(sim.TESTDATA, "kodim23.png")], sorted(glob.glob(os.path.join(sim.TESTDATA, "*.png")))
+    assert [os.path.basename(p) for p in every] == ["kodim05.png", "kodim08.png", "kodim23.png"]
+    for argv, v, want, code in (
+            (["--quick"], "INCOMPLETE", (k23, 1, list(sim.PRESETS)), 0),   # --quick cannot PASS
+            (["--quick"], "FAIL", (k23, 1, list(sim.PRESETS)), 1),
+            (["--acceptance"], "PASS", (every, 5, list(sim.PRESETS)), 0),
+            (["--acceptance"], "INCOMPLETE", (every, 5, list(sim.PRESETS)), 1),
+            (["--acceptance", "--trials", "2", "--presets", "easy,gray", "a.png"], "FAIL",
+             (["a.png"], 2, ["easy", "gray"]), 1)):
+        verdict[:] = [v]
         monkeypatch.setattr(sys, "argv", ["sim.py", *argv])
         with pytest.raises(SystemExit) as e:
             sim.main()
-        assert got[-1][:3] == want and e.value.code == code, argv
+        assert got[-1][:3] == want and e.value.code == code, (argv, v)
     assert got[0][4] == "results/acceptance"
+    monkeypatch.setattr(sim, "TESTDATA", str(tmp_path / "empty"))
+    monkeypatch.setattr(sys, "argv", ["sim.py", "--acceptance"])
+    with pytest.raises(SystemExit) as e:
+        sim.main()
+    assert e.value.code == 2 and len(got) == 5          # argparse error, nothing run
 
 
 def test_cli_matrix_defaults(tmp_path, monkeypatch, capsys):

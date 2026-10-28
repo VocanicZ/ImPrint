@@ -168,27 +168,47 @@ PRINT_MIN = {   # image -> preset -> minimum simulated print+photo decode rate
 PAYLOAD = b"IMPRINT1"
 
 
-def _rate_row(image, name, m, need):
+TRIALS = 5   # print trials and random crops a rate needs before it can PASS
+TESTDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata")
+
+
+def _rate_row(image, name, m, need, trials=TRIALS):
+    """A decode-rate row. Under `trials` attempts it is None (INCOMPLETE) unless even a perfect
+    finish could not reach `need`, in which case it already FAILs."""
     if m is None:
         return dict(image=image, criterion=name, measured="not run", threshold=f">= {need:.2f}", passed=None)
     r = m["ok"] / m["n"]
-    return dict(image=image, criterion=name, measured=f"{m['ok']}/{m['n']} ({r:.2f})",
-                threshold=f">= {need:.2f}", passed=r >= need)
+    measured = f"{m['ok']}/{m['n']} ({r:.2f})"
+    if m["n"] >= trials:
+        passed = r >= need
+    else:
+        measured += f", < {trials} trials"
+        passed = False if m["ok"] + trials - m["n"] < need * trials else None
+    return dict(image=image, criterion=name, measured=measured, threshold=f">= {need:.2f}", passed=passed)
 
 
 def criteria(results: dict) -> tuple[list[dict], str]:
     """Score measured results against every PRD #1 criterion.
 
     results: image -> dict(ssim, mean_dL, geometry={view: {ok, n}}, print={preset: {ok, n}}).
-    Returns (rows, verdict). A row's passed is None when it was not measured; the verdict is
-    FAIL if any row fails, INCOMPLETE if some were not measured, else PASS."""
+    Every PRD #1 image (PRINT_MIN) gets rows, "not run" when it is missing from results.
+    Returns (rows, verdict). A row's passed is None when it was not (fully) measured; the
+    verdict is FAIL if any row fails, INCOMPLETE if some were not measured, else PASS."""
     rows = []
-    for image, r in results.items():
-        rows.append(dict(image=image, criterion="SSIM", measured=f"{r['ssim']:.4f}",
-                         threshold=f">= {SSIM_MIN}", passed=r["ssim"] >= SSIM_MIN))
-        rows.append(dict(image=image, criterion="mean dL", measured=f"{r['mean_dL']:.2f}",
-                         threshold=f"<= {MEAN_DL_MAX}", passed=r["mean_dL"] <= MEAN_DL_MAX))
-        rows += [_rate_row(image, f"decode {v}", r["geometry"].get(v), 1.0) for v in GEOMETRY]
+    for image in [*results, *(i for i in PRINT_MIN if i not in results)]:
+        r = results.get(image)
+        if r is None:
+            rows += [dict(image=image, criterion=c, measured="not run", threshold=t, passed=None)
+                     for c, t in (("SSIM", f">= {SSIM_MIN}"), ("mean dL", f"<= {MEAN_DL_MAX}"))]
+            r = dict(geometry={}, print={})
+        else:
+            rows.append(dict(image=image, criterion="SSIM", measured=f"{r['ssim']:.4f}",
+                             threshold=f">= {SSIM_MIN}", passed=r["ssim"] >= SSIM_MIN))
+            rows.append(dict(image=image, criterion="mean dL", measured=f"{r['mean_dL']:.2f}",
+                             threshold=f"<= {MEAN_DL_MAX}", passed=r["mean_dL"] <= MEAN_DL_MAX))
+        # decode is deterministic: one try settles a fixed view; only the random crop needs trials
+        rows += [_rate_row(image, f"decode {v}", r["geometry"].get(v), 1.0, TRIALS if v == "crop60" else 1)
+                 for v in GEOMETRY]
         rows += [_rate_row(image, f"print {p}", r["print"].get(p), need)
                  for p, need in PRINT_MIN.get(image, {}).items()]
     passed = [x["passed"] for x in rows]
@@ -278,15 +298,20 @@ def main():
     ap.add_argument("--trials", type=int)
     ap.add_argument("--print-cm", type=float, default=15.0)
     ap.add_argument("--acceptance", action="store_true", help="score every PRD #1 criterion (5 trials)")
-    ap.add_argument("--quick", action="store_true", help="acceptance on kodim23 only, 1 trial")
+    ap.add_argument("--quick", action="store_true", help="acceptance on kodim23 only, 1 trial (INCOMPLETE at best)")
     ap.add_argument("--out", default="results/acceptance", help="acceptance output dir")
     args = ap.parse_args()
     if args.acceptance or args.quick:
-        images = args.images or (["testdata/kodim23.png"] if args.quick else sorted(glob.glob("testdata/*.png")))
-        trials = args.trials or (1 if args.quick else 5)
+        images = args.images or ([os.path.join(TESTDATA, "kodim23.png")] if args.quick
+                                 else sorted(glob.glob(os.path.join(TESTDATA, "*.png"))))
+        if not images:
+            ap.error(f"no test images found in {TESTDATA}")
+        trials = args.trials or (1 if args.quick else TRIALS)
         presets = args.presets.split(",") if args.presets else list(PRESETS)
-        sys.exit(acceptance(images, trials, presets, args.print_cm, args.out) != "PASS")
-    args.images = args.images or sorted(glob.glob("testdata/*.png"))
+        verdict = acceptance(images, trials, presets, args.print_cm, args.out)
+        # --quick can never PASS (one image, one trial): it fails only on a measured FAIL
+        sys.exit(verdict == "FAIL" if args.quick else verdict != "PASS")
+    args.images = args.images or sorted(glob.glob(os.path.join(TESTDATA, "*.png")))
     args.presets = args.presets or ",".join(PRESETS)
     args.trials = args.trials or 2
     print("| image | delta | SSIM | mean dL | clean file | " + " | ".join(args.presets.split(",")) + " |")
