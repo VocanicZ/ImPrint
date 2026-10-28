@@ -39,6 +39,7 @@ from __future__ import annotations
 import binascii
 import functools
 import heapq
+import warnings
 
 import cv2
 import numpy as np
@@ -57,6 +58,8 @@ JND_REF = 1.0               # visibility threshold (L*) that gets 1x strength
 MASK_LO, MASK_HI = 0.6, 3.2 # flat floor: a QIM cell on a flat host costs only its margin
 PILOT_HI = 1.5              # pilot's mask ceiling: it sets the data lattice unit, so more costs energy
 QIM_STEP = 2.8              # data lattice: a cell's bit flips every QIM_STEP pilot amplitudes
+SWING_MAX = 10.0            # cap on a cell's peak data swing (L*), x delta: a mostly clipped cell
+                            # would otherwise put its whole nudge on its last few movable pixels
 DATA_GAIN = 0.9             # decoder's data correlation per lattice unit (its sub-block means see a
                             # little less of the data window than the encoder's)
 RAMP = np.arange(K) - (K - 1) / 2
@@ -85,6 +88,26 @@ def visibility(orig: np.ndarray, enc: np.ndarray) -> dict:
     d = np.abs(to_lab(orig)[..., 0] - to_lab(enc)[..., 0])
     return dict(ssim=round(ssim(orig, enc), 4), psnr=round(float(cv2.PSNR(orig, enc)), 1),
                 mean_dL=round(float(d.mean()), 2), p99_dL=round(float(np.percentile(d, 99)), 2))
+
+
+def as_rgb(img: np.ndarray) -> np.ndarray:
+    """The RGB picture the codec works on: grayscale (2-D or one channel) as three equal channels,
+    RGBA without its alpha. Any other shape is a clear ValueError, not an OpenCV crash deep inside."""
+    img = np.asarray(img)
+    if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
+        return cv2.cvtColor(np.ascontiguousarray(img.reshape(img.shape[:2])), cv2.COLOR_GRAY2RGB)
+    if img.ndim == 3 and img.shape[2] in (3, 4):
+        return np.ascontiguousarray(img[..., :3])
+    raise ValueError(f"expected an RGB, RGBA or grayscale image, got shape {img.shape}")
+
+
+def like(rgb: np.ndarray, img: np.ndarray) -> np.ndarray:
+    """rgb back in img's layout: grayscale out for grayscale in, img's own alpha carried over."""
+    if img.ndim == 2 or img.shape[2] == 1:
+        return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).reshape(img.shape)
+    if img.shape[2] == 4:
+        return np.dstack([rgb, img[..., 3]])
+    return rgb
 
 
 # ---------------------------------------------------------------- patterns
@@ -393,37 +416,63 @@ def subblock_for_print(width_px: int, print_mm: float) -> int:
 VIS_SSIM = 0.955            # SSIM floor (PRD: >= 0.95)
 VIS_DL = 0.99               # mean |dL*| ceiling (PRD: <= 1.0; measured rounded to 0.01)
 DELTA_MIN, DELTA_MAX = 0.5, 2.4
+# Smallest picture encode accepts: one that reads back from its clean file. The decoder scans no
+# side under READ_MIN_SIDE px (its spectral windows and grid search). Above that, how few cells the
+# pilot can still lock on depends on the picture: busy kodim05 read nothing at 15x22 cells (3.3
+# tiles) where kodim08 and kodim23 read at 14x21, while all three read at 16x20 and 17x17 (2.2 and
+# 2.0 tiles). So a picture under READ_SURE_CELLS a side or READ_SURE_TILES tiles (a margin over
+# those) is decoded once before encode returns it, and is too small when that finds nothing.
+READ_MIN_SIDE = 256
+READ_SURE_CELLS, READ_SURE_TILES = 16, 3
+WRONG_WARN = 0.25           # warn when this fraction of the clean file's cells read wrong (clipped
+                            # cells carry nothing: the decoder skips them, but they add up)
 
 
 def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock_px: int = 8):
-    """Embed payload into an RGB uint8 image. Returns (image of the same size, stats).
-    delta None: the strongest within the visibility budget (VIS_SSIM, VIS_DL), by bisection."""
+    """Embed payload into an RGB, RGBA or grayscale uint8 image. Returns (image of the same size and
+    layout - alpha carried over, grayscale stays grayscale -, stats). delta None: the strongest
+    within the visibility budget (VIS_SSIM, VIS_DL), by bisection. ValueError when the picture is
+    too small to read back (a small one is decoded once to make sure) or too clipped to carry the
+    payload at all; RuntimeWarning when more than WRONG_WARN of its cells read wrong."""
     if delta is not None:
-        return _embed(rgb, payload, delta, subblock_px)
-    lo, hi, best = DELTA_MIN, DELTA_MAX, None
-    for i in range(7):
-        d = hi if i == 0 else (lo + hi) / 2                     # the cap first: often within budget
-        out, st = _embed(rgb, payload, d, subblock_px)
-        if st["ssim"] >= VIS_SSIM and st["mean_dL"] <= VIS_DL:
-            best, lo = (out, st), d
-            if i == 0:
-                break
-        else:
-            hi = d
-    return best or _embed(rgb, payload, DELTA_MIN, subblock_px)
+        out, st = _embed(rgb, payload, delta, subblock_px)
+    else:
+        lo, hi, best = DELTA_MIN, DELTA_MAX, None
+        for i in range(7):
+            d = hi if i == 0 else (lo + hi) / 2                 # the cap first: often within budget
+            out, st = _embed(rgb, payload, d, subblock_px)
+            if st["ssim"] >= VIS_SSIM and st["mean_dL"] <= VIS_DL:
+                best, lo = (out, st), d
+                if i == 0:
+                    break
+            else:
+                hi = d
+        out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px)
+    rows, cols, T = st["rows"], st["cols"], st["tile"]
+    if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
+        if not any(f["payload"] == payload for f in decode(out)["found"]):
+            raise ValueError(f"image too small to read back: its clean file ({rows}x{cols} cells of "
+                             f"{K * st['subblock_px']} px, {st['tiles']} {T}x{T} tiles) does not decode; use a "
+                             f"larger picture, a smaller sub-block or a shorter payload")
+    if st["wrong_cells"] > WRONG_WARN:
+        warnings.warn(f"{st['wrong_cells']:.0%} of the cells read wrong in the clean file: little gamut "
+                      f"headroom (clipped black/white or saturated areas), the payload may not read back",
+                      RuntimeWarning, stacklevel=2)
+    return out, st
 
 
-def _embed(rgb: np.ndarray, payload: bytes, delta: float, subblock_px: int):
+def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int):
     nb = len(payload)
     if not 1 <= nb <= MAX_BYTES:
         raise ValueError(f"payload must be 1..{MAX_BYTES} bytes")
+    rgb = as_rgb(img)
     H, W = rgb.shape[:2]
     b = int(subblock_px)
     c = K * b
     rows, cols, T = H // c, W // c, tile_size(nb)
-    if rows < T or cols < T:
-        raise ValueError(f"image too small for a {nb}-byte payload: needs at least {T * c} px per side "
-                         f"(sub-block {b} px); use a shorter payload or a smaller sub-block")
+    if min(H, W) < READ_MIN_SIDE or rows < T or cols < T:
+        raise ValueError(f"image too small for a {nb}-byte payload: needs at least {max(READ_MIN_SIDE, T * c)} px "
+                         f"per side (sub-block {b} px); use a shorter payload or a smaller sub-block")
     n, nbits = rows * cols, 8 * frame_len(nb)
     ii, jj = np.mgrid[0:rows, 0:cols]
     t = ((ii % T) * T + (jj % T)).ravel()
@@ -457,13 +506,22 @@ def _embed(rgb: np.ndarray, payload: bytes, delta: float, subblock_px: int):
     # Host-interference rejection (QIM): move each cell's correlation to the nearest lattice point
     # that reads its bit, so a busy host costs at most step/2 + margin, never a skipped cell.
     ok = g > 1e-6                                             # no room (clipped) -> leave the cell
+    if ok.sum() < T * T:
+        raise ValueError(f"no gamut headroom for the payload: only {int(ok.sum())} of {n} cells can move, "
+                         f"under one {T}x{T}-cell tile; the picture is clipped (pure black/white or saturated)")
     a = np.where(ok, (qim_target(h / unit, s, dc / unit) * unit - h) / np.where(ok, g, 1.0), 0.0)
+    # A cell with room left in only a corner (the rest clipped) has a tiny g: its nudge would pile
+    # onto those few pixels, tens of L* there. Cap every cell's peak swing at SWING_MAX x delta;
+    # such a cell reads with less margin instead (its repeats and the LDPC code cover it).
+    cap = SWING_MAX * delta / np.maximum(_cells(m, c).max(axis=(2, 3)).ravel(), 1e-6)
+    a = np.clip(a, -cap, cap)
     region[..., 0] += field(a.astype(np.float32), rows, cols, b, D) * m + pil + notch
-    out = to_rgb(lab)
+    out = like(to_rgb(lab), img)
+    view = as_rgb(out)                                        # what a reader of the returned file sees
 
-    got = s * qim_soft(measure(to_lab(out)[:rows * c, :cols * c, 0], rows, cols, b, D) / unit)
+    got = s * qim_soft(measure(to_lab(view)[:rows * c, :cols * c, 0], rows, cols, b, D) / unit)
     stats = dict(delta=round(float(delta), 3), rows=rows, cols=cols, tile=T, tiles=round(n / T ** 2, 1),
-                 subblock_px=b, bits=nbits, wrong_cells=round(float((got <= 0).mean()), 4), **visibility(rgb, out))
+                 subblock_px=b, bits=nbits, wrong_cells=round(float((got <= 0).mean()), 4), **visibility(rgb, view))
     return out, stats
 
 
@@ -1204,8 +1262,9 @@ def _quad(model) -> np.ndarray:
 
 
 def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
-    """Find and decode every ImPrint in a photo or file: no border or outline needed. Spectral
-    seeds first; if none of them reads, the grid search's seeds (steep tilts)."""
+    """Find and decode every ImPrint in a photo or file (RGB, RGBA or grayscale): no border or
+    outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts)."""
+    rgb = as_rgb(rgb)
     lum = to_lab(rgb)[..., 0]
     seeds = find_seeds(lum)
     found, regions, tried = [], [], 0
