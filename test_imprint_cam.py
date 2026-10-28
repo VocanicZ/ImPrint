@@ -575,6 +575,69 @@ def test_jnd_follows_luminance_and_texture():
     assert ic.jnd(tex, b)[24:-24, 24:-24].mean() > 3 * mid           # contrast masking
 
 
+def kodim(name, h=None, w=None):
+    img = cv2.cvtColor(cv2.imread(f"testdata/{name}.png"), cv2.COLOR_BGR2RGB)
+    return img if h is None else cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+
+
+def test_no_pixel_moves_more_than_a_bounded_multiple_of_delta():
+    """kodim08's clipped highlights leave some cells room in only a corner: the cell's whole QIM
+    nudge went onto those pixels (41 L*, 37x delta, at the default strength). Now the data swing
+    is capped at SWING_MAX x delta and the pilot is at most PILOT x PILOT_HI x delta; the notch
+    only takes out the host's own content at the pilot's lines (a few L*)."""
+    img = kodim("kodim08")
+    for delta in (None, 2.0):
+        enc, st = ic.encode(img, b"hello", delta=delta)
+        d = np.abs(ic.to_lab(enc)[..., 0] - ic.to_lab(img)[..., 0])
+        assert d.max() <= (ic.SWING_MAX + ic.PILOT * ic.PILOT_HI) * st["delta"], (d.max(), st)
+        assert st["wrong_cells"] < 0.02, st
+
+
+def test_encode_rejects_pictures_too_small_to_read_back():
+    """Every picture encode accepts reads back from its clean file; smaller ones are a ValueError.
+    These all encoded and then read nothing: 240x300 px (under the decoder's 256-px windows), and
+    busy kodim05 at 14x14 cells (1.4 tiles) and at 15x22 cells (3.3 tiles: how few cells the pilot
+    locks on depends on the picture, so a small one is decoded before encode returns it)."""
+    for (h, w), b in (((240, 300), 4), ((255, 320), 4), ((448, 448), 8), ((360, 540), 6)):
+        with pytest.raises(ValueError, match="too small"):
+            ic.encode(kodim("kodim05", h, w), b"hello", subblock_px=b)
+    enc, st = ic.encode(kodim("kodim08", 256, 320), b"hello", subblock_px=4)     # at the px floor
+    found = ic.decode(enc)["found"]
+    assert found and found[0]["payload"] == b"hello", st
+
+
+def test_grayscale_and_rgba_pictures_round_trip():
+    """Grayscale in, grayscale out; RGBA keeps its alpha; both decode. Other shapes: ValueError."""
+    rgb = photo_like(360, 540)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    rgba = np.dstack([rgb, np.tile(np.linspace(0, 255, rgb.shape[1]).astype(np.uint8), (rgb.shape[0], 1))])
+    for img in (gray, gray[..., None], rgba):
+        enc, st = ic.encode(img, b"hi", delta=2, subblock_px=6)
+        assert enc.shape == img.shape and enc.dtype == np.uint8 and st["wrong_cells"] < 0.02, st
+        if img.ndim == 3 and img.shape[2] == 4:
+            assert np.array_equal(enc[..., 3], img[..., 3])
+        found = ic.decode(enc)["found"]
+        assert found and found[0]["payload"] == b"hi", img.shape
+    for bad in (rgb[..., :2], rgb[..., 0, 0]):
+        with pytest.raises(ValueError, match="grayscale"):
+            ic.encode(bad, b"hi", delta=2, subblock_px=6)
+        with pytest.raises(ValueError, match="grayscale"):
+            ic.decode(bad)
+
+
+def test_host_without_headroom_raises_or_warns():
+    """Pure black or white can't swing either way: nothing would be embedded, so encode raises
+    instead of returning wrong_cells 1.0. Half of it clipped still carries the payload, but warns."""
+    img = photo_like(360, 540)
+    for v in (0, 255):
+        with pytest.raises(ValueError, match="headroom"):
+            ic.encode(np.full_like(img, v), b"hi", subblock_px=6)
+    half = photo_like()
+    half[:, : half.shape[1] // 2] = 0
+    with pytest.warns(RuntimeWarning, match="read wrong"):
+        ic.encode(half, b"hi", delta=2, subblock_px=6)
+
+
 def _passing(img="kodim23"):
     """Synthetic measurements that just meet every PRD #1 threshold for img."""
     return dict(ssim=0.95, mean_dL=1.0, geometry={v: dict(ok=5, n=5) for v in sim.GEOMETRY},
