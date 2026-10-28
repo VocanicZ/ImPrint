@@ -837,14 +837,18 @@ def pilot_probe(lum: np.ndarray, q, Q, P, J, nc: int = 8, S: int = K * 6, coh_mi
     return q + (off + 0.5) % 1 - 0.5, g(q[None])[0], J, snr
 
 
-def map_probe(lum: np.ndarray, q, g, nc: int = 8, S: int = K * 6, coh_min: float = 0.7, snr_min: float = SNR_MIN):
+def map_probe(lum: np.ndarray, q, g, nc: int = 8, S: int = K * 6, coh_min: float = 0.7, snr_min: float = SNR_MIN,
+              reaim: bool = False):
     """Probe the patch centred on lattice point q through the map g (lattice -> photo px).
+    reaim: if the patch is smeared, probe again through g's local affine map at q, re-aimed by
+    pilot_warp (a map fitted far from q is off there by a few % of scale and turn).
     Returns like pilot_probe, or None."""
     off, coh, snr = pilot_phase(resample(lum, g, q[0] - nc / 2, q[1] - nc / 2, nc, nc, S), nc, S)
-    if coh < coh_min or snr < snr_min:
-        return None
     p = g(np.array([q, q + [1, 0], q + [0, 1]], np.float64))
-    return q + (off + 0.5) % 1 - 0.5, p[0], np.c_[p[1] - p[0], p[2] - p[0]], snr
+    J = np.c_[p[1] - p[0], p[2] - p[0]]
+    if coh < coh_min or snr < snr_min:
+        return pilot_probe(lum, q, q, p[0], J, nc, S, coh_min, snr_min) if reaim else None
+    return q + (off + 0.5) % 1 - 0.5, p[0], J, snr
 
 
 def _homography_map(lat, photo, ransac: float = 0.0):
@@ -965,7 +969,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     Once four probes surround a point it is sampled through their homography instead: across an
     8-cell patch even the exact local affine map is off where the cells shrink. A probe that fails
     is retried when more neighbours have locked, and when the frontier runs dry it is probed once
-    more through the homography of every probe so far.
+    more through the homography of every probe so far (re-aimed by pilot_warp if that smears it).
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
     S = K * r
@@ -1023,7 +1027,8 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     while True:
         grow_from_heap()
         # out of frontier: probes where the cells shrink fade before their neighbours' local maps
-        # reach them, so retry the frontier once through the perspective of every probe so far
+        # reach them, so retry the frontier once through the perspective of every probe so far,
+        # re-aimed where that perspective, fitted on one side of the page, smears the far side
         if len(nodes) < 8:
             break
         g = _homography_map([n[0] for n in nodes.values()], [n[1] for n in nodes.values()], 0.5 * cell)
@@ -1035,7 +1040,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             q = np.array(key, np.float64) * step
             p = g(q[None])[0]
             on = 0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]
-            res = map_probe(lum, q, g, nc, S, coh_min, snr_min) if on else None
+            res = map_probe(lum, q, g, nc, S, coh_min, snr_min, reaim=True) if on else None
             if res:
                 accept(key, res)
                 added += 1

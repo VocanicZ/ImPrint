@@ -324,6 +324,30 @@ def test_homography_probe_reads_where_the_local_affine_smears():
         assert hit is not None and hit[3] > 4 * ic.SNR_MIN and np.abs(hit[0] - q).max() < 0.05, hit
 
 
+def test_map_probe_reaims_where_a_far_fitted_map_smears():
+    """The tracker's last resort probes the frontier through the homography of every probe so far.
+    Fitted on one side of a steeply tilted page, that map is off a few % in scale and turn on the
+    far side, and an 8-cell patch through it smears below the gate. Re-aimed through the map's
+    local affine at the point, the probe locks on the true lattice point and cell vectors."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    img, H = tilted(enc, 30)
+    img = np.clip(img + np.random.default_rng(0).normal(0, 6, img.shape), 0, 255).astype(np.uint8)
+    lum = ic.to_lab(img)[..., 0]
+    T = lambda q: cv2.perspectiveTransform((np.atleast_2d(q) * 24)[None].astype(np.float64), H)[0] - 0.5
+    for q in (np.array([10.0, 15.0]), np.array([30.0, 15.0])):
+        J = np.c_[T(q + [1, 0])[0] - T(q)[0], T(q + [0, 1])[0] - T(q)[0]]
+        for sc, deg in ((1.06, 4), (0.94, -5)):
+            a = np.deg2rad(deg)
+            M = sc * np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+            g = lambda x: T(q + (np.atleast_2d(x) - q) @ M.T)    # right at q, off around it
+            assert ic.pilot_phase(ic.resample(lum, g, q[0] - 4, q[1] - 4, 8, 8, 24), 8, 24)[2] < ic.SNR_MIN
+            assert ic.map_probe(lum, q, g) is None
+            hit = ic.map_probe(lum, q, g, reaim=True)
+            assert hit is not None and hit[3] >= ic.SNR_MIN, hit
+            assert np.abs(hit[0] - q).max() < 0.1 and np.linalg.norm(hit[1] - T(q)[0]) < 1.0, hit
+            assert np.linalg.norm(hit[2] - J) < 0.5 * np.linalg.norm(J @ M - J), (hit[2], J)
+
+
 def test_grid_search_seeds_a_page_the_spectral_peaks_miss(monkeypatch):
     """With no spectral seed at all (a steep tilt smears every window's lines to the noise), decode
     falls back to the grid search: every plausible local grid scored on all four lines at once,
