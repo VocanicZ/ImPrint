@@ -48,6 +48,7 @@ import binascii
 import functools
 import heapq
 import os
+import threading
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -882,6 +883,47 @@ QUICK_SMALL = 1_000_000     # px: a picture this small has too few sync cells to
                             # decode() searches it whatever quick_check says, detect() reads it
 
 
+RUN_SHARE_MIN = 0.1         # run_time never runs slower than this x wall time (a stalled machine still times out)
+_run = dict(wall=None, sched=None, t=0.0, share=1.0)
+_run_lock = threading.Lock()
+
+
+def _sched() -> tuple[int, int] | None:
+    """This process's threads' ns on a CPU and ns waiting for one (Linux schedstat), or None."""
+    cpu = wait = 0
+    try:
+        for tid in os.listdir("/proc/self/task"):
+            try:
+                with open(f"/proc/self/task/{tid}/schedstat") as fh:
+                    a = fh.read().split()
+            except OSError:                                       # a thread that just ended
+                continue
+            cpu, wait = cpu + int(a[0]), wait + int(a[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return cpu, wait
+
+
+def run_time() -> float:
+    """Seconds this process was let run: wall time, each stretch scaled by the share of the time
+    its threads wanted a CPU that they had one (on a CPU vs waiting on the run queue; waiting on a
+    lock or I/O is not starving). quick_check's time limits count this, not wall time: on an idle
+    machine they are the same, on a loaded one (a busy server, a shared test host) the check still
+    gets the work done that it gets idle, instead of a slow confirm turning into a miss. Plain wall
+    time where the scheduler doesn't say (not Linux)."""
+    now = time.perf_counter()
+    with _run_lock:
+        if _run["wall"] is None:
+            _run.update(wall=now, sched=_sched())
+        elif now - _run["wall"] >= 0.02:                          # a sample every 20 ms, at most
+            sched = _sched()
+            if sched and _run["sched"]:
+                cpu, wait = sched[0] - _run["sched"][0], sched[1] - _run["sched"][1]
+                _run["share"] = max(cpu / (cpu + wait), RUN_SHARE_MIN) if cpu + wait > 0 else 1.0
+            _run.update(t=_run["t"] + (now - _run["wall"]) * _run["share"], wall=now, sched=sched)
+        return _run["t"] + (now - _run["wall"]) * _run["share"]
+
+
 def _level_sync(img: np.ndarray, n: int, pool, stride: int = 2) -> list:
     """sync_in_region on 2n x 2n regions of img every stride * n/2 px (4: side by side, 2: half
     overlapping), each n-window's spectrum computed once and shared by the regions it falls in.
@@ -932,7 +974,7 @@ def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int 
         if (model is None or model[2] < 8) and step > 2:           # busy or tilted: jumps that long fail, short ones hold
             step = 2
             model = track(img, (0, c, A[:, 0], A[:, 1]), 1, r=r, step=step, budget=budget, frontier=frontier, until=until)
-        if model is None or model[2] < 8 or time.perf_counter() > until:
+        if model is None or model[2] < 8 or run_time() > until:
             return best
         best = max(best, _sync_read(img, model, r, align))
         if best >= QUICK_Z:
@@ -971,7 +1013,8 @@ def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -
     those, from the grid search's central windows (steep tilts); each is probed (_locks), and one
     that locks is tracked coarsely and read for the sync layout (_sync_confirm) while probing goes
     on. A repetitive texture (halftone dots, windows, fabric) can fake the pilot's lattice, not the
-    known pseudo-random bits. Past `patience` s nothing new starts: out of time = not found.
+    known pseudo-random bits. Past `patience` s nothing new starts: out of time = not found. Its
+    seconds are run_time's: wall time on an idle machine, stretched on a loaded one.
     trace(event, centre_xy, value), if given, sees each probe ("probe", locks of 5) and sync
     read ("sync", z) as they happen. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's
     px, or []."""
@@ -981,8 +1024,8 @@ def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -
 
 def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> list:
     _grid_table(256), _sync_shifts()                              # build the tables once, before the threads do
-    t0 = time.perf_counter()
-    late = lambda: time.perf_counter() - t0 > patience
+    t0 = run_time()
+    late = lambda: run_time() - t0 > patience
     g = cv2.cvtColor(as_rgb(rgb), cv2.COLOR_RGB2GRAY)
     f = min(1.0, QUICK_SIDE / max(g.shape))
     img = (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g).astype(np.float32)
@@ -1026,7 +1069,7 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
         # nothing promising: past QUICK_REJECT with no confirm running and no weaker lock waiting. Asked
         # only once every source has been probed: a busy picture's faint pilot often shows no spectral
         # line at all, only local grids, some only at half scale (ruled out before those, it was lost)
-        hopeless = lambda: not running and not spare and time.perf_counter() - t0 > QUICK_REJECT
+        hopeless = lambda: not running and not spare and run_time() - t0 > QUICK_REJECT
 
         def settled(block: float = 0.0):
             for job in wait(running, timeout=block, return_when=FIRST_COMPLETED)[0] if running else ():
@@ -1064,8 +1107,8 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
             if late():
                 break
             confirm(c, A)
-        while running and time.perf_counter() < stop:
-            if hit := settled(stop - time.perf_counter()):
+        while running and run_time() < stop:
+            if hit := settled(stop - run_time()):
                 return hit
         return []
     finally:
@@ -1368,7 +1411,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     is retried when more neighbours have locked, and when the frontier runs dry it is probed once
     more through the homography of every probe so far (re-aimed by pilot_warp if that smears it).
     budget caps the probes tried while growing, frontier=False skips the global-map retry, and
-    until (perf_counter s) stops it all early: a quick look instead of the whole page. trace(locked,
+    until (run_time s) stops it all early: a quick look instead of the whole page. trace(locked,
     photo_xy), if given, sees every probe as it is tried.
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
@@ -1403,7 +1446,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
         push(key)
 
     def grow_from_heap():
-        while heap and len(done) + len(tried) < budget and time.perf_counter() < until:
+        while heap and len(done) + len(tried) < budget and run_time() < until:
             _, key, parent = heapq.heappop(heap)
             if key in done:
                 continue
@@ -1438,7 +1481,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
         for key in {(k[0] + di, k[1] + dj) for k in nodes for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1))} - done:
             if g is None or tried.get(key, 0) >= 99:
                 continue
-            if time.perf_counter() > until:
+            if run_time() > until:
                 break
             tried[key] = 99                                           # the global map gets one try per key
             q = np.array(key, np.float64) * step
