@@ -97,7 +97,7 @@ def test_quick_check_rejects_halftone_dots_fast():
     big = np.random.default_rng(0).integers(0, 256, (3000, 4000, 3), np.uint8)
     t0 = time.perf_counter()
     assert ic.quick_check(big) == []
-    assert time.perf_counter() - t0 < 2.0                           # QUICK_DEADLINE + grace, with slack for a busy machine
+    assert time.perf_counter() - t0 < ic.QUICK_PATIENCE + ic.QUICK_GRACE + 1.0   # bounded, with slack for a busy machine
 
 
 def test_found_without_border_any_orientation():

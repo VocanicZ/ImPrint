@@ -324,7 +324,10 @@ $('d-go').onclick = async () => {
       say(`<span class="ok">Imprinted pattern found</span> (sync z ${ev.z}, in ${secs()}). Reading the payload…`);
     } else if (ev.e === 'seed') {
       tried++; seed = ev.xy; dot(ev.xy, 3, 'rgba(43,217,107,.6)');
-      say(`<span class="ok">Imprinted.</span> Reading the payload: trying spot ${tried} · ${secs()}`);
+      const sure = $('d-s1').className === 'done';
+      if (!sure) step(2, 'run');            // a small picture is read in full whatever the check said
+      say(sure ? `<span class="ok">Imprinted.</span> Reading the payload: trying spot ${tried} · ${secs()}`
+               : `Small picture: too few sync cells to be sure, so reading it in full: spot ${tried} · ${secs()}`);
     } else if (ev.e === 'found') {
       const q = ev.quad.map(p => [p[0] * k, p[1] * k]);
       ctx.beginPath(); q.forEach((p, i) => i ? ctx.lineTo(...p) : ctx.moveTo(...p)); ctx.closePath();
@@ -337,7 +340,8 @@ $('d-go').onclick = async () => {
       if (ev.e === 'error') { step(3, 'fail'); return say(`<span class="bad">${esc(ev.detail)}</span>`); }
       if ($('d-s2').className === 'run') step(2, ev.found.length ? 'done' : 'fail');
       step(3, ev.found.length ? 'done' : 'fail');
-      if (stage === 2 && $('d-s1').className === 'done') say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>` : `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`);
+      if (ev.found.length && $('d-s1').className === 'fail') step(1, 'done');
+      if (stage === 2 && ($('d-s1').className === 'done' || tried)) say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>` : `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`);
       $('d-res').innerHTML = result(ev);
     }
   };

@@ -28,7 +28,8 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   payload and its tile) carry known bits with known patterns instead of payload. Nothing but an
   Imprinted picture correlates with them, however lattice-like its texture (halftone dots, windows),
   so they make detection certain where the pilot alone can be faked: quick_check finds a candidate
-  grid, tracks it coarsely and runs their matched filter, in under a second. The decoder reads
+  grid, tracks it coarsely and runs their matched filter (most Imprinted pictures within a second;
+  nothing promising under way at one second rules a picture out; the rest up to ten). The decoder reads
   them as erasures, and they also tell the two 180-degree twins apart.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
@@ -546,7 +547,7 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     rows, cols, T = st["rows"], st["cols"], st["tile"]
     if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
         trace("read back", None)
-        if not any(f["payload"] == payload for f in decode(out)["found"]):
+        if not any(f["payload"] == payload for f in decode(out, check=False)["found"]):   # the payload, not detect
             raise ValueError(f"image too small to read back: its clean file ({rows}x{cols} cells of "
                              f"{K * st['subblock_px']} px, {st['tiles']} {T}x{T} tiles) does not decode; use a "
                              f"larger picture, a smaller sub-block or a shorter payload")
@@ -841,17 +842,19 @@ QUICK_GRID = 6              # grid-search candidates per central window (steep t
 QUICK_GRID_AT = (0.35, 0.5, 0.65)   # its windows: centres at these fractions of the picture, both ways
 QUICK_GRID_SCALES = (None, 0.5)     # picture scales it runs at, in turn, while nothing is found (None: the
                                     # shrunk picture's; 1/2 suits busy pictures, as the decoder's)
-QUICK_TOP = 24              # spectral candidates quick_check probes
+QUICK_TOP = 96              # spectral candidates quick_check probes
 QUICK_BEST = 3              # distinct grids kept per spectral region
 QUICK_LOCKS = 3             # of a probe and its 4 neighbours, this many must lock before the sync test
-QUICK_CONFIRM = 6           # locked candidates read for the sync layout, at most, per candidate source
-QUICK_DEADLINE = 0.7        # s: no new confirm starts after this (a repetitive texture locks well and
-                            # would keep them coming); out of time = not found
+QUICK_CONFIRM = 24          # locked candidates read for the sync layout, at most, per candidate source
+QUICK_REJECT = 1.0          # s: no sync read under way by now = not Imprinted (every in-spec Imprinted
+                            # picture not yet confirmed has one running; 1/4 of other pictures don't)
+QUICK_PATIENCE = 10.0       # s: otherwise nothing new starts after this; out of time = not found
 QUICK_THREADS = 4           # threads that scan and probe; one more confirms (more only fight over the GIL)
-QUICK_GRACE = 0.25          # s past the deadline that running confirms get
-QUICK_DECODE = 1.5          # s: decode()'s deadline instead (a miss there loses a readable photo, a false
-                            # pass only costs the full search: tilted prints confirm late, under load)
-QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.5)
+QUICK_GRACE = 0.25          # s past QUICK_PATIENCE that running confirms get
+QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.8)
+QUICK_SMALL = 1_000_000     # px: a picture this small has too few sync cells to always reach QUICK_Z
+                            # (16x24 cells: ~96, z 5-6 even clean), and its full search takes seconds:
+                            # decode() searches it whatever quick_check says, detect() reads it
 
 
 def _level_sync(img: np.ndarray, n: int, pool, stride: int = 2) -> list:
@@ -889,7 +892,7 @@ def _locks(img: np.ndarray, c, A, step: int = 2, S: int = K * 4) -> int:
     return n
 
 
-def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int = 30, align: int = 1,
+def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int = 120, align: int = 1,
                   until: float = np.inf) -> float:
     """Sync evidence for a candidate grid: track it coarsely (probes `step` cells apart, at most
     `budget` tries), read every cell through that map and run the sync matched filter. A clear
@@ -935,25 +938,26 @@ def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
     return best
 
 
-def quick_check(rgb: np.ndarray, deadline: float = QUICK_DEADLINE, trace=None) -> list:
-    """Is this picture Imprinted? Under a second at any size, turn, mirror or scale, and nothing
-    else passes. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
+def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -> list:
+    """Is this picture Imprinted? At any size, turn, mirror or scale, and nothing else passes: most
+    Imprinted pictures within a second, most others ruled out by QUICK_REJECT (nothing promising
+    under way), the rest searched up to `patience` s. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
     candidate grids come from its spectrum (the pilot's lines, two pyramid levels) and, failing
     those, from the grid search's central windows (steep tilts); each is probed (_locks), and one
     that locks is tracked coarsely and read for the sync layout (_sync_confirm) while probing goes
     on. A repetitive texture (halftone dots, windows, fabric) can fake the pilot's lattice, not the
-    known pseudo-random bits. Past `deadline` s nothing new starts: out of time = not found.
+    known pseudo-random bits. Past `patience` s nothing new starts: out of time = not found.
     trace(event, centre_xy, value), if given, sees each probe ("probe", locks of 5) and sync
     read ("sync", z) as they happen. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's
     px, or []."""
     with threadpool_limits(1, "blas"):
-        return _quick_check(rgb, deadline, trace or (lambda *a: None))
+        return _quick_check(rgb, patience, trace or (lambda *a: None))
 
 
-def _quick_check(rgb: np.ndarray, deadline: float, trace=lambda *a: None) -> list:
+def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> list:
     _grid_table(256), _sync_shifts()                              # build the tables once, before the threads do
     t0 = time.perf_counter()
-    late = lambda: time.perf_counter() - t0 > deadline
+    late = lambda: time.perf_counter() - t0 > patience
     g = cv2.cvtColor(as_rgb(rgb), cv2.COLOR_RGB2GRAY)
     f = min(1.0, QUICK_SIDE / max(g.shape))
     img = (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g).astype(np.float32)
@@ -991,9 +995,10 @@ def _quick_check(rgb: np.ndarray, deadline: float, trace=lambda *a: None) -> lis
 
         # probe best first, a batch at a time; a grid that locks well is read for the sync layout on
         # the side while probing goes on, so an Imprinted picture usually stops within its first batch
-        stop = t0 + deadline + QUICK_GRACE                        # running confirms give up here
+        stop = t0 + patience + QUICK_GRACE                        # running confirms give up here
         until[...] = stop
         running, spare, hit = {}, [], None
+        hopeless = lambda: not running and time.perf_counter() - t0 > QUICK_REJECT
 
         def settled(block: float = 0.0):
             for job in wait(running, timeout=block, return_when=FIRST_COMPLETED)[0] if running else ():
@@ -1012,7 +1017,7 @@ def _quick_check(rgb: np.ndarray, deadline: float, trace=lambda *a: None) -> lis
                 break
             todo, confirms = source(), 0                          # each source gets its own confirms
             for i in range(0, len(todo), 8):
-                if (hit := settled()) or late():
+                if (hit := settled()) or late() or hopeless():
                     break
                 batch = todo[i:i + 8]
                 for k, (_, c, A) in sorted(zip(pool.map(lambda t: _locks(img, t[1], t[2]), batch), batch),
@@ -1025,8 +1030,10 @@ def _quick_check(rgb: np.ndarray, deadline: float, trace=lambda *a: None) -> lis
                         spare.append((c, A))
             if hit:
                 return hit
+            if hopeless():
+                return []
         for c, A in spare[:QUICK_CONFIRM]:                         # weaker locks last
-            if late():
+            if late() or hopeless():
                 break
             confirm(c, A)
         while running and time.perf_counter() < stop:
@@ -1642,15 +1649,26 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
     """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
     outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts).
     max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow).
-    check: quick_check first (QUICK_DECODE s), and stop there if it finds no pilot (a picture without
-    a payload: under two seconds instead of minutes); the seeds it confirmed get the first turns.
+    check: quick_check first, and stop there if it finds no pilot (a picture without a payload: one to
+    ten seconds instead of minutes); the seed it confirmed gets the first turn.
     trace(event, centre_xy, value), if given, sees quick_check's events, then ("checked", None,
     seed or None), each seed tried ("seed", centre, None) and each payload read ("found", None, result)."""
     rgb, trace = as_rgb(rgb), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
-        quick = quick_check(rgb, QUICK_DECODE, trace) if check else None
+        quick = quick_check(rgb, trace=trace) if check else None
+        if quick == [] and rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL:
+            quick = None                                    # too few sync cells to rule it out
         trace("checked", None, quick[0] if quick else None)
         return _decode(rgb, max_seeds, max_found, quick, trace)
+
+
+def detect(rgb: np.ndarray) -> bool:
+    """Is this picture Imprinted? quick_check, and for a picture under QUICK_SMALL px that it rules
+    out, a full read (a payload that reads passes its CRC: no false alarm either way)."""
+    rgb = as_rgb(rgb)
+    if quick_check(rgb):
+        return True
+    return rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL and bool(decode(rgb, max_found=1, check=False)["found"])
 
 
 def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None,

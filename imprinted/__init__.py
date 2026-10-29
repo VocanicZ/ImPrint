@@ -3,7 +3,7 @@
     import imprinted
     imprinted.encode("photo.png", "hello", "photo_imprinted.png")
     imprinted.decode("phone_shot.jpg")          # -> "hello", or None
-    imprinted.detect("phone_shot.jpg")          # -> True if it holds an Imprinted pattern (under a second)
+    imprinted.detect("phone_shot.jpg")          # -> True if it holds an Imprinted pattern
 
 `imprinted.core` is the full codec (encode stats, every Imprinted found in a photo, the strength ladder).
 """
@@ -62,6 +62,7 @@ def decode(image, raw: bool = False, check: bool = True) -> str | bytes | None:
 
 
 def detect(image) -> bool:
-    """Does image hold an Imprinted pattern? Quick (under a second at any size), without reading the
-    payload: decode() makes the same check first, so a picture without one costs no more than this."""
-    return bool(core.quick_check(_load(image)))
+    """Does image hold an Imprinted pattern? Most Imprinted pictures answer within a second, most
+    others are ruled out at one; the rest are searched up to ten seconds (small pictures, under
+    1 MP, are read in full instead). decode() makes the same check first."""
+    return core.detect(_load(image))
