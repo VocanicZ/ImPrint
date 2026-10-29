@@ -24,6 +24,12 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   confirm. Encoder and decoder average the same span of every sub-block and both leave the pilot
   out, so a clean file reads back the values the encoder set; the decoder reads only the picture
   (the rectangle of cells that carries the pilot, a few cells past the tracked area).
+* SYNC cells: a fixed pseudo-random quarter of the cells (SYNC_P-periodic, so independent of the
+  payload and its tile) carry known bits with known patterns instead of payload. Nothing but an
+  Imprinted picture correlates with them, however lattice-like its texture (halftone dots, windows),
+  so they make detection certain where the pilot alone can be faked: quick_check finds a candidate
+  grid, tracks it coarsely and runs their matched filter, in under a second. The decoder reads
+  them as erasures, and they also tell the two 180-degree twins apart.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
 smooth gradients cancel) and only touch L*, so grayscale prints work. Strength follows a perceptual
@@ -42,7 +48,7 @@ import heapq
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import cv2
 import numpy as np
@@ -172,11 +178,11 @@ def _all_patterns(seed: int) -> np.ndarray:
     """Data patterns: balanced, ramp-free +-1 KxK. Pattern i depends only on (seed, i)."""
     rng = np.random.default_rng(seed)
     base = np.array([1] * (K * K // 2) + [-1] * (K * K // 2), np.float32)
-    out = []
-    while len(out) < tile_size(MAX_BYTES) ** 2:
-        p = rng.permutation(base).reshape(K, K)
-        if _ramp_free(p):
-            out.append(p)
+    n, out = tile_size(MAX_BYTES) ** 2, []
+    while len(out) < n:                                           # = one permutation at a time, in bulk
+        p = rng.permuted(np.tile(base, (4096, 1)), axis=1).reshape(-1, K, K)
+        free = ((p * RAMP[:, None]).sum((1, 2)) == 0) & ((p * RAMP[None, :]).sum((1, 2)) == 0)   # _ramp_free
+        out.extend(p[free][:n - len(out)])
     return np.stack(out)
 
 
@@ -817,21 +823,22 @@ def find_seeds(lum: np.ndarray) -> list:
 
 
 QUICK_SIDE = 2048           # quick_check shrinks a picture to this long side: the same cost at any size
-QUICK_PLAN = ((0, 256), (1, 256))   # (pyramid level, n) spectral regions scanned
 QUICK_GRID = 6              # grid-search candidates per central window (steep tilts the spectrum misses)
-QUICK_GRID_LEVELS = (0,)    # pyramid levels the grid search runs on, after the spectral candidates
 QUICK_GRID_AT = (0.35, 0.5, 0.65)   # its windows: centres at these fractions of the picture, both ways
+QUICK_GRID_SCALES = (None, 0.5)     # picture scales it runs at, in turn, while nothing is found (None: the
+                                    # shrunk picture's; 1/2 suits busy pictures, as the decoder's)
 QUICK_TOP = 24              # spectral candidates quick_check probes
 QUICK_BEST = 3              # distinct grids kept per spectral region
 QUICK_LOCKS = 3             # of a probe and its 4 neighbours, this many must lock before the sync test
-QUICK_STRIDE = 2            # regions every QUICK_STRIDE half-windows (4: side by side, 2: half overlapping)
 QUICK_CONFIRM = 6           # locked candidates read for the sync layout, at most, per candidate source
 QUICK_DEADLINE = 0.7        # s: no new confirm starts after this (a repetitive texture locks well and
                             # would keep them coming); out of time = not found
+QUICK_THREADS = 4           # threads that scan and probe; one more confirms (more only fight over the GIL)
+QUICK_GRACE = 0.25          # s past the deadline that running confirms get
 QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.5)
 
 
-def _level_sync(img: np.ndarray, n: int, pool, stride: int | None = None) -> list:
+def _level_sync(img: np.ndarray, n: int, pool, stride: int = 2) -> list:
     """sync_in_region on 2n x 2n regions of img every stride * n/2 px (4: side by side, 2: half
     overlapping), each n-window's spectrum computed once and shared by the regions it falls in.
     Returns [(score, centre_xy, A)]."""
@@ -845,7 +852,6 @@ def _level_sync(img: np.ndarray, n: int, pool, stride: int | None = None) -> lis
         c = np.array([x * h + n, y * h + n], np.float64)
         return [(sc, c, A) for sc, A in sync_in_spectrum(_deridge(_whiten(P[y:y + 3, x:x + 3].sum((0, 1)))), n,
                                                           best=QUICK_BEST)]
-    stride = stride or QUICK_STRIDE
     starts = lambda m: sorted(set(range(0, m - 2, stride)) | {m - 3})
     return sum(pool.map(region, [(y, x) for y in starts(ny) for x in starts(nx)]), [])
 
@@ -867,7 +873,8 @@ def _locks(img: np.ndarray, c, A, step: int = 2, S: int = K * 4) -> int:
     return n
 
 
-def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int = 30, align: int = 1) -> float:
+def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int = 30, align: int = 1,
+                  until: float = np.inf) -> float:
     """Sync evidence for a candidate grid: track it coarsely (probes `step` cells apart, at most
     `budget` tries), read every cell through that map and run the sync matched filter. A clear
     picture settles it there; only when it doesn't, the track's frontier is retried through the
@@ -876,9 +883,12 @@ def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int 
     turned around and shifted by one sub-cell offset, which one probe locked the other way round
     gives. Returns the better twin's z (0 if the grid doesn't track)."""
     best = 0.0
-    for frontier in (0, None):
-        model = track(img, (0, c, A[:, 0], A[:, 1]), 1, r=r, step=step, budget=budget, frontier=frontier)
-        if model is None or model[2] < 8:
+    for frontier in (False, True):
+        model = track(img, (0, c, A[:, 0], A[:, 1]), 1, r=r, step=step, budget=budget, frontier=frontier, until=until)
+        if (model is None or model[2] < 8) and step > 2:           # busy or tilted: jumps that long fail, short ones hold
+            step = 2
+            model = track(img, (0, c, A[:, 0], A[:, 1]), 1, r=r, step=step, budget=budget, frontier=frontier, until=until)
+        if model is None or model[2] < 8 or time.perf_counter() > until:
             return best
         best = max(best, _sync_read(img, model, r, align))
         if best >= QUICK_Z:
@@ -911,12 +921,13 @@ def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
 
 def quick_check(rgb: np.ndarray) -> list:
     """Is this picture Imprinted? Under a second at any size, turn, mirror or scale, and nothing
-    else passes: the picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness),
-    its spectrum scanned for the pilot in 2n-px regions (n = 256 and 128: small windows keep a
-    steep tilt's lines sharp) on every pyramid level, the best candidate grids probed (_locks),
-    and those that lock tracked coarsely and read for the sync layout (_sync_confirm): a
-    repetitive texture (halftone dots, windows, fabric) can fake the pilot's lattice, not the known
-    pseudo-random bits. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's px, or []."""
+    else passes. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
+    candidate grids come from its spectrum (the pilot's lines, two pyramid levels) and, failing
+    those, from the grid search's central windows (steep tilts); each is probed (_locks), and one
+    that locks is tracked coarsely and read for the sync layout (_sync_confirm) while probing goes
+    on. A repetitive texture (halftone dots, windows, fabric) can fake the pilot's lattice, not the
+    known pseudo-random bits. Past QUICK_DEADLINE nothing new starts: out of time = not found.
+    Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's px, or []."""
     with threadpool_limits(1, "blas"):
         return _quick_check(rgb)
 
@@ -929,65 +940,80 @@ def _quick_check(rgb: np.ndarray) -> list:
     f = min(1.0, QUICK_SIDE / max(g.shape))
     img = (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g).astype(np.float32)
     cands, lev, s = [], img, 1.0
-    pool = ThreadPoolExecutor(min(8, os.cpu_count() or 1))
+    pool = ThreadPoolExecutor(min(QUICK_THREADS, os.cpu_count() or 1))
+    side = ThreadPoolExecutor(1)                                  # confirms beside the probes
     try:
-        for level in range(max(L for L, _ in QUICK_PLAN) + 1):
-            for L, n in QUICK_PLAN:
-                if L == level and min(lev.shape) >= 2 * n // (1 + (level == 0)):
-                    n = n if min(lev.shape) >= 2 * n else n // 2         # a small picture: smaller windows
-                    cands += [(sc, c * s, A * s) for sc, c, A in _level_sync(lev, n, pool)]
-            if min(lev.shape) < 512:
-                break
+        for level in (0, 1):
+            n = 256 if min(lev.shape) >= 512 else 128             # a small picture: smaller windows
+            if min(lev.shape) >= 2 * n and (level == 0 or n == 256):
+                cands += [(sc, c * s, A * s) for sc, c, A in _level_sync(lev, n, pool)]
             lev, s = cv2.pyrDown(lev), s * 2
         # a real lattice shows in many neighbouring regions with the same grid, clutter mostly in one
         agree = lambda c, A: sum(np.linalg.norm(c2 - c) < 8 * np.linalg.norm(A[:, 0]) and
                                  np.abs(np.abs(A2) - np.abs(A)).max() < 0.05 * np.abs(A).max() for _, c2, A2 in cands) - 1
         spectral = sorted(((sc + 2 * np.log1p(agree(c, A)), c, A) for sc, c, A in cands), key=lambda t: -t[0])[:QUICK_TOP]
 
-        def grid(level):
-            # the grid search's candidates on a 3x3 grid of windows over the middle: a steep tilt
-            # smears every region's lines, but each local grid still scores on all four
-            lev, s, n = img, 1.0, 256
-            for _ in range(level):
-                lev, s = cv2.pyrDown(lev), s * 2
-            if min(lev.shape) < n:
+        def grid(scale):
+            # the grid search's candidates on a 3x3 grid of windows over the middle of the picture
+            # at `scale` x its full size (as the decoder's, which also tries 1 and 1/2): a steep
+            # tilt smears every region's lines, but each local grid still scores on all four; how
+            # many cells a window spans decides whether they stand out of busy texture
+            n, scale = 256, scale or f                            # None: the shrunk picture's scale
+            pic = (g if scale == 1 else cv2.resize(g, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)).astype(np.float32)
+            if min(pic.shape) < n:
                 return []
-            wins = [(min(max(int(fy * lev.shape[0]) - n // 2, 0), lev.shape[0] - n),
-                     min(max(int(fx * lev.shape[1]) - n // 2, 0), lev.shape[1] - n))
+            k = f / scale                                         # pic px -> img px
+            wins = [(min(max(int(fy * pic.shape[0]) - n // 2, 0), pic.shape[0] - n),
+                     min(max(int(fx * pic.shape[1]) - n // 2, 0), pic.shape[1] - n))
                     for fy in QUICK_GRID_AT for fx in QUICK_GRID_AT]
-            return sum(pool.map(lambda yx: [(0.0, np.array([yx[1] + n / 2, yx[0] + n / 2]) * s, A * s) for A in
-                                            grid_candidates(lev[yx[0]:yx[0] + n, yx[1]:yx[1] + n], n, QUICK_GRID)],
+            return sum(pool.map(lambda yx: [(0.0, (np.array([yx[1] + n / 2, yx[0] + n / 2]) - 0.5) * k, A * k) for A in
+                                            grid_candidates(pic[yx[0]:yx[0] + n, yx[1]:yx[1] + n], n, QUICK_GRID)],
                                 wins), [])
 
-        # probe best first, a batch at a time; read the sync layout as soon as a grid locks well, so
-        # an Imprinted picture usually stops after its first batch
-        spare = []
-        for source in [lambda: spectral] + [lambda L=L: grid(L) for L in QUICK_GRID_LEVELS]:
+        # probe best first, a batch at a time; a grid that locks well is read for the sync layout on
+        # the side while probing goes on, so an Imprinted picture usually stops within its first batch
+        stop = t0 + QUICK_DEADLINE + QUICK_GRACE                  # running confirms give up here
+        running, spare, hit = {}, [], None
+
+        def settled(block: float = 0.0):
+            for job in wait(running, timeout=block, return_when=FIRST_COMPLETED)[0] if running else ():
+                c, A = running.pop(job)
+                z = job.result()
+                if z >= QUICK_Z:
+                    return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
+            return None
+
+        def confirm(c, A):
+            running[side.submit(_sync_confirm, img, c, A, until=stop)] = (c, A)
+
+        for source in [lambda: spectral] + [lambda sc=sc: grid(sc) for sc in QUICK_GRID_SCALES]:
             if late():
-                return []
+                break
             todo, confirms = source(), 0                          # each source gets its own confirms
             for i in range(0, len(todo), 8):
+                if (hit := settled()) or late():
+                    break
                 batch = todo[i:i + 8]
                 for k, (_, c, A) in sorted(zip(pool.map(lambda t: _locks(img, t[1], t[2]), batch), batch),
                                            key=lambda kt: -kt[0]):
                     if k >= QUICK_LOCKS + 1 and confirms < QUICK_CONFIRM:
-                        if late():
-                            return []
                         confirms += 1
-                        z = _sync_confirm(img, c, A)
-                        if z >= QUICK_Z:
-                            return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
+                        confirm(c, A)
                     elif k >= QUICK_LOCKS:
                         spare.append((c, A))
+            if hit:
+                return hit
         for c, A in spare[:QUICK_CONFIRM]:                         # weaker locks last
             if late():
-                return []
-            z = _sync_confirm(img, c, A)
-            if z >= QUICK_Z:
-                return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
+                break
+            confirm(c, A)
+        while running and time.perf_counter() < stop:
+            if hit := settled(stop - time.perf_counter()):
+                return hit
         return []
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+        side.shutdown(wait=False, cancel_futures=True)            # a running confirm stops at `stop`
 
 
 @functools.cache
@@ -1268,7 +1294,8 @@ def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
 # ---------------------------------------------------------------- decode
 
 def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: int = 2,
-          coh_min: float = 0.7, snr_min: float = SNR_MIN, budget: int = 6000, frontier: int | None = None, reaim: bool = True):
+          coh_min: float = 0.7, snr_min: float = SNR_MIN, budget: int = 6000, frontier: bool = True,
+          until: float = np.inf):
     """From one seed window, lock onto the pilot phase (sub-cell offset) and grow outward over the
     picture probe by probe, `step` cells apart, strongest first; then fit a lattice->photo map
     (perspective + curl) to every probe. Lattice coords = true cell coords up to a whole-cell
@@ -1282,6 +1309,8 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     8-cell patch even the exact local affine map is off where the cells shrink. A probe that fails
     is retried when more neighbours have locked, and when the frontier runs dry it is probed once
     more through the homography of every probe so far (re-aimed by pilot_warp if that smears it).
+    budget caps the probes tried while growing, frontier=False skips the global-map retry, and
+    until (perf_counter s) stops it all early: a quick look instead of the whole page.
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
     S = K * r
@@ -1315,7 +1344,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
         push(key)
 
     def grow_from_heap():
-        while heap and len(done) + len(tried) < budget:
+        while heap and len(done) + len(tried) < budget and time.perf_counter() < until:
             _, key, parent = heapq.heappop(heap)
             if key in done:
                 continue
@@ -1341,22 +1370,20 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
         # out of frontier: probes where the cells shrink fade before their neighbours' local maps
         # reach them, so retry the frontier once through the perspective of every probe so far,
         # re-aimed where that perspective, fitted on one side of the page, smears the far side
-        if len(nodes) < 8 or frontier is not None and frontier <= 0:
+        if len(nodes) < 8 or not frontier:
             break
         g = _homography_map([n[0] for n in nodes.values()], [n[1] for n in nodes.values()], 0.5 * cell)
         added = 0
         for key in {(k[0] + di, k[1] + dj) for k in nodes for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1))} - done:
             if g is None or tried.get(key, 0) >= 99:
                 continue
-            if frontier is not None:                                  # a capped number of these probes
-                if frontier <= 0:
-                    break
-                frontier -= 1
+            if time.perf_counter() > until:
+                break
             tried[key] = 99                                           # the global map gets one try per key
             q = np.array(key, np.float64) * step
             p = g(q[None])[0]
             on = 0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]
-            res = map_probe(lum, q, g, nc, S, coh_min, snr_min, reaim=reaim) if on else None
+            res = map_probe(lum, q, g, nc, S, coh_min, snr_min, reaim=True) if on else None
             if res:
                 accept(key, res)
                 added += 1
@@ -1570,7 +1597,7 @@ def read(lum: np.ndarray, model, r: int = 6, grow: float = 4) -> dict | None:
                     s = bits[bm[t]]
                     e = bits * soft / np.maximum(np.bincount(bm[t], minlength=nbits), 1)  # per-bit evidence
                     return dict(payload=payload, raw_ber=round(float((s[used] * v[used] <= 0).mean()), 4),
-                                bit_ber=round(float((np.sign(soft) != bits).mean()), 4),
+                                bit_ber=round(float((np.sign(soft) != bits)[soft != 0].mean()), 4),   # erased bits aside
                                 bit_snr=round(float(e.mean() / (e.std() + 1e-9)), 2),
                                 cells=int(used.sum()), tiles=round(used.sum() / T ** 2, 1), probes=nprobe)
     return None

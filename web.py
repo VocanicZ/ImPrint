@@ -23,6 +23,7 @@ import imprinted.core as ic
 ROOT = Path(__file__).parent
 LOG = ROOT / "results" / "decode_log.csv"
 app = FastAPI(title="Imprinted")
+ic.quick_check(np.zeros((512, 512, 3), np.uint8))       # build the decoder's tables now, not on the first upload
 
 
 MAX_UPLOAD = 60 * 1024 * 1024      # bytes

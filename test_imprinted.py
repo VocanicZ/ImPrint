@@ -46,7 +46,7 @@ def test_package_encode_decode_round_trip_through_files(tmp_path):
 
 def test_quick_check_finds_the_pilot_at_any_turn_size_or_tilt_and_nothing_elsewhere():
     """The gate decode() runs first: a clean file in any orientation, shrunk or blown up, and a page
-    turned 50 degrees (as steep as the decoder reads) all show the pilot; plain pictures don't."""
+    turned 50 degrees (as steep as the decoder reads) all read as Imprinted; plain pictures don't."""
     enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
     for view in (enc, np.rot90(enc), enc[:, ::-1], cv2.resize(enc, None, fx=0.6, fy=0.6),
                  cv2.resize(enc, None, fx=4, fy=4), tilted(enc, 50)[0]):
@@ -55,6 +55,49 @@ def test_quick_check_finds_the_pilot_at_any_turn_size_or_tilt_and_nothing_elsewh
     for plain in (photo_like(), photo_like(seed=1), rng.integers(0, 256, (900, 1200, 3), np.uint8)):
         assert ic.quick_check(plain) == []
     assert imprinted.detect(enc) and not imprinted.detect(photo_like())
+
+
+def test_patterns_and_sync_layout_are_pinned():
+    """The data patterns and the sync layout are the file format: if either changed (a numpy
+    whose generator draws differently, an edit), every picture made before would stop reading."""
+    import hashlib
+    sha = lambda a: hashlib.sha256(a.tobytes()).hexdigest()
+    assert sha(ic._all_patterns(ic.SEED).astype(np.int8)) == "f4b0b50997766d3b32261d77c14e837bbff0f85a75583f4818b4601f3df92a31"
+    on, pat, bits = ic._sync_layout()
+    assert sha(np.concatenate([on.ravel().astype(np.int8), pat.ravel().astype(np.int16).view(np.int8),
+                               bits.ravel().astype(np.int8)])) == "6630d4cbd2e04920817236073822a4e64993ad9924339780319684817f670d5e"
+
+
+def test_sync_layout_reads_on_the_right_twin_only():
+    """A quarter of the cells carry known bits: on the decoder's lattice the matched filter stands
+    far out, on its 180-degree twin (cells misaligned) and on an unencoded picture it doesn't."""
+    img = photo_like()
+    enc, _ = ic.encode(img, b"hi", delta=2, subblock_px=6)
+    lum = ic.to_lab(enc)[..., 0]
+    zs = []
+    for sgn in (1, -1):
+        model = ic.refine(lum, ic.track(lum, ic.find_seeds(lum)[0], sgn))
+        for picture in (lum, ic.to_lab(img)[..., 0]):
+            m, w, used, rows, cols, unit = ic.cell_means(picture, model)
+            ii, jj = np.mgrid[0:rows, 0:cols].reshape(2, -1)
+            zs.append(ic.sync_find(m[used], w[used], ii[used], jj[used], unit)[0])
+    right, wrong = max(zs[0], zs[2]), min(zs[0], zs[2])
+    assert right > 15 and wrong < 5 and max(zs[1], zs[3]) < 5, zs
+
+
+def test_quick_check_rejects_halftone_dots_fast():
+    """A halftone screen is a lattice too, and locks the pilot probes; without the sync layout it
+    isn't Imprinted. And the gate gives up in bounded time, at any picture size."""
+    yy, xx = np.mgrid[0:1500, 0:2000].astype(np.float32)
+    u, v = (xx + yy) / 9.0, (xx - yy) / 9.0                        # 45-degree screen, ~6 px pitch
+    dots = (np.cos(2 * np.pi * u) * np.cos(2 * np.pi * v) * 60 + 128 + photo_like(1500, 2000)[..., 0] * 0.3 - 40)
+    screen = np.clip(np.dstack([dots] * 3), 0, 255).astype(np.uint8)
+    assert ic.quick_check(screen) == []
+    import time
+    big = np.random.default_rng(0).integers(0, 256, (3000, 4000, 3), np.uint8)
+    t0 = time.perf_counter()
+    assert ic.quick_check(big) == []
+    assert time.perf_counter() - t0 < 2.0                           # QUICK_DEADLINE + grace, with slack for a busy machine
 
 
 def test_found_without_border_any_orientation():
@@ -198,7 +241,8 @@ def test_unencoded_images_yield_no_payload(monkeypatch):
     calls = []
     real = ic.read_soft
     monkeypatch.setattr(ic, "read_soft", lambda soft, nb: calls.append(nb) or real(soft, nb))
-    assert ic.decode(ic.to_rgb(lab), max_seeds=2)["found"] == [] and len(set(calls)) >= 10   # many lengths tried
+    assert ic.quick_check(ic.to_rgb(lab)) == []                       # a pilot without the sync layout isn't Imprinted
+    assert ic.decode(ic.to_rgb(lab), max_seeds=2, check=False)["found"] == [] and len(set(calls)) >= 10   # many lengths
 
 
 def test_adversarial_host_still_decodes():

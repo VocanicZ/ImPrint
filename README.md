@@ -25,6 +25,8 @@ The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so
 
 **Hidden sync (the invisible finder).** Instead of corner markers, four faint cosines are locked to the cell grid. Each shows up as one sharp line in the spectrum, so the decoder can find the grid (spacing, rotation, mirror, perspective) anywhere in a photo. The encoder first notches the picture's own content at those frequencies so texture can't drown them. From a spectral seed the decoder tracks the pilot outward probe by probe, fits perspective and curl, then reads the cells. When a steep tilt smears every spectral line, a grid search tries plausible local grids directly and keeps the ones neighbouring probes confirm.
 
+**Sync cells and the quick check.** A fixed pseudo-random quarter of the cells carry known bits instead of payload. The pilot is a lattice, and so is anything repetitive (halftone dots in a print, windows, fabric): those can look like a pilot, but nothing except an Imprinted picture correlates with the known bits. So `detect()` can say yes or no fast: it shrinks the photo to 2048 px, finds candidate grids from the spectrum (or, for steep tilts, a grid search), probes them, tracks the best one coarsely and runs a matched filter for the sync cells. `decode()` runs that check first and gives up on a picture without an Imprinted pattern in under a second, instead of searching it for minutes. The decoder treats sync cells as erasures, and they also tell the two 180° turns of the lattice apart.
+
 **Strength.** A perceptual mask (luminance adaptation, contrast sensitivity at the printed pattern frequency, contrast masking) sets how much each pixel may change; clipped pixels (pure black, white, saturated) are never touched. By default the encoder picks the strongest overall strength δ (up to 2.4) that keeps SSIM ≥ 0.955 and mean |ΔL\*| ≤ 0.99. Smooth pictures land near δ 1.2, busy ones near δ 0.8. Pass `delta=` to force a value.
 
 ### Measured (simulated)
@@ -71,10 +73,12 @@ import imprinted
 
 imprinted.encode("photo.png", "hello", "photo_imprinted.png")   # save as PNG
 imprinted.decode("phone_shot.jpg")                            # -> "hello", or None
+imprinted.detect("phone_shot.jpg")                            # -> True if it holds an Imprinted pattern
 ```
 
 * `encode(image, payload, out=None, *, print_width_cm=15.0, strength=None)` takes a path, PIL image or RGB uint8 array, and a `str` or `bytes` payload of 1 to 32 bytes. It returns the encoded PIL image (same size and mode) and saves it to `out` if given. Set `print_width_cm` to how wide the picture will be printed or shown: it sizes the pattern to about 0.8 mm per sub-block. `strength=None` picks the strongest setting inside the visibility budget. Raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
-* `decode(image, raw=False)` returns the first payload found as a `str`, as `bytes` with `raw=True`, or `None` if nothing is found.
+* `decode(image, raw=False, check=True)` returns the first payload found as a `str`, as `bytes` with `raw=True`, or `None` if nothing is found. It runs `detect()` first and returns `None` right away when that finds no pattern. Pictures made with 0.7.x have no sync cells: read those with `check=False`.
+* `detect(image)` returns `True` when the picture holds an Imprinted pattern, without reading the payload. It takes under a second at any size, and repetitive textures don't fool it.
 
 The full codec is `imprinted.core`: `core.encode` also returns stats (strength, SSIM, mean ΔL\*, tiles), `core.decode` returns every payload found in a photo with its bit error rate and outline, and `core.make_ladder` builds the strength-test page.
 

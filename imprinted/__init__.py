@@ -16,7 +16,7 @@ from PIL import Image, ImageOps
 
 from . import core
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 __all__ = ["encode", "decode", "detect", "core"]
 
 
@@ -50,10 +50,11 @@ def encode(image, payload: str | bytes, out=None, *, print_width_cm: float = 15.
     return img
 
 
-def decode(image, raw: bool = False) -> str | bytes | None:
+def decode(image, raw: bool = False, check: bool = True) -> str | bytes | None:
     """First payload found in image (a file, screenshot or photo: path, PIL image or RGB uint8
-    array), or None. A str (UTF-8) unless raw, then bytes."""
-    found = core.decode(_load(image), max_found=1)["found"]
+    array), or None. A str (UTF-8) unless raw, then bytes. check: detect() first and stop there if
+    it finds nothing (a picture made before 0.8 has no sync cells: pass check=False for those)."""
+    found = core.decode(_load(image), max_found=1, check=check)["found"]
     if not found:
         return None
     payload = found[0]["payload"]
