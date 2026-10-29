@@ -145,10 +145,15 @@ def notch_pilot(lum: np.ndarray, c: float, sigma_cells: float = 1.0) -> np.ndarr
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
     u, v = (xx + 0.5) / c, (yy + 0.5) / c
     out = lum.astype(np.float64).copy()
+    # the host's amplitude at a line varies over about a cell, so blur it at 8 samples per cell
+    # (a kernel ~6 cells wide is ~400 px on a big picture); off by under 2% of the notch's rms
+    s = max(1, int(c // 8))
+    small = (max(1, round(w / s)), max(1, round(h / s)))
+    blur = lambda a: cv2.resize(cv2.GaussianBlur(cv2.resize(a, small, interpolation=cv2.INTER_AREA), (0, 0),
+                                                 sigma_cells * c / s), (w, h), interpolation=cv2.INTER_LINEAR)
     for fx, fy in PILOT_FREQS:
         e = np.exp(-2j * np.pi * (fx * u + fy * v))
         z = lum * e
-        blur = lambda a: cv2.GaussianBlur(a, (0, 0), sigma_cells * c)
         a = blur(z.real) + 1j * blur(z.imag)                 # local amplitude of the host at this line
         out -= 2 * np.real(a * np.conj(e))
     return out.astype(np.float32)
@@ -434,20 +439,21 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     within the visibility budget (VIS_SSIM, VIS_DL), by bisection. ValueError when the picture is
     too small to read back (a small one is decoded once to make sure) or too clipped to carry the
     payload at all; RuntimeWarning when more than WRONG_WARN of its cells read wrong."""
+    cache = {}                                                  # the host's notch: the same at every delta
     if delta is not None:
-        out, st = _embed(rgb, payload, delta, subblock_px)
+        out, st = _embed(rgb, payload, delta, subblock_px, cache)
     else:
         lo, hi, best = DELTA_MIN, DELTA_MAX, None
         for i in range(7):
             d = hi if i == 0 else (lo + hi) / 2                 # the cap first: often within budget
-            out, st = _embed(rgb, payload, d, subblock_px)
+            out, st = _embed(rgb, payload, d, subblock_px, cache)
             if st["ssim"] >= VIS_SSIM and st["mean_dL"] <= VIS_DL:
                 best, lo = (out, st), d
                 if i == 0:
                     break
             else:
                 hi = d
-        out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px)
+        out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px, cache)
     rows, cols, T = st["rows"], st["cols"], st["tile"]
     if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
         if not any(f["payload"] == payload for f in decode(out)["found"]):
@@ -461,7 +467,7 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     return out, st
 
 
-def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int):
+def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cache: dict | None = None):
     nb = len(payload)
     if not 1 <= nb <= MAX_BYTES:
         raise ValueError(f"payload must be 1..{MAX_BYTES} bytes")
@@ -491,8 +497,10 @@ def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int):
     # the pilot follows the same mask, but only up to PILOT_HI: it sets the lattice unit, and a
     # bigger unit makes every cell's QIM nudge bigger
     pil = PILOT * delta * pilot_field(rows * c, cols * c, c) * pm
-    lum_n = notch_pilot(lum, c)
-    notch = (lum_n - lum) * room                              # only where there's room to change
+    cache = {} if cache is None else cache
+    if "notch" not in cache:
+        cache["notch"] = notch_pilot(lum, c) - lum
+    notch = cache["notch"] * room                              # only where there's room to change
     # pilot + notch are part of what the data must beat, less the mean cell: the decoder takes
     # that out (it is the pilot, the same in every cell) before it reads the data
     mean_cell = _cells(pil, c).mean(axis=(0, 1))
@@ -608,13 +616,6 @@ def _deridge(R: np.ndarray) -> np.ndarray:
     return R / np.maximum(ridge, 1.0)
 
 
-def _plausible(A: np.ndarray) -> bool:
-    """A photographed cell grid: perspective skews it, but cells stay roughly square."""
-    l1, l2 = np.linalg.norm(A[:, 0]), np.linalg.norm(A[:, 1])
-    cos = abs(A[:, 0] @ A[:, 1]) / (l1 * l2 + 1e-9)
-    return 0.5 < l1 / l2 < 2 and cos < 0.65
-
-
 def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
     """Find the pilot lines in a region's spectrum and solve the cell grid: any two strong peaks
     fix a candidate grid, the other lines must show up where it predicts them.
@@ -634,48 +635,40 @@ def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
     obs = np.concatenate([obs, -obs])                              # both signs of every line
     logR = np.log(np.concatenate([R[yy[sel][order], xx[sel][order]]] * 2))
 
-    def r_at(f):                                                   # whitened power at a frequency
-        x, y = c + f[0] * n, c + f[1] * n
-        xi, yi = int(round(x)), int(round(y))
-        if not (1 <= xi < n - 1 and 1 <= yi < n - 1):
-            return 1e-3
-        return float(R[yi - 1:yi + 2, xi - 1:xi + 2].max())
-
-    best, nf = None, len(PILOT_FREQS)
-    for a in range(len(obs)):
-        for b in range(len(obs)):
-            if a == b or a % (len(obs) // 2) == b % (len(obs) // 2):
-                continue
-            for i in range(nf):
-                for j in range(nf):
-                    if i == j:
-                        continue
-                    F2 = PILOT_FREQS[[i, j]]
-                    Mt = np.linalg.solve(F2, obs[[a, b]])            # obs = F @ Mt
-                    A = np.linalg.inv(Mt)
-                    cell = np.sqrt(abs(np.linalg.det(A)))
-                    if not 12 <= cell <= n / 3 or not _plausible(A):
-                        continue
-                    rest = [k for k in range(nf) if k not in (i, j)]
-                    pred = PILOT_FREQS[rest] @ Mt
-                    lr = np.log([r_at(f) for f in pred])
-                    if lr.mean() < np.log(4):                         # the other lines, on average
-                        continue
-                    score = float(logR[a] + logR[b] + lr.sum())
-                    if best is None or score > best[0]:
-                        best = (score, Mt, (a, b, i, j, rest, pred, lr))
-    if best is None:
+    # every candidate at once: two observed peaks (a, b: not one line and its mirror) as two pilot
+    # lines (i, j) fix the grid; the other two lines must show where it predicts them
+    nf, m = len(PILOT_FREQS), len(obs)
+    a, b = np.nonzero(np.not_equal.outer(np.arange(m) % (m // 2), np.arange(m) % (m // 2)))
+    ij = np.array([(i, j) for i in range(nf) for j in range(nf) if i != j])
+    rest = np.array([[k for k in range(nf) if k not in (i, j)] for i, j in ij])
+    O = np.stack([obs[a], obs[b]], 1)[:, None]                       # (pairs, 1, 2, 2)
+    Mt = np.linalg.solve(PILOT_FREQS[ij][None], O)                    # obs = F @ Mt, (pairs, ij, 2, 2)
+    dM = np.linalg.det(Mt)
+    ok = np.abs(dM) > 0
+    A = np.linalg.inv(np.where(ok[..., None, None], Mt, np.eye(2)))
+    cell = np.sqrt(np.abs(np.linalg.det(A)))
+    l1, l2 = np.linalg.norm(A[..., 0], axis=-1), np.linalg.norm(A[..., 1], axis=-1)
+    cos = np.abs((A[..., 0] * A[..., 1]).sum(-1)) / (l1 * l2 + 1e-9)
+    ok &= (12 <= cell) & (cell <= n / 3) & (0.5 < l1 / l2) & (l1 / l2 < 2) & (cos < 0.65)   # roughly square cells
+    pred = PILOT_FREQS[rest][None] @ np.where(ok[..., None, None], Mt, 0.0)   # (pairs, ij, 2 lines, fx fy)
+    xi, yi = (np.rint(c + pred[..., k] * n).astype(int) for k in (0, 1))
+    inside = (1 <= xi) & (xi < n - 1) & (1 <= yi) & (yi < n - 1)
+    Rmax = cv2.dilate(R, np.ones((3, 3), np.uint8)).astype(np.float64)   # whitened power near a frequency
+    lr = np.log(np.where(inside, Rmax[np.clip(yi, 0, n - 1), np.clip(xi, 0, n - 1)], 1e-3))
+    ok &= lr.mean(-1) >= np.log(4)                                   # the other lines, on average
+    if not ok.any():
         return None
+    score = np.where(ok, logR[a][:, None] + logR[b][:, None] + lr.sum(-1), -np.inf)
+    p, q = np.unravel_index(np.argmax(score), score.shape)
     # refine with every line that shows (sub-pixel positions of the predicted ones)
-    score, Mt, (a, b, i, j, rest, pred, lr) = best
-    fo, used = [obs[a], obs[b]], [i, j]
-    for k, f, l in zip(rest, pred, lr):
+    fo, used = [obs[a[p]], obs[b[p]]], list(ij[q])
+    for k, f, l in zip(rest[q], pred[p, q], lr[p, q]):
         if l >= np.log(2):
             yk, xk = _subpixel(R, int(round(c + f[1] * n)), int(round(c + f[0] * n)))
             fo.append([(xk - c) / n, (yk - c) / n])
             used.append(k)
     Mt, *_ = np.linalg.lstsq(PILOT_FREQS[used], np.array(fo), rcond=None)
-    return score, np.linalg.inv(Mt)
+    return float(score[p, q]), np.linalg.inv(Mt)
 
 
 def _starts(size: int, span: int, step: int) -> list[int]:
@@ -1266,9 +1259,10 @@ def _quad(model) -> np.ndarray:
     return fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
 
 
-def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
+def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None) -> dict:
     """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
-    outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts)."""
+    outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts).
+    max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow)."""
     rgb = as_rgb(rgb)
     lum = to_lab(rgb)[..., 0]
     seeds = find_seeds(lum)
@@ -1310,7 +1304,7 @@ def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
 
     for batch in (seeds, None):
         for seed in grid_seeds(lum) if batch is None else batch:
-            if batch is not None and tried >= max_seeds:
+            if batch is not None and tried >= max_seeds or max_found and len(found) >= max_found:
                 break                                               # (the grid's few seeds all get a turn)
             if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
                 continue                                            # inside a picture already read

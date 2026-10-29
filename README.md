@@ -33,11 +33,13 @@ The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so
 
 | image | δ | SSIM | mean ΔL\* | clean / turned / mirrored | 60% crops | print easy | gray | hard | curled |
 |---|---|---|---|---|---|---|---|---|---|
-| kodim23 (smooth) | 1.21 | 0.956 | 0.74 | all | 5/5 | 5/5 | 5/5 | 4/5 | 5/5 |
+| kodim23 (smooth) | 1.21 | 0.956 | 0.74 | all | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
 | kodim05 (busy) | 0.83 | 0.976 | 0.99 | all | 5/5 | 5/5 | 5/5 | – | – |
 | kodim08 (busy, periodic) | 0.92 | 0.980 | 0.98 | all | 5/5 | 5/5 | 5/5 | – | – |
 
 `hard` is tilt up to ~40°, 0.6 camera px per printed px, JPEG 75. `sim.py` models print (AM halftone, dot gain, grayscale) and photo (3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; confirm on real hardware with the strength ladder page.
+
+Speed (v0.7.1, one desktop CPU, 4 threads): encoding takes about 1.5 s for a 768×512 picture and 25 s for 3000×2000; decoding a clean file takes 2 to 25 s, and a phone photo of a print 10 to 45 s.
 
 ---
 
