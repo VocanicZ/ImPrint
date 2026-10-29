@@ -113,13 +113,13 @@ nice .venv/bin/python sim.py --quick                 # kodim23, 1 trial
 
 ## Contributing
 
-Bug reports and PRs are welcome. Open issues and PRs against `camera-robust` (the default branch).
+Bug reports and PRs are welcome. Open PRs against `main`.
 
 **Reporting a bug.** Include the input image (or a small one that reproduces it), the exact command or code, the payload, and what you expected vs. what happened. For decode failures, attach the photo and say how it was taken (printer, paper size, phone, distance, angle).
 
 **Making a change.**
 
-1. Branch from `camera-robust`.
+1. Branch from `main`.
 2. Run the tests that cover your change while you work, then the full gate before you open the PR (below).
 3. If you touch the codec, run `sim.py --acceptance` and put the table in the PR. A change that makes any row FAIL needs a strong reason.
 4. If the encoder's output changes, regenerate the README figure: `.venv/bin/python scripts/readme_image.py` (exits non-zero if it no longer decodes).
@@ -132,8 +132,8 @@ There is no GitHub CI: `scripts/ci-local.sh` is the gate, and it builds `.venv` 
 The suite is slow (each test encodes and decodes a full image), so don't rerun all of it on every edit. [rtdd](https://github.com/VocanicZ/rtdd) keeps a per-test coverage map (`.rtdd/map.jsonl`, committed) and runs only the tests that cover your change:
 
 ```bash
-rtdd which --base origin/camera-robust   # tests covering your diff + changed lines nothing covers; runs nothing
-rtdd run   --base origin/camera-robust   # run just those tests, refresh their map rows
+rtdd which --base origin/main           # tests covering your diff + changed lines nothing covers; runs nothing
+rtdd run   --base origin/main           # run just those tests, refresh their map rows
 scripts/ci-local.sh                      # full gate before you push/merge
 ```
 
