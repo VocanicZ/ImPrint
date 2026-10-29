@@ -197,6 +197,34 @@ def xy(c) -> list:
     return [round(float(c[0]), 1), round(float(c[1]), 1)]
 
 
+def grid_lines(model, most: int = 40) -> list:
+    """A tracked lattice->photo map as polylines along its cell edges (at most `most` each way)."""
+    fmap, (x0, x1, y0, y1), _ = model
+    xs, ys = np.arange(np.ceil(x0), np.floor(x1) + 1), np.arange(np.ceil(y0), np.floor(y1) + 1)
+    k = max(1, -(-max(len(xs), len(ys)) // most))
+    tx, ty = np.linspace(x0, x1, 24), np.linspace(y0, y1, 24)
+    return ([fmap(np.c_[np.full_like(ty, x), ty]).round(1).tolist() for x in xs[::k]] +
+            [fmap(np.c_[tx, np.full_like(tx, y)]).round(1).tolist() for y in ys[::k]])
+
+
+def read_cells(info: dict) -> dict:
+    """What a read saw, per cell it used, in photo px: 0 sync cell, 1 payload bit read right,
+    2 read wrong (fixed by error correction), 3 read (payload not known: the read failed)."""
+    fmap, rows, cols, used = info["model"][0], info["rows"], info["cols"], info["used"]
+    ii, jj = np.mgrid[0:rows, 0:cols].reshape(2, -1)
+    lat = np.c_[info["xs"] + jj + 0.5, info["ys"] + ii + 0.5]
+    keep = used | (info["sync"] if info["sync"] is not None else False)
+    kind = np.full(rows * cols, 3)
+    if info["right"] is not None:
+        kind = np.where(info["right"], 1, 2)
+    if info["sync"] is not None:
+        kind = np.where(info["sync"], 0, kind)
+    p = fmap(lat[keep])
+    size = float(np.median(np.linalg.norm(fmap(lat[keep][:200] + [1, 0]) - p[:200], axis=1))) if len(p) else 0.0
+    return dict(xy=p.round(1).ravel().tolist(), kind=kind[keep].tolist(), cell=round(size, 1),
+                z=round(float(info["z"]), 1), sync_found=info["sync"] is not None)
+
+
 @app.post("/api/decode")
 async def decode(request: Request, file: UploadFile = File(...), label: str = Form("")):
     """Streams JSON lines as the decoder works: the photo's preview, each quick-check probe and
@@ -214,6 +242,14 @@ async def decode(request: Request, file: UploadFile = File(...), label: str = Fo
                                                       e2=xy(v[3])) if v is not None else {})))
             elif ev == "seed":
                 put(dict(e=ev, xy=xy(c)))
+            elif ev == "twin":
+                put(dict(e=ev, xy=xy(c), sgn=int(v)))
+            elif ev == "try":
+                put(dict(e=ev, xy=xy(c), ok=bool(v)))
+            elif ev in ("tracked", "refined"):
+                put(dict(e=ev, lines=grid_lines(v) if v else [], probes=int(v[2]) if v else 0))
+            elif ev == "cells":
+                put(dict(e=ev, **read_cells(v)))
             elif ev == "found":
                 put(dict(e=ev, **payload(v)))
 

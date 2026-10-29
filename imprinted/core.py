@@ -1325,7 +1325,7 @@ def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
 
 def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: int = 2,
           coh_min: float = 0.7, snr_min: float = SNR_MIN, budget: int = 6000, frontier: bool = True,
-          until: float = np.inf):
+          until: float = np.inf, trace=None):
     """From one seed window, lock onto the pilot phase (sub-cell offset) and grow outward over the
     picture probe by probe, `step` cells apart, strongest first; then fit a lattice->photo map
     (perspective + curl) to every probe. Lattice coords = true cell coords up to a whole-cell
@@ -1340,7 +1340,8 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
     is retried when more neighbours have locked, and when the frontier runs dry it is probed once
     more through the homography of every probe so far (re-aimed by pilot_warp if that smears it).
     budget caps the probes tried while growing, frontier=False skips the global-map retry, and
-    until (perf_counter s) stops it all early: a quick look instead of the whole page.
+    until (perf_counter s) stops it all early: a quick look instead of the whole page. trace(locked,
+    photo_xy), if given, sees every probe as it is tried.
     Returns (fmap, extent, n_probes) or None."""
     _, c0, e1, e2 = seed
     S = K * r
@@ -1391,6 +1392,8 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             tried[key] = len(around)
             res = homography_probe(lum, q, around, nc, S, coh_min, snr_min) if len(around) >= 4 else None
             res = res or probe(q, Q, P, J)
+            if trace:
+                trace(res is not None, p)
             if res is not None:
                 accept(key, res)
 
@@ -1414,6 +1417,8 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             p = g(q[None])[0]
             on = 0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]
             res = map_probe(lum, q, g, nc, S, coh_min, snr_min, reaim=True) if on else None
+            if trace and on:
+                trace(res is not None, p)
             if res:
                 accept(key, res)
                 added += 1
@@ -1585,19 +1590,25 @@ def lattice_scale(c: np.ndarray, w: np.ndarray, used: np.ndarray, unit: float) -
     return s0 * 2 ** (ks[int(np.argmax(fit))] / 12)
 
 
-def read(lum: np.ndarray, model, r: int = 6, grow: float = 4) -> dict | None:
+def read(lum: np.ndarray, model, r: int = 6, grow: float = 4, trace=None) -> dict | None:
     """Try every payload length and tile phase on the pilot-free cells: soft-combine repeats,
-    LDPC belief propagation, CRC."""
+    LDPC belief propagation, CRC. trace(cells), if given, sees what it read: dict(model, xs, ys
+    (lattice coords of cell 0, 0), rows, cols, used, sync (the sync cells, if found), z, right
+    (per cell: its bit read right, once the payload is known; else None))."""
     cm = cell_means(lum, model, r, grow)
     if cm is None:
         return None
+    report = lambda **kw: trace and trace(dict(model=model, xs=np.floor(model[1][0] - grow),
+                                               ys=np.floor(model[1][2] - grow), rows=rows, cols=cols, **kw))
     m, w, used, rows, cols, unit = cm
     nprobe = model[2]
     ii, jj = np.mgrid[0:rows, 0:cols]
     ii, jj = ii.ravel(), jj.ravel()
     z, (di, dj) = sync_find(m[used], w[used], ii[used], jj[used], unit)
+    sync = None
     if z >= SYNC_Z:                                               # sync cells hold no payload: erasures
-        w = np.where(sync_cells(ii + di, jj + dj)[0], 0.0, w)
+        sync = sync_cells(ii + di, jj + dj)[0] & used
+        w = np.where(sync, 0.0, w)
         used = used & (w > 0)
     for nb in range(1, MAX_BYTES + 1):
         T, nbits = tile_size(nb), 8 * frame_len(nb)
@@ -1626,10 +1637,12 @@ def read(lum: np.ndarray, model, r: int = 6, grow: float = 4) -> dict | None:
                     bits = to_bits(payload)
                     s = bits[bm[t]]
                     e = bits * soft / np.maximum(np.bincount(bm[t], minlength=nbits), 1)  # per-bit evidence
+                    report(used=used, sync=sync, z=z, right=s * v > 0)
                     return dict(payload=payload, raw_ber=round(float((s[used] * v[used] <= 0).mean()), 4),
                                 bit_ber=round(float((np.sign(soft) != bits)[soft != 0].mean()), 4),   # erased bits aside
                                 bit_snr=round(float(e.mean() / (e.std() + 1e-9)), 2),
                                 cells=int(used.sum()), tiles=round(used.sum() / T ** 2, 1), probes=nprobe)
+    report(used=used, sync=sync, z=z, right=None)
     return None
 
 
@@ -1652,7 +1665,10 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
     check: quick_check first, and stop there if it finds no pilot (a picture without a payload: one to
     ten seconds instead of minutes); the seed it confirmed gets the first turn.
     trace(event, centre_xy, value), if given, sees quick_check's events, then ("checked", None,
-    seed or None), each seed tried ("seed", centre, None) and each payload read ("found", None, result)."""
+    seed or None), each seed tried ("seed", centre, None), each twin tracked from it ("twin", centre,
+    sgn), every probe ("try", photo_xy, locked), the tracked and refined maps ("tracked"/"refined",
+    None, model), the cells each read saw ("cells", None, read's trace dict) and each payload read
+    ("found", None, result)."""
     rgb, trace = as_rgb(rgb), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
         small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL      # read in full anyway: a quick look only
@@ -1679,16 +1695,23 @@ def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list 
     lum = to_lab(rgb)[..., 0]
     seeds, found, regions, tried = [], [], [], 0
 
+    probed = lambda ok, p: trace("try", p, ok)
+    cells = lambda info: trace("cells", None, info)
+
     def attempt(seed):
         res, locked = None, []
         for sgn in (1, -1):
-            tracked = track(lum, seed, sgn)
+            trace("twin", seed[1], sgn)
+            tracked = track(lum, seed, sgn, trace=probed)
+            trace("tracked", None, tracked)
             model = refine(lum, tracked) if tracked else None
-            res = read(lum, model) if model else None
+            if model:
+                trace("refined", None, model)
+            res = read(lum, model, trace=cells) if model else None
             if not res and tracked and model is not tracked:
                 # the tracker's own probes now outnumber a refine pass's small windows, and in busy
                 # texture its fit can be the better one
-                res = read(lum, tracked)
+                res = read(lum, tracked, trace=cells)
                 model = tracked if res else model
             if res:
                 break
@@ -1698,7 +1721,8 @@ def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list 
             # one twin locked, the other tracked badly: the pilot alone can't tell twins apart, so
             # the locked one may be the wrong one - turn its lattice 180 degrees and refit that
             model = refine(lum, _twin(locked[0]))
-            res = read(lum, model)
+            trace("refined", None, model)
+            res = read(lum, model, trace=cells)
             if not res and model[2] >= 30:
                 locked.append(model)
         if not res and len(locked) == 2:
