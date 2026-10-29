@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ImPrint</title>
+<title>Imprinted</title>
 <style>
   :root { --bg:#f6f6f4; --card:#fff; --fg:#1d1d1b; --muted:#6b6b66; --line:#ddddd8; --acc:#2f6fdf; --ok:#1f9d55; --warn:#d48a00; --bad:#d23b3b; }
   @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#1f1f1f; --fg:#ececea; --muted:#9a9a95; --line:#333; --acc:#6b9bff; } }
@@ -39,7 +39,7 @@
 </head>
 <body>
 <main>
-  <h1>ImPrint: invisible, print/camera-robust image codes</h1>
+  <h1>Imprinted: invisible, print/camera-robust image codes</h1>
   <nav>
     <button data-tab="enc" class="on">Encode</button>
     <button data-tab="dec">Decode</button>
@@ -117,7 +117,7 @@ $('e-go').onclick = async () => {
   if (j.subblock_mm < j.min_subblock_mm) warn.push(`Printed sub-block is ${j.subblock_mm} mm (< ${j.min_subblock_mm} mm): print larger, or use a higher-resolution image.`);
   if (s.tiles < 2) warn.push('Low redundancy (fewer than 2 payload tiles): use a shorter payload or a larger image.');
   if (s.wrong_cells > 0.15) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
-  const name = 'imprint_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
+  const name = 'imprinted_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
   out.innerHTML = `
     ${warn.map(w => `<p class="warn">${esc(w)}</p>`).join('')}
     ${kv({'similarity (SSIM)': s.ssim + '  (1 = identical)', 'PSNR': s.psnr + ' dB',
@@ -163,7 +163,7 @@ $('l-go').onclick = async () => {
   if (!j) return;
   out.innerHTML = `<table><tr><th>strength δ</th><th>SSIM</th><th>PSNR</th><th>mean ΔL*</th><th>99% ΔL*</th><th>payload tiles</th></tr>
     ${j.stats.map(s => `<tr><td>${s.delta}</td><td>${s.ssim}</td><td>${s.psnr}</td><td>${s.mean_dL}</td><td>${s.p99_dL}</td><td>${s.tiles}×</td></tr>`).join('')}</table>
-    <a class="btn" href="${j.pdf}" download="imprint_ladder.pdf">Download test page (PDF)</a>
+    <a class="btn" href="${j.pdf}" download="imprinted_ladder.pdf">Download test page (PDF)</a>
     <p class="note">Each copy prints ~8.8 cm wide. Photograph the whole page; the decoder finds every copy it can read.</p>`;
 };
 </script>

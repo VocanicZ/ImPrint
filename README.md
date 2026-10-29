@@ -1,10 +1,10 @@
-# ImPrint: invisible, camera-robust data in images
+# Imprinted: invisible, camera-robust data in images
 
-![Original, ImPrinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
+![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](https://raw.githubusercontent.com/VocanicZ/Imprinted/main/versus.png)
 
-*Made by `scripts/readme_image.py` with the current encoder: kodim23 at default strength, payload `ImPrint`, then printed and photographed through `sim.py`'s curled-page channel (tilt, curl, mirror, clutter, JPEG).*
+*Made by `scripts/readme_image.py` with the current encoder: kodim23 at default strength, payload `Imprinted`, then printed and photographed through `sim.py`'s curled-page channel (tilt, curl, mirror, clutter, JPEG).*
 
-ImPrint hides a short payload (up to 32 bytes) inside an ordinary picture. The encoded image:
+Imprinted hides a short payload (up to 32 bytes) inside an ordinary picture. The encoded image:
 
 * **looks like the original**: same size, no border, no QR-style markers, no visible pattern (SSIM ≥ 0.955, mean ΔL\* ≤ 1 by default);
 * **decodes from the pixels alone**, not from metadata: from the file, a screenshot, a crop, or a **phone photo of a print or a screen**, at an angle, in odd light, printed in grayscale, mirrored, gently curled, with clutter around it.
@@ -17,7 +17,7 @@ Typical uses: provenance tags, case or session IDs, leak forensics, linking a pr
 
 ## How it works
 
-The current codec is `imprint_cam.py`. It only changes lightness (L\* in CIE Lab), so color shifts, white balance and grayscale printing don't matter.
+The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so color shifts, white balance and grayscale printing don't matter.
 
 **Data cells.** The image is split into cells of 4×4 sub-blocks (a sub-block prints at about 0.8 mm). Each cell carries one bit as the correlation of its sub-block means with a fixed ±1 pattern. The patterns are orthogonal to flat color and linear ramps, so lighting gradients and printer drift cancel out. The bit is quantized onto a lattice (QIM): the encoder moves each cell only to the nearest lattice point that reads the right bit, so busy texture costs a small bounded nudge instead of a lost cell.
 
@@ -43,11 +43,17 @@ The current codec is `imprint_cam.py`. It only changes lightness (L\* in CIE Lab
 
 ## Install
 
-Needs Python 3.12 (other 3.10+ versions likely work, untested).
+Needs Python 3.10+ (tested on 3.12).
 
 ```bash
-git clone https://github.com/VocanicZ/ImPrint.git
-cd ImPrint
+pip install git+https://github.com/VocanicZ/Imprinted.git
+```
+
+That installs the `imprinted` library only (numpy, opencv-python-headless, pillow). For the web UI, simulator and tests, clone the repo:
+
+```bash
+git clone https://github.com/VocanicZ/Imprinted.git
+cd Imprinted
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
@@ -56,7 +62,21 @@ On Windows use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 
 ## Use
 
-**Web UI** (encode, decode, print a strength ladder; works from a phone on the same network):
+**Python:**
+
+```python
+import imprinted
+
+imprinted.encode("photo.png", "hello", "photo_imprinted.png")   # save as PNG
+imprinted.decode("phone_shot.jpg")                            # -> "hello", or None
+```
+
+* `encode(image, payload, out=None, *, print_width_cm=15.0, strength=None)` takes a path, PIL image or RGB uint8 array, and a `str` or `bytes` payload of 1 to 32 bytes. It returns the encoded PIL image (same size and mode) and saves it to `out` if given. Set `print_width_cm` to how wide the picture will be printed or shown: it sizes the pattern to about 0.8 mm per sub-block. `strength=None` picks the strongest setting inside the visibility budget. Raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
+* `decode(image, raw=False)` returns the first payload found as a `str`, as `bytes` with `raw=True`, or `None` if nothing is found.
+
+The full codec is `imprinted.core`: `core.encode` also returns stats (strength, SSIM, mean ΔL\*, tiles), `core.decode` returns every payload found in a photo with its bit error rate and outline, and `core.make_ladder` builds the strength-test page.
+
+**Web UI** (from a clone: encode, decode, print a strength ladder; works from a phone on the same network):
 
 ```bash
 .venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765
@@ -64,24 +84,6 @@ On Windows use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 ```
 
 Set the print width when encoding: it picks the sub-block size so the pattern prints at about 0.8 mm. Decode attempts are logged to `results/decode_log.csv`.
-
-**Python:**
-
-```python
-import cv2
-import imprint_cam as ic
-
-rgb = cv2.cvtColor(cv2.imread("photo.png"), cv2.COLOR_BGR2RGB)
-b = ic.subblock_for_print(rgb.shape[1], print_mm=150)        # sized for a 15 cm wide print
-enc, stats = ic.encode(rgb, b"hello", subblock_px=b)          # stats: delta, ssim, mean_dL, tiles, ...
-cv2.imwrite("photo_imprint.png", cv2.cvtColor(enc, cv2.COLOR_RGB2BGR))   # save lossless (PNG)
-
-photo = cv2.cvtColor(cv2.imread("phone_shot.jpg"), cv2.COLOR_BGR2RGB)
-for f in ic.decode(photo)["found"]:
-    print(f["payload"], f["raw_ber"])
-```
-
-`encode` takes RGB, RGBA or grayscale uint8 and returns the same layout. It raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
 
 **Simulator:**
 
@@ -99,10 +101,12 @@ nice .venv/bin/python sim.py --quick                 # kodim23, 1 trial
 
 | path | what |
 |---|---|
-| `imprint_cam.py` | the codec: `encode`, `decode`, `make_ladder` |
+| `imprinted/__init__.py` | the library's simple `encode` / `decode` |
+| `imprinted/core.py` | the codec: full `encode`, `decode`, `make_ladder` |
+| `pyproject.toml` | pip package (`imprinted`) |
 | `web.py`, `web/index.html` | FastAPI web UI |
 | `sim.py` | print/photo simulator and acceptance benchmark |
-| `test_imprint_cam.py` | test suite |
+| `test_imprinted.py` | test suite |
 | `testdata/` | Kodak test images (kodim05, 08, 23) |
 | `scripts/ci-local.sh` | local CI gate |
 | `scripts/readme_image.py` | regenerates `versus.png` |

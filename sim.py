@@ -15,7 +15,7 @@ import sys
 import cv2
 import numpy as np
 
-import imprint_cam as ic
+import imprinted.core as ic
 
 PRESETS = {
     # tilt: 3D tilt, max ~tilt*200 deg; scale: camera px per printed px; frame: scene / page size

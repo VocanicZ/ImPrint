@@ -1,4 +1,4 @@
-"""Camera-robust ImPrint: invisible and borderless.
+"""Camera-robust Imprinted: invisible and borderless.
 
 The encoded image IS the original image (same size, no frame, no markers) plus a faint lightness
 texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
@@ -1267,7 +1267,7 @@ def _quad(model) -> np.ndarray:
 
 
 def decode(rgb: np.ndarray, max_seeds: int = 40) -> dict:
-    """Find and decode every ImPrint in a photo or file (RGB, RGBA or grayscale): no border or
+    """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
     outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts)."""
     rgb = as_rgb(rgb)
     lum = to_lab(rgb)[..., 0]
@@ -1346,7 +1346,7 @@ def make_ladder(rgb: np.ndarray, tag: str = "") -> tuple[np.ndarray, list[dict]]
     img = cv2.resize(rgb, (int(w * f), int(h * f)), interpolation=cv2.INTER_AREA)
     b = subblock_for_print(cw, cw / LADDER_DPI * 25.4)
     put = lambda t, x, y, s=1.0: cv2.putText(page, t, (x, y), cv2.FONT_HERSHEY_SIMPLEX, s, (0, 0, 0), 2, cv2.LINE_AA)
-    put("ImPrint strength ladder - print A4 at 100%, photograph, decode", 150, 170, 1.2)
+    put("Imprinted strength ladder - print A4 at 100%, photograph, decode", 150, 170, 1.2)
     stats = []
     for i, d in enumerate(LADDER_DELTAS):
         enc, st = encode(img, f"d{d:g}{tag}".encode()[:MAX_BYTES], delta=d, subblock_px=b)

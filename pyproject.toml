@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imprinted"
+dynamic = ["version"]
+description = "Hide a short payload in a picture, invisibly; read it back from the file or a phone photo of a print."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["numpy>=2", "opencv-python-headless>=4.8", "pillow>=10"]
+keywords = ["watermark", "steganography", "print", "camera", "image"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics",
+    "Development Status :: 3 - Alpha",
+]
+
+[project.urls]
+Homepage = "https://github.com/VocanicZ/Imprinted"
+
+[tool.setuptools]
+packages = ["imprinted"]
+
+[tool.setuptools.dynamic]
+version = { attr = "imprinted.__version__" }

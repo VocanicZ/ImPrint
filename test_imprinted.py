@@ -1,4 +1,4 @@
-"""Run: .venv/bin/python test_imprint_cam.py  (also works under pytest)"""
+"""Run: .venv/bin/python test_imprinted.py  (also works under pytest)"""
 import binascii
 import glob
 import json
@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 from reedsolo import ReedSolomonError, RSCodec
 
-import imprint_cam as ic
+import imprinted
+import imprinted.core as ic
 import sim
 
 
@@ -30,6 +31,17 @@ def test_same_size_no_markers():
     assert enc.shape == img.shape
     assert st["ssim"] >= ic.VIS_SSIM >= 0.95 and st["mean_dL"] <= ic.VIS_DL <= 1.0, st
     assert ic.encode(img, b"hello", delta=2, subblock_px=6)[0].shape == img.shape
+
+
+def test_package_encode_decode_round_trip_through_files(tmp_path):
+    """The pip package's front door: paths, PIL images or arrays in, a str payload out."""
+    src, out = tmp_path / "in.png", tmp_path / "out.png"
+    cv2.imwrite(str(src), cv2.cvtColor(photo_like(), cv2.COLOR_RGB2BGR))
+    enc = imprinted.encode(src, "héllo", out)
+    assert enc.size == (1080, 720) and enc.mode == "RGB" and out.exists()
+    assert imprinted.decode(out) == "héllo"
+    assert imprinted.decode(np.asarray(enc), raw=True) == "héllo".encode()
+    assert imprinted.decode(photo_like(seed=1)) is None
 
 
 def test_found_without_border_any_orientation():

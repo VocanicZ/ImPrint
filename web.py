@@ -18,11 +18,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 from PIL import Image
 
-import imprint_cam as ic
+import imprinted.core as ic
 
 ROOT = Path(__file__).parent
 LOG = ROOT / "results" / "decode_log.csv"
-app = FastAPI(title="ImPrint")
+app = FastAPI(title="Imprinted")
 
 
 MAX_UPLOAD = 60 * 1024 * 1024      # bytes

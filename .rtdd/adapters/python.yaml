@@ -1,11 +1,11 @@
-# pytest adapter for ImPrint; overrides rtdd's built-in `python` adapter (same name,
+# pytest adapter for Imprinted; overrides rtdd's built-in `python` adapter (same name,
 # so map rows keep "a":"python"). Same flags as the built-in, but it also detects the
 # suite file itself and runs pytest through scripts/rtdd-pytest.sh, which reuses
 # ci-local's .venv, installs pytest-cov + pytest-reportlog when missing, caps
 # OMP/OPENBLAS threads at 4 and runs under `nice`. The built-in calls bare `pytest`,
 # which finds neither the venv nor the plugins.
 name: python
-detect: ["pytest.ini", "test_imprint_cam.py"]
+detect: ["pytest.ini", "test_imprinted.py"]
 env:
   COVERAGE_CORE: ctrace
   COVERAGE_FILE: .coverage
