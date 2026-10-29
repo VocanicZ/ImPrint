@@ -3,6 +3,7 @@
     import imprinted
     imprinted.encode("photo.png", "hello", "photo_imprinted.png")
     imprinted.decode("phone_shot.jpg")          # -> "hello", or None
+    imprinted.detect("phone_shot.jpg")          # -> True if it holds an Imprinted pattern (under a second)
 
 `imprinted.core` is the full codec (encode stats, every Imprinted found in a photo, the strength ladder).
 """
@@ -16,7 +17,7 @@ from PIL import Image, ImageOps
 from . import core
 
 __version__ = "0.7.1"
-__all__ = ["encode", "decode", "core"]
+__all__ = ["encode", "decode", "detect", "core"]
 
 
 def _load(image) -> np.ndarray:
@@ -57,3 +58,9 @@ def decode(image, raw: bool = False) -> str | bytes | None:
         return None
     payload = found[0]["payload"]
     return payload if raw else payload.decode("utf-8", "replace")
+
+
+def detect(image) -> bool:
+    """Does image hold an Imprinted pattern? Quick (under a second at any size), without reading the
+    payload: decode() makes the same check first, so a picture without one costs no more than this."""
+    return bool(core.quick_check(_load(image)))

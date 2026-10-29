@@ -44,6 +44,19 @@ def test_package_encode_decode_round_trip_through_files(tmp_path):
     assert imprinted.decode(photo_like(seed=1)) is None
 
 
+def test_quick_check_finds_the_pilot_at_any_turn_size_or_tilt_and_nothing_elsewhere():
+    """The gate decode() runs first: a clean file in any orientation, shrunk or blown up, and a page
+    turned 50 degrees (as steep as the decoder reads) all show the pilot; plain pictures don't."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    for view in (enc, np.rot90(enc), enc[:, ::-1], cv2.resize(enc, None, fx=0.6, fy=0.6),
+                 cv2.resize(enc, None, fx=4, fy=4), tilted(enc, 50)[0]):
+        assert ic.quick_check(np.ascontiguousarray(view)), view.shape
+    rng = np.random.default_rng(0)
+    for plain in (photo_like(), photo_like(seed=1), rng.integers(0, 256, (900, 1200, 3), np.uint8)):
+        assert ic.quick_check(plain) == []
+    assert imprinted.detect(enc) and not imprinted.detect(photo_like())
+
+
 def test_found_without_border_any_orientation():
     enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
     h, w = enc.shape[:2]
@@ -369,7 +382,7 @@ def test_grid_search_seeds_a_page_the_spectral_peaks_miss(monkeypatch):
     enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
     img, H = tilted(enc, 40)
     monkeypatch.setattr(ic, "find_seeds", lambda lum: [])
-    found = ic.decode(img)["found"]
+    found = ic.decode(img, check=False)["found"]
     assert found and found[0]["payload"] == b"hi"
     flip = np.diag([-1.0, 1, 1])
     flip[0, 2] = img.shape[1] - 1
@@ -476,7 +489,7 @@ def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
         return m[0], m[1], 40 if x < 200 or (x > 400 and m[2] != 8) else 5
     monkeypatch.setattr(ic, "refine", refine)
     monkeypatch.setattr(ic, "read", lambda lum, m: None)
-    r = ic.decode(np.zeros((100, 600, 3), np.uint8))
+    r = ic.decode(np.zeros((100, 600, 3), np.uint8), check=False)
     assert r["tried"] == 3 and tracked == [40, 40, 300, 300, 500, 500] and r["found"] == []
 
 
@@ -490,7 +503,7 @@ def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
     monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 5 if m[0](np.zeros((1, 2)))[0, 0] != c[0] else 40))
     right = lambda m: np.allclose(m[0](np.array([[0.0, 0.0], [1.0, 0.0]])), [c, c - [10, 0]])
     monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"twin") if right(m) else None)
-    found = ic.decode(np.zeros((100, 400, 3), np.uint8))["found"]
+    found = ic.decode(np.zeros((100, 400, 3), np.uint8), check=False)["found"]
     assert [f["payload"] for f in found] == [b"twin"]
     assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
 
@@ -576,7 +589,7 @@ def test_decode_reads_the_tracked_map_when_the_refit_misses(monkeypatch):
     monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked)
     monkeypatch.setattr(ic, "refine", lambda lum, m: (lambda q: c + 3 + 10 * q, m[1], 40))
     monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"trk") if m is tracked else None)
-    found = ic.decode(np.zeros((100, 400, 3), np.uint8))["found"]
+    found = ic.decode(np.zeros((100, 400, 3), np.uint8), check=False)["found"]
     assert [f["payload"] for f in found] == [b"trk"]
 
 

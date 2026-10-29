@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = ["numpy>=2", "opencv-python-headless>=4.8", "pillow>=10"]
+dependencies = ["numpy>=2", "opencv-python-headless>=4.8", "pillow>=10", "threadpoolctl>=3"]
 keywords = ["watermark", "steganography", "print", "camera", "image"]
 classifiers = [
     "Programming Language :: Python :: 3",

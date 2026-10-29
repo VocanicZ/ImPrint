@@ -39,10 +39,13 @@ from __future__ import annotations
 import binascii
 import functools
 import heapq
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
+from threadpoolctl import threadpool_limits
 
 K = 4                       # sub-blocks per cell side
 SEED = 0x1A9
@@ -584,17 +587,25 @@ def _subpixel(R: np.ndarray, y: int, x: int) -> tuple[float, float]:
     return y + off(l[0, 1], l[1, 1], l[2, 1]), x + off(l[1, 0], l[1, 1], l[1, 2])
 
 
-def _whitened_spectrum(region: np.ndarray, n: int = 256) -> np.ndarray:
-    """Welch-averaged power spectrum of a region of n..2n px per side (3x3 overlapping n-windows,
-    spread over it), divided by its local geometric mean: image texture -> ~1, random spikes
-    average down, pilot lines stay."""
-    P = 0
-    for y in np.linspace(0, region.shape[0] - n, 3).astype(int):
-        for x in np.linspace(0, region.shape[1] - n, 3).astype(int):
-            w = region[y:y + n, x:x + n]
-            P = P + np.abs(np.fft.fft2((w - w.mean()) * _hann(n))) ** 2
-    P = np.fft.fftshift(P).astype(np.float32)
+def _power(w: np.ndarray) -> np.ndarray:
+    """Power spectrum of one Hann-windowed n x n window (unshifted)."""
+    d = cv2.dft(((w - w.mean()) * _hann(len(w))).astype(np.float32), flags=cv2.DFT_COMPLEX_OUTPUT)
+    return cv2.magnitude(d[..., 0], d[..., 1]) ** 2
+
+
+def _whiten(P: np.ndarray) -> np.ndarray:
+    """A summed window power spectrum, centred and divided by its local geometric mean: image
+    texture -> ~1, random spikes average down, pilot lines stay."""
+    P = np.fft.fftshift(P)
     return P / np.exp(cv2.blur(np.log(P + 1e-9), (9, 9)))
+
+
+def _whitened_spectrum(region: np.ndarray, n: int = 256) -> np.ndarray:
+    """Welch-averaged, whitened power spectrum of a region of n..2n px per side (3x3 overlapping
+    n-windows, spread over it)."""
+    return _whiten(sum(_power(region[y:y + n, x:x + n])
+                       for y in np.linspace(0, region.shape[0] - n, 3).astype(int)
+                       for x in np.linspace(0, region.shape[1] - n, 3).astype(int)))
 
 
 @functools.cache
@@ -616,11 +627,24 @@ def _deridge(R: np.ndarray) -> np.ndarray:
     return R / np.maximum(ridge, 1.0)
 
 
+@functools.cache
+def _line_pairs() -> tuple:
+    """Every ordered pair (i, j) of pilot lines, the other two lines of each, and inv([f_i; f_j])."""
+    nf = len(PILOT_FREQS)
+    ij = np.array([(i, j) for i in range(nf) for j in range(nf) if i != j])
+    rest = np.array([[k for k in range(nf) if k not in (i, j)] for i, j in ij])
+    return ij, rest, np.linalg.inv(PILOT_FREQS[ij])
+
+
 def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
     """Find the pilot lines in a region's spectrum and solve the cell grid: any two strong peaks
     fix a candidate grid, the other lines must show up where it predicts them.
     Returns (score, A) with A: cell coords -> px offsets (columns = cell vectors), or None."""
-    R = _deridge(_whitened_spectrum(region, n))
+    return sync_in_spectrum(_deridge(_whitened_spectrum(region, n)), n, top)
+
+
+def sync_in_spectrum(R: np.ndarray, n: int, top: int = 10):
+    """sync_in_region on a deridged, whitened n x n spectrum."""
     c = n // 2
     loc = (R == cv2.dilate(R, np.ones((3, 3), np.uint8))) & (R > 3)
     yy, xx = np.nonzero(loc)
@@ -637,16 +661,17 @@ def sync_in_region(region: np.ndarray, n: int = 256, top: int = 10):
 
     # every candidate at once: two observed peaks (a, b: not one line and its mirror) as two pilot
     # lines (i, j) fix the grid; the other two lines must show where it predicts them
-    nf, m = len(PILOT_FREQS), len(obs)
+    m = len(obs)
     a, b = np.nonzero(np.not_equal.outer(np.arange(m) % (m // 2), np.arange(m) % (m // 2)))
-    ij = np.array([(i, j) for i in range(nf) for j in range(nf) if i != j])
-    rest = np.array([[k for k in range(nf) if k not in (i, j)] for i, j in ij])
+    ij, rest, Fi = _line_pairs()
     O = np.stack([obs[a], obs[b]], 1)[:, None]                       # (pairs, 1, 2, 2)
-    Mt = np.linalg.solve(PILOT_FREQS[ij][None], O)                    # obs = F @ Mt, (pairs, ij, 2, 2)
-    dM = np.linalg.det(Mt)
+    Mt = Fi[None] @ O                                                 # obs = F @ Mt, (pairs, ij, 2, 2)
+    dM = Mt[..., 0, 0] * Mt[..., 1, 1] - Mt[..., 0, 1] * Mt[..., 1, 0]
     ok = np.abs(dM) > 0
-    A = np.linalg.inv(np.where(ok[..., None, None], Mt, np.eye(2)))
-    cell = np.sqrt(np.abs(np.linalg.det(A)))
+    dM = np.where(ok, dM, 1.0)                                        # 2x2 inverse in closed form
+    A = np.stack([np.stack([Mt[..., 1, 1], -Mt[..., 0, 1]], -1),
+                  np.stack([-Mt[..., 1, 0], Mt[..., 0, 0]], -1)], -2) / dM[..., None, None]
+    cell = np.sqrt(np.abs(1 / dM))
     l1, l2 = np.linalg.norm(A[..., 0], axis=-1), np.linalg.norm(A[..., 1], axis=-1)
     cos = np.abs((A[..., 0] * A[..., 1]).sum(-1)) / (l1 * l2 + 1e-9)
     ok &= (12 <= cell) & (cell <= n / 3) & (0.5 < l1 / l2) & (l1 / l2 < 2) & (cos < 0.65)   # roughly square cells
@@ -701,6 +726,73 @@ def find_seeds(lum: np.ndarray) -> list:
                     and np.linalg.norm(np.c_[f1, f2] - A) < 0.05 * np.linalg.norm(A)) - 1
         out.append((sc + 2 * np.log1p(agree), c, e1, e2))
     return sorted(out, key=lambda s: -s[0])
+
+
+QUICK_SIDE = 2048           # quick_check shrinks a picture to this long side: the same cost at any size
+QUICK_TOP = 16              # spectral candidates quick_check tries to confirm
+QUICK_LOCKS = 4             # a probe and its 4 neighbours: this many must lock onto one lattice
+QUICK_STRIDE = 4            # regions every QUICK_STRIDE half-windows (4: side by side, 2: half overlapping)
+
+
+def _level_sync(img: np.ndarray, n: int, pool, stride: int | None = None) -> list:
+    """sync_in_region on 2n x 2n regions of img every stride * n/2 px (4: side by side, 2: half
+    overlapping), each n-window's spectrum computed once and shared by the regions it falls in.
+    Returns [(score, centre_xy, A)]."""
+    h = n // 2
+    ny, nx = (img.shape[0] - n) // h + 1, (img.shape[1] - n) // h + 1
+    P = np.array(list(pool.map(lambda i: _power(img[i // nx * h:i // nx * h + n, i % nx * h:i % nx * h + n]),
+                               range(ny * nx)))).reshape(ny, nx, n, n)
+
+    def region(yx):
+        y, x = yx
+        r = sync_in_spectrum(_deridge(_whiten(P[y:y + 3, x:x + 3].sum((0, 1)))), n)
+        return r and (r[0], np.array([x * h + n, y * h + n], np.float64), r[1])
+    stride = stride or QUICK_STRIDE
+    starts = lambda m: sorted(set(range(0, m - 2, stride)) | {m - 3})
+    return [r for r in pool.map(region, [(y, x) for y in starts(ny) for x in starts(nx)]) if r]
+
+
+def _locks(img: np.ndarray, c, A, step: int = 2) -> int:
+    """How many of a probe at c and its 4 neighbours `step` cells away lock onto the lattice the
+    first one found: each neighbour must see the pilot phase that lattice predicts there. A clutter
+    peak's grid may pass one probe by chance, not five that agree."""
+    first = pilot_probe(img, np.zeros(2), np.zeros(2), np.asarray(c, np.float64), A)
+    if first is None:
+        return 0
+    n, miss = 1, 0
+    for d in ((step, 0), (-step, 0), (0, step), (0, -step)):
+        r = pilot_probe(img, np.array(d, np.float64), *first[:3])
+        ok = r is not None and np.linalg.norm(r[0] - d) < 0.2
+        n, miss = n + ok, miss + (not ok)
+        if 5 - miss < QUICK_LOCKS:                                # can't make it any more
+            break
+    return n
+
+
+def quick_check(rgb: np.ndarray) -> list:
+    """Is there an Imprinted pilot in this picture? Fast at any size, rotation, mirror or scale:
+    the picture is shrunk to QUICK_SIDE px (gray is enough, the pilot only moves lightness), its
+    spectrum scanned in 2n-px regions (n = 256 and 128: small windows keep a steep tilt's lines
+    sharp) on every pyramid level, and the best candidate grids confirmed by five probes each.
+    Returns the confirmed seeds [(score, centre_xy, e1, e2)] in rgb's px, best first: [] = none."""
+    with threadpool_limits(1, "blas"):
+        return _quick_check(rgb)
+
+
+def _quick_check(rgb: np.ndarray) -> list:
+    g = cv2.cvtColor(as_rgb(rgb), cv2.COLOR_RGB2GRAY)
+    f = min(1.0, QUICK_SIDE / max(g.shape))
+    img = (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g).astype(np.float32)
+    cands, lev, s = [], img, 1.0
+    with ThreadPoolExecutor(min(8, os.cpu_count() or 1)) as pool:
+        while min(lev.shape) >= 256:
+            for n in (256, 128):
+                if min(lev.shape) >= 2 * n:
+                    cands += [(sc, c * s, A * s) for sc, c, A in _level_sync(lev, n, pool)]
+            lev, s = cv2.pyrDown(lev), s * 2
+        cands = sorted(cands, key=lambda t: -t[0])[:QUICK_TOP]
+        locks = list(pool.map(lambda t: _locks(img, t[1], t[2]), cands))
+    return [(sc, c / f, A[:, 0] / f, A[:, 1] / f) for (sc, c, A), k in zip(cands, locks) if k >= QUICK_LOCKS]
 
 
 @functools.cache
@@ -1259,14 +1351,22 @@ def _quad(model) -> np.ndarray:
     return fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
 
 
-def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None) -> dict:
+def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, check: bool = True) -> dict:
     """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
     outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts).
-    max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow)."""
+    max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow).
+    check: quick_check first, and stop there if it finds no pilot (a picture without a payload: under
+    a second instead of minutes); the seeds it confirmed get the first turns."""
     rgb = as_rgb(rgb)
+    with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
+        return _decode(rgb, max_seeds, max_found, quick_check(rgb) if check else None)
+
+
+def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None) -> dict:
+    if quick == []:
+        return dict(found=[], tried=0, seeds=0, overlay=draw(rgb, []))
     lum = to_lab(rgb)[..., 0]
-    seeds = find_seeds(lum)
-    found, regions, tried = [], [], 0
+    seeds, found, regions, tried = [], [], [], 0
 
     def attempt(seed):
         res, locked = None, []
@@ -1302,15 +1402,16 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None) -
             found.append(res)
             regions.append(poly)
 
-    for batch in (seeds, None):
-        for seed in grid_seeds(lum) if batch is None else batch:
-            if batch is not None and tried >= max_seeds or max_found and len(found) >= max_found:
+    batches = (lambda: quick or [], lambda: seeds.extend(find_seeds(lum)) or seeds, lambda: grid_seeds(lum))
+    for i, batch in enumerate(batches):
+        for seed in batch():
+            if i < 2 and tried >= max_seeds or max_found and len(found) >= max_found:
                 break                                               # (the grid's few seeds all get a turn)
             if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
                 continue                                            # inside a picture already read
             tried += 1
             attempt(seed)
-        if found:
+        if found and (i or max_found and len(found) >= max_found):
             break
     return dict(found=found, tried=tried, seeds=len(seeds), overlay=draw(rgb, found))
 
