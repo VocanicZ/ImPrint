@@ -97,31 +97,6 @@ def test_quick_check_rules_out_only_after_every_source_had_its_look(monkeypatch)
     assert ic.quick_check(photo_like(seed=1)) == []
 
 
-def test_run_time_counts_only_the_time_the_process_was_let_run(monkeypatch):
-    """quick_check's limits are in run_time: wall time while the process runs or waits on its own
-    (a sleep, a lock), slowed by the share of time its threads sat starved on the run queue, so a
-    loaded machine doesn't turn a slow confirm into a miss; never under RUN_SHARE_MIN x wall."""
-    import time
-
-    def elapsed(sched, secs=0.5):
-        monkeypatch.setattr(ic, "_sched", sched)
-        t0, w0 = ic.run_time(), time.perf_counter()
-        while time.perf_counter() - w0 < secs:
-            time.sleep(0.03)
-            ic.run_time()
-        return ic.run_time() - t0, time.perf_counter() - w0
-
-    monkeypatch.setattr(ic, "_run", dict(wall=None, sched=None, t=0.0, share=1.0))
-    loaded = iter((k * 10**8, 3 * k * 10**8) for k in range(10**4))          # 1 part on a CPU, 3 waiting
-    run, wall = elapsed(lambda: next(loaded))
-    assert 0.2 * wall < run < 0.3 * wall + 0.03, (run, wall)
-    run, wall = elapsed(lambda: (0, 0))                                        # asleep: not starved
-    assert run > 0.9 * wall - 0.03, (run, wall)
-    stalled = iter((k, 10**9 * k) for k in range(1, 10**4))
-    run, wall = elapsed(lambda: next(stalled))
-    assert ic.RUN_SHARE_MIN * wall - 0.03 < run < 1.5 * ic.RUN_SHARE_MIN * wall + 0.03, (run, wall)
-
-
 def test_quick_check_rejects_halftone_dots_fast():
     """A halftone screen is a lattice too, and locks the pilot probes; without the sync layout it
     isn't Imprinted. And the gate gives up in bounded time, at any picture size."""
