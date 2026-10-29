@@ -1655,8 +1655,9 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
     seed or None), each seed tried ("seed", centre, None) and each payload read ("found", None, result)."""
     rgb, trace = as_rgb(rgb), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
-        quick = quick_check(rgb, trace=trace) if check else None
-        if quick == [] and rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL:
+        small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL      # read in full anyway: a quick look only
+        quick = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE, trace) if check else None
+        if quick == [] and small:
             quick = None                                    # too few sync cells to rule it out
         trace("checked", None, quick[0] if quick else None)
         return _decode(rgb, max_seeds, max_found, quick, trace)
@@ -1666,9 +1667,9 @@ def detect(rgb: np.ndarray) -> bool:
     """Is this picture Imprinted? quick_check, and for a picture under QUICK_SMALL px that it rules
     out, a full read (a payload that reads passes its CRC: no false alarm either way)."""
     rgb = as_rgb(rgb)
-    if quick_check(rgb):
-        return True
-    return rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL and bool(decode(rgb, max_found=1, check=False)["found"])
+    if rgb.shape[0] * rgb.shape[1] > QUICK_SMALL:
+        return bool(quick_check(rgb))
+    return bool(decode(rgb, max_found=1)["found"])          # its own quick look, then a full read
 
 
 def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None,

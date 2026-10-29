@@ -251,9 +251,13 @@ $('e-go').onclick = async () => {
       final = {enc, orig, diff};
       if (j.subblock_mm < j.min_subblock_mm) warn.push(`Printed sub-block is ${j.subblock_mm} mm (< ${j.min_subblock_mm} mm): print larger, or use a higher-resolution image.`);
       if (s.tiles < 2) warn.push('Low redundancy (fewer than 2 payload tiles): use a shorter payload or a larger image.');
-      if (s.wrong_cells > 0.15) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
+      const unreadable = s.wrong_cells > j.wrong_max;
+      if (s.wrong_cells > 0.15 && !unreadable) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
       const name = 'imprinted_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
-      say(`<span class="ok">Done in ${(j.ms / 1000).toFixed(1)} s</span>: strength δ ${s.delta} after ${tries} tr${tries > 1 ? 'ies' : 'y'}. Click a step above to see its working data again.`);
+      say(unreadable
+        ? `<span class="bad">This picture can't carry the code: ${pct(s.wrong_cells)} of its cells read wrong straight from the file.</span> It has too little room to change (pure white or black, fully saturated colour, flat graphics, or transparent areas). Use a photo-like picture.`
+        : `<span class="ok">Done in ${(j.ms / 1000).toFixed(1)} s</span>: strength δ ${s.delta} after ${tries} tr${tries > 1 ? 'ies' : 'y'}. Click a step above to see its working data again.`);
+      if (unreadable) Object.keys(STAGES).forEach(k => k === 'done' && pill(k, 'fail'));
       $('e-s-done').style.cursor = 'pointer'; $('e-s-done').onclick = compare;
       $('e-res').innerHTML = `${warn.map(w => `<p class="warn">${esc(w)}</p>`).join('')}
         ${kv({'similarity (SSIM)': s.ssim + '  (1 = identical)', 'PSNR': s.psnr + ' dB',
@@ -341,7 +345,9 @@ $('d-go').onclick = async () => {
       if ($('d-s2').className === 'run') step(2, ev.found.length ? 'done' : 'fail');
       step(3, ev.found.length ? 'done' : 'fail');
       if (ev.found.length && $('d-s1').className === 'fail') step(1, 'done');
-      if (stage === 2 && ($('d-s1').className === 'done' || tried)) say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>` : `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`);
+      if (stage === 2 && ($('d-s1').className === 'done' || tried)) say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>`
+        : $('d-s1').className === 'done' ? `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`
+        : `<span class="bad">No Imprinted payload in this picture</span> (small picture, read in full: ${ev.seconds} s)`);
       $('d-res').innerHTML = result(ev);
     }
   };

@@ -182,7 +182,8 @@ async def encode(request: Request, file: UploadFile = File(...), text: str = For
         dpi = rgb.shape[1] / (width_cm / 2.54)
         return dict(image=b64png(enc, dpi=dpi), original=b64png(rgb), diff=b64png(diff, 1600), stats=st,
                     ms=round((time.time() - t0) * 1000), dpi=round(dpi), subblock_mm=round(b * 25.4 / dpi, 2),
-                    print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)], min_subblock_mm=0.65)
+                    print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)], min_subblock_mm=0.65,
+                    wrong_max=ic.WRONG_WARN)
     return streamed(request, rgb, work)
 
 
