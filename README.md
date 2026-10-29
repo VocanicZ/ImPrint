@@ -46,7 +46,7 @@ The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so
 Needs Python 3.10+ (tested on 3.12).
 
 ```bash
-pip install git+https://github.com/VocanicZ/Imprinted.git
+pip install imprinted
 ```
 
 That installs the `imprinted` library only (numpy, opencv-python-headless, pillow). For the web UI, simulator and tests, clone the repo:
