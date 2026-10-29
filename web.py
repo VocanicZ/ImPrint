@@ -3,6 +3,7 @@
 Run:  .venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765
 Then open http://<this-pc-ip>:8765 on the PC or on a phone in the same network.
 """
+import asyncio
 import base64
 import csv
 import io
@@ -17,7 +18,7 @@ from pathlib import Path
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(50_000_000))   # the decoder itself refuses bombs
 import cv2  # noqa: E402
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 from PIL import Image
 
@@ -75,27 +76,62 @@ def index():
     return (ROOT / "web" / "index.html").read_text()
 
 
-def streamed(rgb: np.ndarray, work) -> StreamingResponse:
+JOBS = threading.BoundedSemaphore(2)    # encodes/decodes at once: each one already uses every core
+
+
+class Cancelled(Exception):
+    pass
+
+
+def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
     """Run work(put) in a thread and stream JSON lines: the photo's preview, every event work puts
-    as it happens, then work's result ("done") or its failure ("error")."""
+    as it happens, then work's result ("done") or its failure ("error"). At most JOBS run at once;
+    a job whose client goes away stops at its next event (put raises)."""
     events: queue.Queue = queue.Queue()
+    gone = threading.Event()
+
+    def put(ev):
+        if gone.is_set():
+            raise Cancelled
+        events.put(ev)
 
     def run():
         try:
-            events.put(dict(e="done", **work(events.put)))
+            events.put(dict(e="done", **work(put)))
+        except Cancelled:
+            pass
         except ValueError as e:                        # the codec's own "can't do this picture"
             events.put(dict(e="error", detail=str(e)))
         except Exception as e:                         # the stream must end either way
             events.put(dict(e="error", detail=f"{type(e).__name__}: {e}"))
+        finally:
+            JOBS.release()
 
-    def stream():
-        yield json.dumps(dict(e="preview", img=b64jpg(rgb, 1200), w=rgb.shape[1], h=rgb.shape[0])) + "\n"
-        threading.Thread(target=run, daemon=True).start()
-        while True:
-            ev = events.get()
-            yield json.dumps(ev, default=lambda o: o.item()) + "\n"           # numpy scalars
-            if ev["e"] in ("done", "error"):
-                return
+    async def stream():
+        if not JOBS.acquire(blocking=False):
+            yield json.dumps(dict(e="error", detail="busy with other pictures: try again in a moment")) + "\n"
+            return
+        started = False
+        try:
+            img = await asyncio.to_thread(b64jpg, rgb, 1200)
+            yield json.dumps(dict(e="preview", img=img, w=rgb.shape[1], h=rgb.shape[0])) + "\n"
+            threading.Thread(target=run, daemon=True).start()
+            started = True
+            while True:
+                try:
+                    ev = events.get_nowait()
+                except queue.Empty:
+                    if await request.is_disconnected():    # (the server drops writes to a gone client silently)
+                        return
+                    await asyncio.sleep(0.05)
+                    continue
+                yield json.dumps(ev, default=lambda o: o.item()) + "\n"       # numpy scalars
+                if ev["e"] in ("done", "error"):
+                    return
+        finally:                                       # finished, or the client went away
+            gone.set()
+            if not started:
+                JOBS.release()
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
@@ -108,7 +144,7 @@ def gray(a: np.ndarray, signed: bool, top: np.ndarray) -> tuple[np.ndarray, floa
 
 
 @app.post("/api/encode")
-async def encode(file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
+async def encode(request: Request, file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
                  width_cm: float = Form(15.0)):
     """delta <= 0: the encoder's default, the strongest within its visibility budget. Streams the
     encoder's stages as it computes them (their working data, once: later strengths only rescale
@@ -147,7 +183,7 @@ async def encode(file: UploadFile = File(...), text: str = Form(...), delta: flo
         return dict(image=b64png(enc, dpi=dpi), original=b64png(rgb), diff=b64png(diff, 1600), stats=st,
                     ms=round((time.time() - t0) * 1000), dpi=round(dpi), subblock_mm=round(b * 25.4 / dpi, 2),
                     print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)], min_subblock_mm=0.65)
-    return streamed(rgb, work)
+    return streamed(request, rgb, work)
 
 
 def payload(f: dict) -> dict:
@@ -161,7 +197,7 @@ def xy(c) -> list:
 
 
 @app.post("/api/decode")
-async def decode(file: UploadFile = File(...), label: str = Form("")):
+async def decode(request: Request, file: UploadFile = File(...), label: str = Form("")):
     """Streams JSON lines as the decoder works: the photo's preview, each quick-check probe and
     sync read, the check's verdict, each seed tried, each payload found, then the result."""
     rgb = read_rgb(await file.read())
@@ -186,7 +222,7 @@ async def decode(file: UploadFile = File(...), label: str = Form("")):
         secs = round(time.time() - t, 1)
         log(label, rgb, found, secs)
         return dict(found=found, seeds=r["seeds"], tried=r["tried"], seconds=secs, photo=f"{rgb.shape[1]}x{rgb.shape[0]}")
-    return streamed(rgb, work)
+    return streamed(request, rgb, work)
 
 
 def log(label: str, rgb: np.ndarray, found: list, secs: float):
