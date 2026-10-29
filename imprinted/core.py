@@ -517,29 +517,35 @@ WRONG_WARN = 0.25           # warn when this fraction of the clean file's cells 
                             # cells carry nothing: the decoder skips them, but they add up)
 
 
-def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock_px: int = 8):
+def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock_px: int = 8, trace=None):
     """Embed payload into an RGB, RGBA or grayscale uint8 image. Returns (image of the same size and
     layout - alpha carried over, grayscale stays grayscale -, stats). delta None: the strongest
     within the visibility budget (VIS_SSIM, VIS_DL), by bisection. ValueError when the picture is
     too small to read back (a small one is decoded once to make sure) or too clipped to carry the
-    payload at all; RuntimeWarning when more than WRONG_WARN of its cells read wrong."""
+    payload at all; RuntimeWarning when more than WRONG_WARN of its cells read wrong.
+    trace(stage, value), if given, sees each _embed stage's working data as it is computed and
+    ("tried", stats) after each strength; ("read back", None) before the small-picture check."""
+    trace = trace or (lambda *a: None)
     cache = {}                                                  # the host's notch: the same at every delta
     if delta is not None:
-        out, st = _embed(rgb, payload, delta, subblock_px, cache)
+        out, st = _embed(rgb, payload, delta, subblock_px, cache, trace)
+        trace("tried", st)
     else:
         lo, hi, best = DELTA_MIN, DELTA_MAX, None
         for i in range(7):
             d = hi if i == 0 else (lo + hi) / 2                 # the cap first: often within budget
-            out, st = _embed(rgb, payload, d, subblock_px, cache)
+            out, st = _embed(rgb, payload, d, subblock_px, cache, trace)
+            trace("tried", st)
             if st["ssim"] >= VIS_SSIM and st["mean_dL"] <= VIS_DL:
                 best, lo = (out, st), d
                 if i == 0:
                     break
             else:
                 hi = d
-        out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px, cache)
+        out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px, cache, trace)
     rows, cols, T = st["rows"], st["cols"], st["tile"]
     if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
+        trace("read back", None)
         if not any(f["payload"] == payload for f in decode(out)["found"]):
             raise ValueError(f"image too small to read back: its clean file ({rows}x{cols} cells of "
                              f"{K * st['subblock_px']} px, {st['tiles']} {T}x{T} tiles) does not decode; use a "
@@ -551,7 +557,8 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     return out, st
 
 
-def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cache: dict | None = None):
+def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cache: dict | None = None,
+           trace=lambda *a: None):
     nb = len(payload)
     if not 1 <= nb <= MAX_BYTES:
         raise ValueError(f"payload must be 1..{MAX_BYTES} bytes")
@@ -570,6 +577,8 @@ def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cach
     s = to_bits(payload)[bit_map(T * T, nbits)[t]]
     on, sp, sb = sync_cells(ii.ravel(), jj.ravel())               # the known quarter (see sync_find)
     D, s = np.where(on[:, None, None], sp, D), np.where(on, sb, s)
+    trace("layout", dict(delta=delta, rows=rows, cols=cols, tile=T, cell_px=c, sync=on.reshape(rows, cols),
+                         bits=s.reshape(rows, cols)))
 
     lab = to_lab(rgb)
     region = lab[:rows * c, :cols * c]                         # whole cells only; view into lab
@@ -580,13 +589,16 @@ def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cach
     room = -cv2.dilate(-room, np.ones((b, b), np.uint8))      # erode: whole sub-block must have room
     pm = pm * room
     m = m * room
+    trace("mask", m)
     # the pilot follows the same mask, but only up to PILOT_HI: it sets the lattice unit, and a
     # bigger unit makes every cell's QIM nudge bigger
     pil = PILOT * delta * pilot_field(rows * c, cols * c, c) * pm
+    trace("pilot", pil)
     cache = {} if cache is None else cache
     if "notch" not in cache:
         cache["notch"] = notch_pilot(lum, c) - lum
     notch = cache["notch"] * room                              # only where there's room to change
+    trace("notch", notch)
     # pilot + notch are part of what the data must beat, less the mean cell: the decoder takes
     # that out (it is the pilot, the same in every cell) before it reads the data
     mean_cell = _cells(pil, c).mean(axis=(0, 1))
@@ -609,7 +621,9 @@ def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cach
     # such a cell reads with less margin instead (its repeats and the LDPC code cover it).
     cap = SWING_MAX * delta / np.maximum(_cells(m, c).max(axis=(2, 3)).ravel(), 1e-6)
     a = np.clip(a, -cap, cap)
-    region[..., 0] += field(a.astype(np.float32), rows, cols, b, D) * m + pil + notch
+    data = field(a.astype(np.float32), rows, cols, b, D) * m
+    trace("data", data)
+    region[..., 0] += data + pil + notch
     out = like(to_rgb(lab), img)
     view = as_rgb(out)                                        # what a reader of the returned file sees
 
@@ -835,6 +849,8 @@ QUICK_DEADLINE = 0.7        # s: no new confirm starts after this (a repetitive 
                             # would keep them coming); out of time = not found
 QUICK_THREADS = 4           # threads that scan and probe; one more confirms (more only fight over the GIL)
 QUICK_GRACE = 0.25          # s past the deadline that running confirms get
+QUICK_DECODE = 1.5          # s: decode()'s deadline instead (a miss there loses a readable photo, a false
+                            # pass only costs the full search: tilted prints confirm late, under load)
 QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.5)
 
 
@@ -919,29 +935,32 @@ def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
     return best
 
 
-def quick_check(rgb: np.ndarray) -> list:
+def quick_check(rgb: np.ndarray, deadline: float = QUICK_DEADLINE, trace=None) -> list:
     """Is this picture Imprinted? Under a second at any size, turn, mirror or scale, and nothing
     else passes. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
     candidate grids come from its spectrum (the pilot's lines, two pyramid levels) and, failing
     those, from the grid search's central windows (steep tilts); each is probed (_locks), and one
     that locks is tracked coarsely and read for the sync layout (_sync_confirm) while probing goes
     on. A repetitive texture (halftone dots, windows, fabric) can fake the pilot's lattice, not the
-    known pseudo-random bits. Past QUICK_DEADLINE nothing new starts: out of time = not found.
-    Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's px, or []."""
+    known pseudo-random bits. Past `deadline` s nothing new starts: out of time = not found.
+    trace(event, centre_xy, value), if given, sees each probe ("probe", locks of 5) and sync
+    read ("sync", z) as they happen. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's
+    px, or []."""
     with threadpool_limits(1, "blas"):
-        return _quick_check(rgb)
+        return _quick_check(rgb, deadline, trace or (lambda *a: None))
 
 
-def _quick_check(rgb: np.ndarray) -> list:
+def _quick_check(rgb: np.ndarray, deadline: float, trace=lambda *a: None) -> list:
     _grid_table(256), _sync_shifts()                              # build the tables once, before the threads do
     t0 = time.perf_counter()
-    late = lambda: time.perf_counter() - t0 > QUICK_DEADLINE
+    late = lambda: time.perf_counter() - t0 > deadline
     g = cv2.cvtColor(as_rgb(rgb), cv2.COLOR_RGB2GRAY)
     f = min(1.0, QUICK_SIDE / max(g.shape))
     img = (cv2.resize(g, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else g).astype(np.float32)
     cands, lev, s = [], img, 1.0
     pool = ThreadPoolExecutor(min(QUICK_THREADS, os.cpu_count() or 1))
     side = ThreadPoolExecutor(1)                                  # confirms beside the probes
+    until = np.array(np.inf)                                      # their time limit, read live: zeroed on return
     try:
         for level in (0, 1):
             n = 256 if min(lev.shape) >= 512 else 128             # a small picture: smaller windows
@@ -972,19 +991,21 @@ def _quick_check(rgb: np.ndarray) -> list:
 
         # probe best first, a batch at a time; a grid that locks well is read for the sync layout on
         # the side while probing goes on, so an Imprinted picture usually stops within its first batch
-        stop = t0 + QUICK_DEADLINE + QUICK_GRACE                  # running confirms give up here
+        stop = t0 + deadline + QUICK_GRACE                        # running confirms give up here
+        until[...] = stop
         running, spare, hit = {}, [], None
 
         def settled(block: float = 0.0):
             for job in wait(running, timeout=block, return_when=FIRST_COMPLETED)[0] if running else ():
                 c, A = running.pop(job)
                 z = job.result()
+                trace("sync", c / f, z)
                 if z >= QUICK_Z:
                     return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
             return None
 
         def confirm(c, A):
-            running[side.submit(_sync_confirm, img, c, A, until=stop)] = (c, A)
+            running[side.submit(_sync_confirm, img, c, A, until=until)] = (c, A)
 
         for source in [lambda: spectral] + [lambda sc=sc: grid(sc) for sc in QUICK_GRID_SCALES]:
             if late():
@@ -996,6 +1017,7 @@ def _quick_check(rgb: np.ndarray) -> list:
                 batch = todo[i:i + 8]
                 for k, (_, c, A) in sorted(zip(pool.map(lambda t: _locks(img, t[1], t[2]), batch), batch),
                                            key=lambda kt: -kt[0]):
+                    trace("probe", c / f, k)
                     if k >= QUICK_LOCKS + 1 and confirms < QUICK_CONFIRM:
                         confirms += 1
                         confirm(c, A)
@@ -1012,8 +1034,9 @@ def _quick_check(rgb: np.ndarray) -> list:
                 return hit
         return []
     finally:
+        until[...] = 0                                            # a running confirm stops at its next probe
         pool.shutdown(wait=False, cancel_futures=True)
-        side.shutdown(wait=False, cancel_futures=True)            # a running confirm stops at `stop`
+        side.shutdown(wait=False, cancel_futures=True)
 
 
 @functools.cache
@@ -1614,18 +1637,24 @@ def _quad(model) -> np.ndarray:
     return fmap(np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)).astype(np.float32)
 
 
-def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, check: bool = True) -> dict:
+def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, check: bool = True,
+           trace=None) -> dict:
     """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
     outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts).
     max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow).
-    check: quick_check first, and stop there if it finds no pilot (a picture without a payload: under
-    a second instead of minutes); the seeds it confirmed get the first turns."""
-    rgb = as_rgb(rgb)
+    check: quick_check first (QUICK_DECODE s), and stop there if it finds no pilot (a picture without
+    a payload: under two seconds instead of minutes); the seeds it confirmed get the first turns.
+    trace(event, centre_xy, value), if given, sees quick_check's events, then ("checked", None,
+    seed or None), each seed tried ("seed", centre, None) and each payload read ("found", None, result)."""
+    rgb, trace = as_rgb(rgb), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
-        return _decode(rgb, max_seeds, max_found, quick_check(rgb) if check else None)
+        quick = quick_check(rgb, QUICK_DECODE, trace) if check else None
+        trace("checked", None, quick[0] if quick else None)
+        return _decode(rgb, max_seeds, max_found, quick, trace)
 
 
-def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None) -> dict:
+def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None,
+            trace=lambda *a: None) -> dict:
     if quick == []:
         return dict(found=[], tried=0, seeds=0, overlay=draw(rgb, []))
     lum = to_lab(rgb)[..., 0]
@@ -1664,6 +1693,7 @@ def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list 
                        photo_px_per_subblock=round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K, 1))
             found.append(res)
             regions.append(poly)
+            trace("found", None, res)
 
     batches = (lambda: quick or [], lambda: seeds.extend(find_seeds(lum)) or seeds, lambda: grid_seeds(lum))
     for i, batch in enumerate(batches):
@@ -1673,6 +1703,7 @@ def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list 
             if any(cv2.pointPolygonTest(poly, tuple(map(float, seed[1])), False) >= 0 for poly in regions):
                 continue                                            # inside a picture already read
             tried += 1
+            trace("seed", seed[1], None)
             attempt(seed)
         if found and (i or max_found and len(found) >= max_found):
             break

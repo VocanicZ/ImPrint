@@ -6,8 +6,11 @@ Then open http://<this-pc-ip>:8765 on the PC or on a phone in the same network.
 import base64
 import csv
 import io
+import json
 import os
+import queue
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -15,7 +18,7 @@ os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(50_000_000))   # the dec
 import cv2  # noqa: E402
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from PIL import Image
 
 import imprinted.core as ic
@@ -51,6 +54,13 @@ def cell(v) -> str:
     return "'" + v if v.lstrip()[:1] in ("=", "+", "-", "@", "|", "＝", "＋", "－", "＠") else v
 
 
+def b64jpg(rgb: np.ndarray, max_side: int) -> str:
+    f = min(1.0, max_side / max(rgb.shape[:2]))
+    small = cv2.resize(rgb, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else rgb
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(small, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
+
+
 def b64png(rgb: np.ndarray, max_side: int | None = None, dpi: float | None = None) -> str:
     if max_side and max(rgb.shape[:2]) > max_side:
         f = max_side / max(rgb.shape[:2])
@@ -65,33 +75,121 @@ def index():
     return (ROOT / "web" / "index.html").read_text()
 
 
+def streamed(rgb: np.ndarray, work) -> StreamingResponse:
+    """Run work(put) in a thread and stream JSON lines: the photo's preview, every event work puts
+    as it happens, then work's result ("done") or its failure ("error")."""
+    events: queue.Queue = queue.Queue()
+
+    def run():
+        try:
+            events.put(dict(e="done", **work(events.put)))
+        except ValueError as e:                        # the codec's own "can't do this picture"
+            events.put(dict(e="error", detail=str(e)))
+        except Exception as e:                         # the stream must end either way
+            events.put(dict(e="error", detail=f"{type(e).__name__}: {e}"))
+
+    def stream():
+        yield json.dumps(dict(e="preview", img=b64jpg(rgb, 1200), w=rgb.shape[1], h=rgb.shape[0])) + "\n"
+        threading.Thread(target=run, daemon=True).start()
+        while True:
+            ev = events.get()
+            yield json.dumps(ev, default=lambda o: o.item()) + "\n"           # numpy scalars
+            if ev["e"] in ("done", "error"):
+                return
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+def gray(a: np.ndarray, signed: bool, top: np.ndarray) -> tuple[np.ndarray, float]:
+    """A working array as an 8-bit picture, scaled by the spread of `top` (the whole array): signed
+    ones around mid-gray. Returns it and the gain."""
+    top = float(np.percentile(np.abs(top[::3, ::3]), 99.5)) or 1.0   # every 9th px: same spread, 9x faster
+    g = (127 if signed else 255) / top
+    return np.clip(a * g + (128 if signed else 0), 0, 255).astype(np.uint8), g
+
+
 @app.post("/api/encode")
 async def encode(file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
                  width_cm: float = Form(15.0)):
-    """delta <= 0: the encoder's default, the strongest within its visibility budget."""
+    """delta <= 0: the encoder's default, the strongest within its visibility budget. Streams the
+    encoder's stages as it computes them (their working data, once: later strengths only rescale
+    it), each strength tried, then the result."""
     rgb = read_rgb(await file.read())
     b = ic.subblock_for_print(rgb.shape[1], width_cm * 10)
-    try:
-        enc, st = ic.encode(rgb, text.encode(), delta=delta if delta > 0 else None, subblock_px=b)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    diff = np.clip(np.abs(enc.astype(int) - rgb.astype(int)) * 10, 0, 255).astype(np.uint8)
-    dpi = rgb.shape[1] / (width_cm / 2.54)
-    return dict(image=b64png(enc, dpi=dpi), original=b64png(rgb), diff=b64png(diff, 1600), stats=st,
-                dpi=round(dpi), subblock_mm=round(b * 25.4 / dpi, 2),
-                print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)],
-                min_subblock_mm=0.65)
+    t0, sent = time.time(), set()
+
+    def work(put):
+        def trace(stage, v):
+            ev = dict(e="stage", stage=stage, ms=round((time.time() - t0) * 1000))
+            if stage == "tried":
+                ev.update(stats={k: v[k] for k in ("delta", "ssim", "mean_dL", "p99_dL", "wrong_cells")},
+                          ok=v["ssim"] >= ic.VIS_SSIM and v["mean_dL"] <= ic.VIS_DL)
+            elif stage == "layout":
+                ev.update(delta=round(float(v["delta"]), 3))
+                if stage not in sent:                  # one px per cell: sync blue, payload bits light/dark
+                    img = np.where(v["sync"][..., None], [60, 140, 255],
+                                   np.where(v["bits"][..., None] > 0, [235, 235, 235], [45, 45, 45])).astype(np.uint8)
+                    ev.update(cells=b64png(img), **{k: v[k] for k in ("rows", "cols", "tile", "cell_px")},
+                              sync_share=round(float(v["sync"].mean()), 3))
+            elif stage in ("mask", "pilot", "notch", "data") and stage not in sent:
+                f = min(1.0, 900 / max(v.shape))
+                small = cv2.resize(v, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else v
+                y, x = v.shape[0] // 2 - 64, v.shape[1] // 2 - 64              # 1:1 crop of the middle
+                pic, g = gray(small, signed=stage != "mask", top=v)
+                crop, _ = gray(v[y:y + 128, x:x + 128], signed=stage != "mask", top=v)
+                ev.update(img=b64jpg(np.repeat(pic[..., None], 3, 2), 900), gain=round(g, 1),
+                          crop=b64png(np.repeat(crop[..., None], 3, 2)), crop_xy=[x, y])
+            sent.add(stage)
+            put(ev)
+
+        enc, st = ic.encode(rgb, text.encode(), delta=delta if delta > 0 else None, subblock_px=b, trace=trace)
+        diff = np.clip(np.abs(enc.astype(int) - rgb.astype(int)) * 10, 0, 255).astype(np.uint8)
+        dpi = rgb.shape[1] / (width_cm / 2.54)
+        return dict(image=b64png(enc, dpi=dpi), original=b64png(rgb), diff=b64png(diff, 1600), stats=st,
+                    ms=round((time.time() - t0) * 1000), dpi=round(dpi), subblock_mm=round(b * 25.4 / dpi, 2),
+                    print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)], min_subblock_mm=0.65)
+    return streamed(rgb, work)
+
+
+def payload(f: dict) -> dict:
+    return dict(text=f["payload"].decode("utf-8", "replace"), hex=f["payload"].hex(),
+                quad=np.asarray(f["quad"]).round(1).tolist(),
+                **{k: f[k] for k in ("raw_ber", "cells", "tiles", "probes", "mirrored", "photo_px_per_subblock")})
+
+
+def xy(c) -> list:
+    return [round(float(c[0]), 1), round(float(c[1]), 1)]
 
 
 @app.post("/api/decode")
 async def decode(file: UploadFile = File(...), label: str = Form("")):
+    """Streams JSON lines as the decoder works: the photo's preview, each quick-check probe and
+    sync read, the check's verdict, each seed tried, each payload found, then the result."""
     rgb = read_rgb(await file.read())
-    t = time.time()
-    r = ic.decode(rgb)
-    found = [dict(text=f["payload"].decode("utf-8", "replace"), hex=f["payload"].hex(),
-                  **{k: f[k] for k in ("raw_ber", "cells", "tiles", "probes", "mirrored", "photo_px_per_subblock")})
-             for f in r["found"]]
-    secs = round(time.time() - t, 1)
+
+    def work(put):
+        def trace(ev, c, v):
+            if ev == "probe":
+                put(dict(e=ev, xy=xy(c), locks=int(v)))
+            elif ev == "sync":
+                put(dict(e=ev, xy=xy(c), z=round(float(v), 1)))
+            elif ev == "checked":
+                put(dict(e=ev, ok=v is not None, **(dict(z=round(float(v[0]), 1), xy=xy(v[1]), e1=xy(v[2]),
+                                                      e2=xy(v[3])) if v is not None else {})))
+            elif ev == "seed":
+                put(dict(e=ev, xy=xy(c)))
+            elif ev == "found":
+                put(dict(e=ev, **payload(v)))
+
+        t = time.time()
+        r = ic.decode(rgb, trace=trace)
+        found = [payload(f) for f in r["found"]]
+        secs = round(time.time() - t, 1)
+        log(label, rgb, found, secs)
+        return dict(found=found, seeds=r["seeds"], tried=r["tried"], seconds=secs, photo=f"{rgb.shape[1]}x{rgb.shape[0]}")
+    return streamed(rgb, work)
+
+
+def log(label: str, rgb: np.ndarray, found: list, secs: float):
     LOG.parent.mkdir(exist_ok=True)
     new = not LOG.exists()
     with LOG.open("a", newline="") as fh:
@@ -100,8 +198,6 @@ async def decode(file: UploadFile = File(...), label: str = Form("")):
             w.writerow(["time", "label", "photo", "found", "payloads", "raw_ber", "seconds"])
         w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), cell(label), f"{rgb.shape[1]}x{rgb.shape[0]}", len(found),
                     cell(" ".join(f["text"] for f in found)), " ".join(str(f["raw_ber"]) for f in found), secs])
-    return dict(found=found, seeds=r["seeds"], tried=r["tried"], overlay=b64png(r["overlay"]),
-                seconds=secs, photo=f"{rgb.shape[1]}x{rgb.shape[0]}")
 
 
 @app.post("/api/ladder")

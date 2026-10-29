@@ -34,7 +34,22 @@
   table { border-collapse:collapse; width:100%; font-size:14px; margin:10px 0; }
   th, td { border:1px solid var(--line); padding:6px; text-align:center; }
   a { color:var(--acc); }
-  .cmp { user-select:none; -webkit-user-select:none; touch-action:none; }
+  .cmp { user-select:none; -webkit-user-select:none; touch-action:none; cursor:ew-resize; }
+  .stage { position:relative; margin-top:10px; }
+  .stage canvas { width:100%; height:auto; }
+  .stage .fx { position:absolute; left:0; top:0; height:100%; pointer-events:none; border-color:transparent; }
+  .steps { display:flex; gap:6px; margin:4px 0 8px; flex-wrap:wrap; }
+  .steps span { padding:4px 10px; border-radius:999px; border:1px solid var(--line); font-size:13px; color:var(--muted); }
+  .steps span.run { border-color:var(--acc); color:var(--acc); animation:pulse 1s ease-in-out infinite; }
+  .steps span.done { border-color:var(--ok); color:var(--ok); }
+  .steps span.fail { border-color:var(--bad); color:var(--bad); }
+  .steps span.skip { opacity:.45; }
+  @keyframes pulse { 50% { opacity:.55; } }
+  .status { font-size:15px; min-height:1.45em; }
+  .zoom { display:flex; gap:12px; align-items:flex-start; margin-top:10px; }
+  .zoom canvas { width:min(256px, 42vw); height:auto; image-rendering:pixelated; flex:none; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-top:6px; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:-1px; }
 </style>
 </head>
 <body>
@@ -92,6 +107,7 @@ $('e-delta').oninput = e => $('e-dv').textContent = +e.target.value ? e.target.v
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const kv = o => '<div class="kv">' + Object.entries(o).map(([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join('') + '</div>';
 const pct = x => (x * 100).toFixed(1) + '%';
+const loadImg = src => new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = no; i.src = src; });
 
 async function post(url, fields, btn, out, busy = 'Working…') {
   btn.disabled = true; out.innerHTML = `<p class="note">${esc(busy)}</p>`;
@@ -106,54 +122,239 @@ async function post(url, fields, btn, out, busy = 'Working…') {
   finally { btn.disabled = false; }
 }
 
+// ---------------------------------------------------------------- streaming
+// the server sends JSON lines as the job runs: handle each one as it arrives
+async function stream(url, fd, handle) {
+  const r = await fetch(url, {method: 'POST', body: fd});
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(typeof j.detail === 'string' ? j.detail : 'upload failed (' + r.status + ')'); }
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) await handle(JSON.parse(buf.slice(0, i)));
+  }
+}
+
 // ---------------------------------------------------------------- encode
+// every picture shown here is the encoder's own working data for this job, sent as it computes it
+const STAGES = {layout: [1, 'Cell layout'], mask: [2, 'Where change can hide'], pilot: [3, 'Pilot grid'],
+                notch: [4, 'Look-alike texture out'], data: [5, 'Payload nudges'], tried: [6, 'Visibility check'], done: [7, 'Result']};
+const CAPTION = {
+  layout: v => `The picture is cut into ${v.rows} × ${v.cols} cells of ${v.cell_px} px. Light/dark cells carry payload bits (one ${v.tile}×${v.tile}-cell tile, repeated over the picture); the blue ${(v.sync_share * 100).toFixed(0)}% are sync cells with known bits, which is how a reader proves a photo is Imprinted.`,
+  mask: v => 'Texture mask: how much each pixel may change unseen. Busy texture hides change (bright); flat areas and clipped black or white get little (dark).',
+  notch: v => `The photo's own texture at the pilot's frequencies, taken out so it can neither fake nor hide the grid (shown ×${v.gain}; mid-gray = 0).`,
+  pilot: v => `Pilot grid: four faint waves at the cell frequencies. A reader finds them at any turn, size or mirror and they tell it where every cell is (shown ×${v.gain}).`,
+  data: v => `Payload nudges: each cell's ±pattern pushed just far enough to read its bit (QIM), scaled by the mask (shown ×${v.gain}).`,
+};
+
 $('e-go').onclick = async () => {
-  const f = $('e-file').files[0], out = $('e-out');
+  const f = $('e-file').files[0], out = $('e-out'), btn = $('e-go');
   if (!f) return out.innerHTML = '<p class="bad">Choose an image.</p>';
   if (new TextEncoder().encode($('e-text').value).length > 32) return out.innerHTML = '<p class="bad">Payload over 32 bytes.</p>';
-  const j = await post('/api/encode', {file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value}, $('e-go'), out);
-  if (!j) return;
-  const s = j.stats, warn = [];
-  if (j.subblock_mm < j.min_subblock_mm) warn.push(`Printed sub-block is ${j.subblock_mm} mm (< ${j.min_subblock_mm} mm): print larger, or use a higher-resolution image.`);
-  if (s.tiles < 2) warn.push('Low redundancy (fewer than 2 payload tiles): use a shorter payload or a larger image.');
-  if (s.wrong_cells > 0.15) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
-  const name = 'imprinted_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
-  out.innerHTML = `
-    ${warn.map(w => `<p class="warn">${esc(w)}</p>`).join('')}
-    ${kv({'similarity (SSIM)': s.ssim + '  (1 = identical)', 'PSNR': s.psnr + ' dB',
-          'lightness change': `mean ${s.mean_dL}, 99% of pixels ≤ ${s.p99_dL} (ΔL*; ~1 is a just-noticeable step on a flat area)`,
-          'cells': `${s.cols} × ${s.rows} (payload tile ${s.tile}×${s.tile}, repeated ${s.tiles}×)`,
-          'print': `${j.print_cm[0]} × ${j.print_cm[1]} cm @ ${j.dpi} dpi, sub-block ${j.subblock_mm} mm`})}
-    <p><a class="btn" href="${j.image}" download="${esc(name)}">Download PNG</a>
-       <button class="btn alt" id="e-hold">Hold to see original</button>
-       <button class="btn alt" id="e-diff">Show difference ×10</button></p>
-    <img id="e-img" class="cmp" src="${j.image}">
-    <p class="note">Same size as your original, no border or markers: a hidden sync pattern lets the decoder find the code anywhere. Hold the button (or press on the image) to flip to the original. Print at 100%; the PNG carries the DPI for the chosen width.</p>`;
-  const img = $('e-img');
-  let diffOn = false;
-  const show = which => img.src = which === 'orig' ? j.original : diffOn ? j.diff : j.image;
-  for (const el of [$('e-hold'), img]) {
-    el.onpointerdown = e => { e.preventDefault(); show('orig'); };
-    el.onpointerup = el.onpointerleave = el.onpointercancel = () => show('enc');
+  btn.disabled = true;
+  out.innerHTML = `<div class="steps">${Object.entries(STAGES).map(([k, [n, t]]) => `<span id="e-s-${k}">${n} · ${t}</span>`).join('')}</div>
+    <div class="status" id="e-status">Uploading…</div>
+    <div class="stage"><canvas id="e-cv" class="cmp"></canvas><canvas id="e-fx" class="fx"></canvas></div>
+    <div class="zoom"><canvas id="e-zoom" width="256" height="256"></canvas><div><div id="e-cap"></div><div class="note" id="e-zcap"></div></div></div>
+    <table id="e-tries" hidden><tr><th>try</th><th>strength δ</th><th>SSIM</th><th>mean ΔL*</th><th>cells reading wrong</th><th>verdict</th><th>at</th></tr></table>
+    <div id="e-res"></div>`;
+  const fd = new FormData();
+  for (const [k, v] of Object.entries({file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value})) fd.append(k, v);
+  const cv = $('e-cv'), fx = $('e-fx'), zoom = $('e-zoom'), ctx = cv.getContext('2d'), fctx = fx.getContext('2d'), zctx = zoom.getContext('2d');
+  const say = h => $('e-status').innerHTML = h, t0 = performance.now();
+  let photo, W, H, k = 1, layout, tries = 0, delta = '', final = null, split = null, diffOn = false, fade = 0;
+  const seen = {};                                       // stage -> its event (with the working data)
+  const pill = (stage, cls) => $('e-s-' + stage).className = cls;
+
+  function show(stage) {                                // a stage's working data over the photo, and its 1:1 crop
+    const v = seen[stage]; if (!v) return;
+    cancelAnimationFrame(fade); fctx.clearRect(0, 0, fx.width, fx.height);
+    Object.keys(STAGES).forEach(s => $('e-s-' + s).style.outline = s === stage ? '2px solid var(--acc)' : '');
+    $('e-cap').textContent = CAPTION[stage](v);
+    const rw = layout.cols * layout.cell_px * k, rh = layout.rows * layout.cell_px * k;
+    ctx.drawImage(photo, 0, 0, cv.width, cv.height);
+    if (stage === 'layout') {
+      ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, cv.width, cv.height);
+      ctx.imageSmoothingEnabled = false; ctx.globalAlpha = .6; ctx.drawImage(v.cellsImg, 0, 0, rw, rh); ctx.globalAlpha = 1;
+      ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 1.5; ctx.beginPath();     // payload tile edges
+      const tp = layout.tile * layout.cell_px * k;
+      for (let x = 0; x <= rw + 1; x += tp) { ctx.moveTo(x, 0); ctx.lineTo(x, rh); }
+      for (let y = 0; y <= rh + 1; y += tp) { ctx.moveTo(0, y); ctx.lineTo(rw, y); }
+      ctx.stroke(); ctx.imageSmoothingEnabled = true;
+      zctx.imageSmoothingEnabled = false; zctx.drawImage(v.cellsImg, 0, 0, 8, 8, 0, 0, 256, 256);
+      $('e-zcap').textContent = 'Top-left 8 × 8 cells, enlarged.';
+    } else {
+      const t1 = performance.now();                       // fade the working data in over the photo
+      const step = () => { const a = Math.min(1, (performance.now() - t1) / 450);
+        ctx.drawImage(photo, 0, 0, cv.width, cv.height); ctx.globalAlpha = a; ctx.drawImage(v.imgEl, 0, 0, rw, rh); ctx.globalAlpha = 1;
+        if (a < 1) fade = requestAnimationFrame(step); };
+      step();
+      zctx.imageSmoothingEnabled = false; zctx.drawImage(v.cropEl, 0, 0, 256, 256);
+      $('e-zcap').textContent = `1:1 pixels from the middle of the picture (128 × 128 px), enlarged ×2. Computed at ${v.ms} ms.`;
+      ctx.strokeStyle = '#ffb020'; ctx.lineWidth = 2;
+      ctx.strokeRect(v.crop_xy[0] * k, v.crop_xy[1] * k, 128 * k, 128 * k);
+    }
   }
-  $('e-diff').onclick = () => { diffOn = !diffOn; $('e-diff').textContent = diffOn ? 'Show encoded' : 'Show difference ×10'; show('enc'); };
+
+  function compare() {                                  // the finished picture: original left of the line, Imprinted right
+    const x = split ?? cv.width / 2;
+    Object.keys(STAGES).forEach(s => $('e-s-' + s).style.outline = s === 'done' ? '2px solid var(--acc)' : '');
+    ctx.drawImage(diffOn ? final.diff : final.enc, 0, 0, cv.width, cv.height);
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, x, cv.height); ctx.clip(); ctx.drawImage(final.orig, 0, 0, cv.width, cv.height); ctx.restore();
+    fctx.clearRect(0, 0, fx.width, fx.height); fctx.fillStyle = '#fff'; fctx.fillRect(x - 1.5, 0, 3, fx.height);
+    const fs = Math.max(12, Math.round(fx.width / 55)); fctx.font = `${fs}px system-ui`;
+    const tag = (t, right) => { const w = fctx.measureText(t).width + 12, at = right ? x - w - 6 : x + 6;
+      fctx.fillStyle = 'rgba(0,0,0,.6)'; fctx.fillRect(at, 6, w, fs + 10); fctx.fillStyle = '#fff'; fctx.fillText(t, at + 6, fs + 8); };
+    tag('original', true); tag(diffOn ? 'difference ×10' : 'Imprinted', false);
+    $('e-cap').textContent = 'Drag across the picture: left of the line is your original, right the Imprinted copy.';
+    const src = diffOn ? final.diff : final.enc, z = src.naturalWidth / W;   // its 1:1 middle crop
+    zctx.imageSmoothingEnabled = false;
+    zctx.drawImage(src, (W / 2 - 64) * z, (H / 2 - 64) * z, 128 * z, 128 * z, 0, 0, 256, 256);
+    $('e-zcap').textContent = diffOn ? 'The change ×10 in the middle of the picture.' : '1:1 pixels of the Imprinted picture, middle, enlarged ×2: the pattern is there, below what the eye picks out.';
+  }
+
+  const handle = async ev => {
+    if (ev.e === 'preview') {
+      photo = await loadImg(ev.img); W = ev.w; H = ev.h; k = photo.naturalWidth / W;
+      cv.width = fx.width = photo.naturalWidth; cv.height = fx.height = photo.naturalHeight;
+      ctx.drawImage(photo, 0, 0); say('Encoding…');
+    } else if (ev.e === 'stage') {
+      const st = ev.stage;
+      if (st === 'read back') return say('Small picture: decoding it once to make sure it reads back…');
+      const [n] = STAGES[st];
+      Object.entries(STAGES).forEach(([s, [m]]) => m < n && $('e-s-' + s).className !== 'done' && pill(s, 'done'));
+      pill(st, 'run');
+      if (st === 'layout') { tries++; delta = ev.delta; }
+      if (st !== 'tried') say(`Try ${tries}, strength δ ${delta}: ${STAGES[st][1].toLowerCase()} · ${(ev.ms / 1000).toFixed(2)} s`);
+      if (st === 'layout') {
+        Object.keys(STAGES).forEach(s => s !== 'layout' && $('e-s-' + s).className === 'run' && pill(s, 'done'));
+      }
+      if (st === 'tried') {
+        const t = $('e-tries'), s = ev.stats; t.hidden = false; pill('tried', 'done');
+        t.insertAdjacentHTML('beforeend', `<tr><td>${tries}</td><td>${s.delta}</td><td>${s.ssim}</td><td>${s.mean_dL}</td><td>${pct(s.wrong_cells)}</td>
+          <td class="${ev.ok ? 'ok' : 'bad'}">${ev.ok ? '✓ invisible enough' : '✗ too visible'}</td><td>${(ev.ms / 1000).toFixed(2)} s</td></tr>`);
+        say(`Try ${tries}: δ ${s.delta} is ${ev.ok ? '<span class="ok">within</span>' : '<span class="bad">over</span>'} the visibility budget (SSIM ≥ 0.955, mean ΔL* ≤ 0.99)`);
+        return;
+      }
+      if (ev.cells) { ev.cellsImg = await loadImg(ev.cells); layout = ev; }
+      if (ev.img) { [ev.imgEl, ev.cropEl] = await Promise.all([loadImg(ev.img), loadImg(ev.crop)]); }
+      if (ev.cells || ev.img) { seen[st] = ev; show(st);
+        $('e-s-' + st).style.cursor = 'pointer'; $('e-s-' + st).onclick = () => show(st); }
+    } else if (ev.e === 'error') {
+      say(`<span class="bad">${esc(ev.detail)}</span>`);
+    } else if (ev.e === 'done') {
+      Object.keys(STAGES).forEach(s => pill(s, 'done'));
+      const j = ev, s = j.stats, warn = [];
+      const [enc, orig, diff] = await Promise.all([j.image, j.original, j.diff].map(loadImg));
+      final = {enc, orig, diff};
+      if (j.subblock_mm < j.min_subblock_mm) warn.push(`Printed sub-block is ${j.subblock_mm} mm (< ${j.min_subblock_mm} mm): print larger, or use a higher-resolution image.`);
+      if (s.tiles < 2) warn.push('Low redundancy (fewer than 2 payload tiles): use a shorter payload or a larger image.');
+      if (s.wrong_cells > 0.15) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
+      const name = 'imprinted_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
+      say(`<span class="ok">Done in ${(j.ms / 1000).toFixed(1)} s</span>: strength δ ${s.delta} after ${tries} tr${tries > 1 ? 'ies' : 'y'}. Click a step above to see its working data again.`);
+      $('e-s-done').style.cursor = 'pointer'; $('e-s-done').onclick = compare;
+      $('e-res').innerHTML = `${warn.map(w => `<p class="warn">${esc(w)}</p>`).join('')}
+        ${kv({'similarity (SSIM)': s.ssim + '  (1 = identical)', 'PSNR': s.psnr + ' dB',
+              'lightness change': `mean ${s.mean_dL}, 99% of pixels ≤ ${s.p99_dL} (ΔL*; ~1 is a just-noticeable step on a flat area)`,
+              'cells': `${s.cols} × ${s.rows} (payload tile ${s.tile}×${s.tile}, repeated ${s.tiles}×)`,
+              'print': `${j.print_cm[0]} × ${j.print_cm[1]} cm @ ${j.dpi} dpi, sub-block ${j.subblock_mm} mm`})}
+        <p><a class="btn" href="${j.image}" download="${esc(name)}">Download PNG</a>
+           <button class="btn alt" id="e-diff">Show difference ×10</button></p>
+        <p class="note">Same size as your original, no border or markers. Print at 100%; the PNG carries the DPI for the chosen width.</p>`;
+      $('e-diff').onclick = () => { diffOn = !diffOn; $('e-diff').textContent = diffOn ? 'Show Imprinted' : 'Show difference ×10'; compare(); };
+      compare();
+    }
+  };
+  const at = e => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(cv.width, (e.clientX - r.left) * cv.width / r.width)); };
+  cv.onpointerdown = e => { if (!final) return; cv.setPointerCapture(e.pointerId); split = at(e); compare(); };
+  cv.onpointermove = e => { if (final && cv.hasPointerCapture(e.pointerId)) { split = at(e); compare(); } };
+  try { await stream('/api/encode', fd, handle); }
+  catch (e) { say(`<span class="bad">${esc(e.message)}</span>`); }
+  finally { btn.disabled = false; }
 };
 
 // ---------------------------------------------------------------- decode
 $('d-go').onclick = async () => {
-  const f = $('d-file').files[0], out = $('d-out');
+  const f = $('d-file').files[0], out = $('d-out'), btn = $('d-go');
   if (!f) return out.innerHTML = '<p class="bad">Choose a photo.</p>';
-  const j = await post('/api/decode', {file: f, label: $('d-label').value}, $('d-go'), out, 'Searching for the hidden sync pattern…');
-  if (!j) return;
+  btn.disabled = true;
+  out.innerHTML = `<div class="steps"><span id="d-s1">1 · Is it Imprinted?</span><span id="d-s2">2 · Reading the payload</span><span id="d-s3">3 · Result</span></div>
+    <div class="status" id="d-status">Uploading…</div>
+    <div class="stage"><canvas id="d-cv"></canvas><canvas id="d-fx" class="fx"></canvas></div>
+    <div class="legend"><span><i style="background:#3fa7ff"></i>grid locks</span><span><i style="background:#ffb020"></i>weak lock</span><span><i style="background:#999"></i>no lock</span><span><i style="background:#2bd96b"></i>hidden pattern / payload area</span></div>
+    <div id="d-res"></div>`;
+  const fd = new FormData(); fd.append('file', f); fd.append('label', $('d-label').value);
+  const step = (n, cls) => $('d-s' + n).className = cls;
+  const say = h => $('d-status').innerHTML = h;
+  let cv, fx, ctx, fctx, k = 1, W, H, t0 = performance.now(), tick = 0, pulse = 0, seed = null, tried = 0, probes = 0, syncs = 0, stage = 1;
+  const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + ' s';
+  const dot = (p, r, col, fill = true) => { ctx.beginPath(); ctx.arc(p[0] * k, p[1] * k, r, 0, 7);
+    if (fill) { ctx.fillStyle = col; ctx.fill(); } else { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke(); } };
+  const live = () => {                       // the seed being read: a pulsing crosshair
+    fctx.clearRect(0, 0, fx.width, fx.height);
+    if (seed) { const r = 10 + 8 * Math.abs(Math.sin(performance.now() / 180)), [x, y] = [seed[0] * k, seed[1] * k];
+      fctx.strokeStyle = '#2bd96b'; fctx.lineWidth = 2.5; fctx.beginPath(); fctx.arc(x, y, r, 0, 7);
+      fctx.moveTo(x - r - 8, y); fctx.lineTo(x + r + 8, y); fctx.moveTo(x, y - r - 8); fctx.lineTo(x, y + r + 8); fctx.stroke(); }
+    pulse = requestAnimationFrame(live);
+  };
+  const handle = async ev => {
+    if (ev.e === 'preview') {
+      const img = await loadImg(ev.img); W = ev.w; H = ev.h; k = img.naturalWidth / W;
+      cv = $('d-cv'); fx = $('d-fx'); cv.width = fx.width = img.naturalWidth; cv.height = fx.height = img.naturalHeight;
+      ctx = cv.getContext('2d'); fctx = fx.getContext('2d'); ctx.drawImage(img, 0, 0);
+      ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, 0, cv.width, cv.height);
+      step(1, 'run'); tick = setInterval(() => stage === 1 && say(`Looking for the hidden grid… ${probes} spots probed, ${syncs} sync tests · ${secs()}`), 100);
+      pulse = requestAnimationFrame(live);
+    } else if (ev.e === 'probe') {
+      probes++; dot(ev.xy, ev.locks >= 4 ? 6 : 4, ev.locks >= 4 ? '#3fa7ff' : ev.locks >= 3 ? '#ffb020' : 'rgba(170,170,170,.7)');
+    } else if (ev.e === 'sync') {
+      syncs++; dot(ev.xy, 13, ev.z >= 6 ? '#2bd96b' : '#e05555', false);
+      ctx.font = 'bold 13px system-ui'; ctx.fillStyle = ev.z >= 6 ? '#2bd96b' : '#e05555'; ctx.fillText('z ' + ev.z, ev.xy[0] * k + 16, ev.xy[1] * k - 8);
+    } else if (ev.e === 'checked') {
+      stage = 2;
+      if (!ev.ok) { step(1, 'fail'); step(2, 'skip'); say(`<span class="bad">No Imprinted pattern in this photo</span> (checked in ${secs()})`); return; }
+      step(1, 'done'); step(2, 'run');
+      ctx.strokeStyle = 'rgba(43,217,107,.8)'; ctx.lineWidth = 1.2;            // the hidden grid it found, 6 cells each way
+      const n = 6, P = (a, b) => [(ev.xy[0] + a * ev.e1[0] + b * ev.e2[0]) * k, (ev.xy[1] + a * ev.e1[1] + b * ev.e2[1]) * k];
+      ctx.beginPath();
+      for (let i = -n; i <= n; i++) { ctx.moveTo(...P(i, -n)); ctx.lineTo(...P(i, n)); ctx.moveTo(...P(-n, i)); ctx.lineTo(...P(n, i)); }
+      ctx.stroke();
+      say(`<span class="ok">Imprinted pattern found</span> (sync z ${ev.z}, in ${secs()}). Reading the payload…`);
+    } else if (ev.e === 'seed') {
+      tried++; seed = ev.xy; dot(ev.xy, 3, 'rgba(43,217,107,.6)');
+      say(`<span class="ok">Imprinted.</span> Reading the payload: trying spot ${tried} · ${secs()}`);
+    } else if (ev.e === 'found') {
+      const q = ev.quad.map(p => [p[0] * k, p[1] * k]);
+      ctx.beginPath(); q.forEach((p, i) => i ? ctx.lineTo(...p) : ctx.moveTo(...p)); ctx.closePath();
+      ctx.fillStyle = 'rgba(43,217,107,.22)'; ctx.fill(); ctx.strokeStyle = '#2bd96b'; ctx.lineWidth = 3; ctx.stroke();
+      const c = q.reduce((a, p) => [a[0] + p[0] / 4, a[1] + p[1] / 4], [0, 0]);
+      ctx.font = 'bold 22px system-ui'; ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.strokeText(ev.text, c[0] - ctx.measureText(ev.text).width / 2, c[1]);
+      ctx.fillStyle = '#fff'; ctx.fillText(ev.text, c[0] - ctx.measureText(ev.text).width / 2, c[1]);
+    } else if (ev.e === 'done' || ev.e === 'error') {
+      clearInterval(tick); cancelAnimationFrame(pulse); seed = null; fctx && fctx.clearRect(0, 0, fx.width, fx.height);
+      if (ev.e === 'error') { step(3, 'fail'); return say(`<span class="bad">${esc(ev.detail)}</span>`); }
+      if ($('d-s2').className === 'run') step(2, ev.found.length ? 'done' : 'fail');
+      step(3, ev.found.length ? 'done' : 'fail');
+      if (stage === 2 && $('d-s1').className === 'done') say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>` : `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`);
+      $('d-res').innerHTML = result(ev);
+    }
+  };
+  try { await stream('/api/decode', fd, handle); }
+  catch (e) { clearInterval(tick); cancelAnimationFrame(pulse); $('d-status') ? say(`<span class="bad">${esc(e.message)}</span>`) : out.innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
+  finally { btn.disabled = false; }
+};
+
+function result(j) {
   const head = j.found.length
     ? j.found.map((f, i) => `<div class="big ok">#${i + 1} ✓ ${esc(f.text)}</div>` + kv({
         'raw cell error': pct(f.raw_ber) + ' (fixed by error correction)', 'cells read': `${f.cells} (${f.tiles} payload tiles)`,
         'photo px / sub-block': f.photo_px_per_subblock, 'mirrored photo': f.mirrored ? 'yes' : 'no'})).join('')
     : `<div class="big bad">✗ nothing decoded</div>
-       <p class="note">Sync candidates: ${j.seeds}, tried ${j.tried}. Try: closer so the picture fills the frame, sharper focus, less glare.</p>`;
-  out.innerHTML = head + kv({'photo': j.photo, 'time': j.seconds + ' s'}) +
-    `<figure style="margin:10px 0 0"><img src="${j.overlay}"><figcaption class="note">Green = area where the code was read.</figcaption></figure>`;
-};
+       <p class="note">${j.tried ? `Sync candidates: ${j.seeds}, tried ${j.tried}. ` : 'The quick check found no hidden sync pattern: not Imprinted, or too blurred or small to tell. '}Try: closer so the picture fills the frame, sharper focus, less glare.</p>`;
+  return head + kv({'photo': j.photo, 'time': j.seconds + ' s'});
+}
 
 // ---------------------------------------------------------------- ladder
 $('l-go').onclick = async () => {
