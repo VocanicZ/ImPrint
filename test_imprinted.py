@@ -525,14 +525,14 @@ def test_decode_skips_seeds_on_a_lattice_that_already_failed(monkeypatch):
     seeds = [(9.0, np.array([x, 50.0]), np.array([10.0, 0]), np.array([0, 10.0])) for x in (40, 60, 80, 300, 500, 520)]
     monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
     tracked = []
-    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked.append(seed[1][0]) or
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, **_: tracked.append(seed[1][0]) or
                         (lambda q, c=seed[1]: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 9 if sgn > 0 else 8))
 
     def refine(lum, m):
         x = m[0](np.zeros((1, 2)))[0, 0]
         return m[0], m[1], 40 if x < 200 or (x > 400 and m[2] != 8) else 5
     monkeypatch.setattr(ic, "refine", refine)
-    monkeypatch.setattr(ic, "read", lambda lum, m: None)
+    monkeypatch.setattr(ic, "read", lambda lum, m, **_: None)
     r = ic.decode(np.zeros((100, 600, 3), np.uint8), check=False)
     assert r["tried"] == 3 and tracked == [40, 40, 300, 300, 500, 500] and r["found"] == []
 
@@ -542,11 +542,11 @@ def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
     locked lattice turned around, and that reads."""
     c = np.array([100.0, 50.0])
     monkeypatch.setattr(ic, "find_seeds", lambda lum: [(9.0, c, np.array([10.0, 0]), np.array([0, 10.0]))])
-    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: (lambda q: c + 10 * q if sgn > 0 else c + 3 - 10 * q,
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, **_: (lambda q: c + 10 * q if sgn > 0 else c + 3 - 10 * q,
                                                              (-5.0, 5.0, -5.0, 5.0), 9))
     monkeypatch.setattr(ic, "refine", lambda lum, m: (m[0], m[1], 5 if m[0](np.zeros((1, 2)))[0, 0] != c[0] else 40))
     right = lambda m: np.allclose(m[0](np.array([[0.0, 0.0], [1.0, 0.0]])), [c, c - [10, 0]])
-    monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"twin") if right(m) else None)
+    monkeypatch.setattr(ic, "read", lambda lum, m, **_: dict(payload=b"twin") if right(m) else None)
     found = ic.decode(np.zeros((100, 400, 3), np.uint8), check=False)["found"]
     assert [f["payload"] for f in found] == [b"twin"]
     assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
@@ -630,9 +630,9 @@ def test_decode_reads_the_tracked_map_when_the_refit_misses(monkeypatch):
     tracked = (lambda q: c + 10 * q, (-5.0, 5.0, -5.0, 5.0), 200)
     monkeypatch.setattr(ic, "find_seeds", lambda lum: [(9.0, c, np.array([10.0, 0]), np.array([0, 10.0]))])
     monkeypatch.setattr(ic, "grid_seeds", lambda lum: [])
-    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn: tracked)
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, **_: tracked)
     monkeypatch.setattr(ic, "refine", lambda lum, m: (lambda q: c + 3 + 10 * q, m[1], 40))
-    monkeypatch.setattr(ic, "read", lambda lum, m: dict(payload=b"trk") if m is tracked else None)
+    monkeypatch.setattr(ic, "read", lambda lum, m, **_: dict(payload=b"trk") if m is tracked else None)
     found = ic.decode(np.zeros((100, 400, 3), np.uint8), check=False)["found"]
     assert [f["payload"] for f in found] == [b"trk"]
 
