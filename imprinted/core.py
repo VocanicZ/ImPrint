@@ -558,6 +558,34 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     return out, st
 
 
+def _cell_codes(rows: int, cols: int, payload: bytes):
+    """Each cell's pattern and bit for payload on a rows x cols grid: (D, s, on), on = sync cells."""
+    T, nbits = tile_size(len(payload)), 8 * frame_len(len(payload))
+    ii, jj = np.mgrid[0:rows, 0:cols]
+    t = ((ii % T) * T + (jj % T)).ravel()
+    D = pats(T * T)[t]
+    s = to_bits(payload)[bit_map(T * T, nbits)[t]]
+    on, sp, sb = sync_cells(ii.ravel(), jj.ravel())               # the known quarter (see sync_find)
+    return np.where(on[:, None, None], sp, D), np.where(on, sb, s), on
+
+
+def unembed(img: np.ndarray, payload: bytes, subblock_px: int) -> np.ndarray:
+    """Take an encode of payload back out of img (an Imprinted file, uncropped, at subblock_px): each
+    cell loses its component along that cell's pattern, so the old bits no longer read. Encoding on
+    top without this leaves both texts readable (the decoder returns whichever it reaches first);
+    the next encode's notch replaces the old pilot. Same size and layout as img."""
+    rgb = as_rgb(img)
+    b = int(subblock_px)
+    c = K * b
+    rows, cols = rgb.shape[0] // c, rgb.shape[1] // c
+    D, _, _ = _cell_codes(rows, cols, payload)
+    lab = to_lab(rgb)
+    lum = lab[:rows * c, :cols * c, 0]                          # view into lab
+    unit = measure(field(np.ones(rows * cols, np.float32), rows, cols, b, D), rows, cols, b, D)
+    lum -= field((measure(lum, rows, cols, b, D) / unit).astype(np.float32), rows, cols, b, D)
+    return like(to_rgb(lab), img)
+
+
 def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cache: dict | None = None,
            trace=lambda *a: None):
     nb = len(payload)
@@ -572,12 +600,7 @@ def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cach
         raise ValueError(f"image too small for a {nb}-byte payload: needs at least {max(READ_MIN_SIDE, T * c)} px "
                          f"per side (sub-block {b} px); use a shorter payload or a smaller sub-block")
     n, nbits = rows * cols, 8 * frame_len(nb)
-    ii, jj = np.mgrid[0:rows, 0:cols]
-    t = ((ii % T) * T + (jj % T)).ravel()
-    D = pats(T * T)[t]
-    s = to_bits(payload)[bit_map(T * T, nbits)[t]]
-    on, sp, sb = sync_cells(ii.ravel(), jj.ravel())               # the known quarter (see sync_find)
-    D, s = np.where(on[:, None, None], sp, D), np.where(on, sb, s)
+    D, s, on = _cell_codes(rows, cols, payload)
     trace("layout", dict(delta=delta, rows=rows, cols=cols, tile=T, cell_px=c, sync=on.reshape(rows, cols),
                          bits=s.reshape(rows, cols)))
 
@@ -1677,6 +1700,31 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
             quick = None                                    # too few sync cells to rule it out
         trace("checked", None, quick[0] if quick else None)
         return _decode(rgb, max_seeds, max_found, quick, trace)
+
+
+def existing(rgb: np.ndarray, read: bool = False) -> dict | None:
+    """An Imprinted pattern already in rgb: dict(subblock_px (its grid, so a new encode can land on
+    the same one: on any other the old text stays the readable one), payload (only when read:
+    reading costs seconds, finding it doesn't; None if it doesn't read)), or None if there is none.
+    Pictures under QUICK_SMALL px are read to find out (see detect)."""
+    rgb = as_rgb(rgb)
+    small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL
+    q = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE)  # a small one gets a quick look, then a read
+    if q:
+        _, _, e1, e2 = q[0]
+        sub = round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K)
+        if not read:
+            return dict(subblock_px=sub, payload=None)
+        with threadpool_limits(1, "blas"):
+            found = _decode(rgb, 40, 1, q)["found"]
+    elif small:
+        found = decode(rgb, max_found=1, check=False)["found"]
+        if not found:
+            return None
+        sub = round(found[0]["photo_px_per_subblock"])
+    else:
+        return None
+    return dict(subblock_px=sub, payload=found[0]["payload"] if found and read else None)
 
 
 def detect(rgb: np.ndarray) -> bool:

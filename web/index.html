@@ -70,6 +70,9 @@
       <div><label>Strength δ: <span id="e-dv">auto</span> (auto = strongest that stays invisible; lower = less visible)</label>
         <input type="range" id="e-delta" min="0" max="4" step="0.25" value="0" style="width:100%"></div>
       <div><label>Print width (cm), sets the cell size</label><input type="number" id="e-width" value="15" min="3" step="0.5"></div>
+      <div><label>If the picture is already Imprinted</label>
+        <label class="inline"><input type="radio" name="e-mode" value="override" checked> Override: replace its text</label>
+        <label class="inline"><input type="radio" name="e-mode" value="append"> Append: add this after its text</label></div>
     </div>
     <button class="go" id="e-go">Encode</button>
     <div class="out" id="e-out"></div>
@@ -153,7 +156,7 @@ async function stream(url, fd, handle) {
 
 // ---------------------------------------------------------------- encode
 // every picture shown here is the encoder's own working data for this job, sent as it computes it
-const STAGES = {layout: [1, 'Cell layout'], mask: [2, 'Where change can hide'], pilot: [3, 'Pilot grid'],
+const STAGES = {check: [0, 'Already Imprinted?'], layout: [1, 'Cell layout'], mask: [2, 'Where change can hide'], pilot: [3, 'Pilot grid'],
                 notch: [4, 'Look-alike texture out'], data: [5, 'Payload nudges'], tried: [6, 'Visibility check'], done: [7, 'Result']};
 const CAPTION = {
   layout: v => `The picture is cut into ${v.rows} × ${v.cols} cells of ${v.cell_px} px. Light/dark cells carry payload bits (one ${v.tile}×${v.tile}-cell tile, repeated over the picture); the blue ${(v.sync_share * 100).toFixed(0)}% are sync cells with known bits, which is how a reader proves a photo is Imprinted.`,
@@ -175,7 +178,8 @@ $('e-go').onclick = async () => {
     <table id="e-tries" hidden><tr><th>try</th><th>strength δ</th><th>SSIM</th><th>mean ΔL*</th><th>cells reading wrong</th><th>verdict</th><th>at</th></tr></table>
     <div id="e-res"></div>`;
   const fd = new FormData();
-  for (const [k, v] of Object.entries({file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value})) fd.append(k, v);
+  const mode = document.querySelector('input[name=e-mode]:checked').value;
+  for (const [k, v] of Object.entries({file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value, mode})) fd.append(k, v);
   const cv = $('e-cv'), fx = $('e-fx'), zoom = $('e-zoom'), ctx = cv.getContext('2d'), fctx = fx.getContext('2d'), zctx = zoom.getContext('2d');
   const say = h => $('e-status').innerHTML = h, t0 = performance.now();
   let photo, W, H, k = 1, layout, tries = 0, delta = '', final = null, split = null, diffOn = false, fade = 0;
@@ -241,8 +245,15 @@ $('e-go').onclick = async () => {
       photo = await loadImg(ev.img); W = ev.w; H = ev.h; k = photo.naturalWidth / W;
       cv.width = fx.width = photo.naturalWidth; cv.height = fx.height = photo.naturalHeight;
       ctx.drawImage(photo, 0, 0); say('Encoding…');
+    } else if (ev.e === 'existing') {
+      pill('check', 'done');
+      if (!ev.found) say(`Not Imprinted yet · ${(ev.ms / 1000).toFixed(1)} s`);
+      else $('e-res').insertAdjacentHTML('beforebegin', `<p class="warn" id="e-again">Already Imprinted${ev.old != null ? ` with “${esc(ev.old)}”` : ''} (found in ${(ev.ms / 1000).toFixed(1)} s).
+        The old text is taken out, then ${mode === 'append' ? 'old and new text are encoded together' : 'the new text is encoded'} on the picture's own grid (${ev.subblock_px} px sub-blocks; the print width setting is ignored).
+        Taking it out leaves traces, so the change is about 1.8× as visible as one encode: encode the original picture instead if you still have it.</p>`);
     } else if (ev.e === 'stage') {
       const st = ev.stage;
+      if (st === 'check') { pill('check', 'run'); return say('Is it already Imprinted? If so, reading its text to take it out…'); }
       if (st === 'read back') return say('Small picture: decoding it once to make sure it reads back…');
       const [n] = STAGES[st];
       Object.entries(STAGES).forEach(([s, [m]]) => m < n && $('e-s-' + s).className !== 'done' && pill(s, 'done'));
@@ -275,6 +286,7 @@ $('e-go').onclick = async () => {
       const unreadable = s.wrong_cells > j.wrong_max;
       if (s.wrong_cells > 0.15 && !unreadable) warn.push(`${pct(s.wrong_cells)} of cells can't hold the code invisibly (pure black/white, fully saturated color, or very strong edges). Decoding may fail: use a photo-like image, a shorter payload, or a higher strength.`);
       const name = 'imprinted_' + $('e-text').value.replace(/[^\w-]/g, '_') + '.png';
+      if (j.reencoded) $('e-again') && ($('e-again').innerHTML += ` Encoded text: “${esc(j.payload)}”.`);
       say(unreadable
         ? `<div class="big bad">✗ This picture can't carry the code</div><p class="bad" style="margin:0 0 8px">${pct(s.wrong_cells)} of its cells read wrong straight from the encoded file: too little room to change (pure white or black, fully saturated colour, flat graphics or transparent areas). It won't decode. Use a photo-like picture.</p>`
         : `<span class="ok">Done in ${(j.ms / 1000).toFixed(1)} s</span>: strength δ ${s.delta} after ${tries} tr${tries > 1 ? 'ies' : 'y'}. Click a step above to see its working data again.`);

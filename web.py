@@ -145,13 +145,16 @@ def gray(a: np.ndarray, signed: bool, top: np.ndarray) -> tuple[np.ndarray, floa
 
 @app.post("/api/encode")
 async def encode(request: Request, file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
-                 width_cm: float = Form(15.0)):
+                 width_cm: float = Form(15.0), mode: str = Form("override")):
     """delta <= 0: the encoder's default, the strongest within its visibility budget. Streams the
     encoder's stages as it computes them (their working data, once: later strengths only rescale
-    it), each strength tried, then the result."""
+    it), each strength tried, then the result. A picture that is already Imprinted is encoded again
+    on its own grid with its old text taken out first (else both read, or only the old one): mode
+    "override" replaces the text, "append" encodes "old new"."""
     rgb = read_rgb(await file.read())
     b = ic.subblock_for_print(rgb.shape[1], width_cm * 10)
     t0, sent = time.time(), set()
+    message = text.encode()
 
     def work(put):
         def trace(stage, v):
@@ -177,13 +180,32 @@ async def encode(request: Request, file: UploadFile = File(...), text: str = For
             sent.add(stage)
             put(ev)
 
-        enc, st = ic.encode(rgb, text.encode(), delta=delta if delta > 0 else None, subblock_px=b, trace=trace)
+        nonlocal b, message
+        put(dict(e="stage", stage="check", ms=round((time.time() - t0) * 1000)))
+        old = ic.existing(rgb, read=True)
+        put(dict(e="existing", found=old is not None, ms=round((time.time() - t0) * 1000),
+                 **(dict(subblock_px=old["subblock_px"], old=None if old["payload"] is None else
+                         old["payload"].decode("utf-8", "replace")) if old else {})))
+        host = rgb
+        if old:
+            # on its own grid, with the old text taken out first: otherwise both texts read
+            if old["payload"] is None:
+                raise ValueError("this picture is already Imprinted but its text doesn't read, so it can't be "
+                                 "taken out: encode the original picture instead")
+            b = old["subblock_px"]
+            if mode == "append":
+                message = old["payload"] + b" " + message
+                if len(message) > ic.MAX_BYTES:
+                    raise ValueError(f"old and new text together are {len(message)} bytes, over the "
+                                     f"{ic.MAX_BYTES}-byte limit: shorten the new text or use Override")
+            host = ic.unembed(rgb, old["payload"], b)
+        enc, st = ic.encode(host, message, delta=delta if delta > 0 else None, subblock_px=b, trace=trace)
         diff = np.clip(np.abs(enc.astype(int) - rgb.astype(int)) * 10, 0, 255).astype(np.uint8)
         dpi = rgb.shape[1] / (width_cm / 2.54)
         return dict(image=b64png(enc, dpi=dpi), original=b64png(rgb), diff=b64png(diff, 1600), stats=st,
                     ms=round((time.time() - t0) * 1000), dpi=round(dpi), subblock_mm=round(b * 25.4 / dpi, 2),
                     print_cm=[round(width_cm, 1), round(rgb.shape[0] / dpi * 2.54, 1)], min_subblock_mm=0.65,
-                    wrong_max=ic.WRONG_WARN)
+                    wrong_max=ic.WRONG_WARN, payload=message.decode("utf-8", "replace"), reencoded=old is not None)
     return streamed(request, rgb, work)
 
 
