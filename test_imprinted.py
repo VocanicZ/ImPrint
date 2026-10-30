@@ -924,7 +924,9 @@ def test_acceptance_run_writes_report_and_images(tmp_path, monkeypatch, capsys):
     cv2.imwrite(str(src), photo_like(360, 540))
     out = tmp_path / "out"
     assert sim.acceptance([str(src)], 2, ["easy", "hard", "nonsense"], 15.0, str(out)) == "FAIL"
-    assert len(calls) == 6 + 1 + 2 * 2              # all views once, a 2nd random crop, 2 presets x 2 trials
+    # encode's read-back (22x33 cells, under READ_SURE_CELLS), all views once, a 2nd random crop,
+    # 2 presets x 2 trials
+    assert len(calls) == 1 + 6 + 1 + 2 * 2 and calls[0] == (360, 540, 3)
     rep = json.loads((out / "acceptance.json").read_text())
     r = rep["results"]["kodim23"]
     assert r["geometry"]["clean"] == dict(ok=1, n=1) and r["geometry"]["crop60"] == dict(ok=2, n=2)
