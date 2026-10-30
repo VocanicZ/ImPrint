@@ -137,6 +137,7 @@ PILOT_FREQS = np.array([[3.0, 1.0], [-1.0, 3.0], [2.0, -3.0], [2.0, 3.0]])
 PILOT_PHASES = np.array([0.3, 1.7, 4.1, 2.8])       # 4th phase: lowest peak of the summed field
 PILOT_ALIAS_MAX = 0.85
 SYNC_MIN_SIDE = 320         # smallest image/level side scanned with 256-px spectral windows
+TRACK_TOL = 0.5             # cells: a tracked probe further than this off its neighbours' lattice is clutter
 SNR_MIN = 2.0               # a pilot probe counts when its lines stand this far above their
                             # neighbours (a 4-line fit rejects wrong offsets, so a lower bar is safe)
 
@@ -509,7 +510,7 @@ VIS_DL = 0.99               # mean |dL*| ceiling (PRD: <= 1.0; measured rounded 
 DELTA_MIN, DELTA_MAX = 0.5, 2.4
 # Smallest picture encode accepts: one that reads back from its clean file. The decoder scans no
 # side under READ_MIN_SIDE px (its spectral windows and grid search). Above that, how few cells the
-# pilot can still lock on depends on the picture. Calibrated for 0.8, where sync cells take a quarter
+# pilot can still lock on depends on the picture. Calibrated for 1.0, where sync cells take a quarter
 # of every tile's cells (testdata pictures at 512-1152 px wide, sub-blocks 4-8 px, 2-16 byte
 # payloads): busy kodim05 read nothing at 18x27 cells (4.9 tiles) or 21x32 (3.4 tiles), and kodim08
 # nothing at 18x28 (1.6 tiles), while all three read at 24x36, 25x38 and 32x48 (2.7 tiles and up).
@@ -618,7 +619,7 @@ def strength(img: np.ndarray, subblock_px: int) -> float:
     encoding it again at this strength lands the new data on the same lattice as the old, so a cell
     whose bit stays put doesn't move. (encode's own search would go stronger: the old pattern reads
     to the mask as texture.) Within DELTA_MIN..DELTA_MAX."""
-    lum = to_lab(as_rgb(img))[..., 0]
+    lum = np.ascontiguousarray(to_lab(as_rgb(img))[..., 0])
     b = int(subblock_px)
     c = K * b
     rows, cols = lum.shape[0] // c, lum.shape[1] // c
@@ -946,6 +947,8 @@ QUICK_PATIENCE = 10.0       # s: otherwise nothing new starts after this; out of
 QUICK_THREADS = 4           # threads that scan and probe; one more confirms (more only fight over the GIL)
 QUICK_GRACE = 0.25          # s past QUICK_PATIENCE that running confirms get
 QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.8)
+QUICK_Z_FULL = 8.0          # the same, for quick_check's full-size second look: screenshots reach ~5.8
+                            # there, real pictures 10-15
 QUICK_SMALL = 1_000_000     # px: a picture this small has too few sync cells to always reach QUICK_Z
                             # (16x24 cells: ~96, z 5-6 even clean), and its full search takes seconds:
                             # decode() searches it whatever quick_check says; detect() and existing()
@@ -1054,11 +1057,24 @@ def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -
     read ("sync", z) as they happen. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's
     px, or []: its cell vectors face the 180-degree twin the sync layout read on, so track(sgn=1)
     from it locks the lattice that reads."""
+    t0, trace = time.perf_counter(), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):
-        return _quick_check(rgb, patience, trace or (lambda *a: None))
+        hit = _quick_check(rgb, patience, trace)
+        h, w, n = rgb.shape[0], rgb.shape[1], QUICK_SIDE
+        left = patience - (time.perf_counter() - t0)
+        if hit or max(h, w) <= n or left <= 0:
+            return hit
+        # shrunk to QUICK_SIDE, a picture that fills little of a big photo (a 4032 px phone shot of
+        # a print or screen across the room) has its pilot lines past the shrunk picture's Nyquist
+        # limit: look again, at full size, at the middle QUICK_SIDE px square
+        y, x = max(0, (h - n) // 2), max(0, (w - n) // 2)
+        o = np.array([x, y], np.float64)
+        hit = _quick_check(rgb[y:y + n, x:x + n], left, lambda e, c, v: trace(e, None if c is None else c + o, v),
+                           QUICK_Z_FULL)
+        return [(z, c + o, e1, e2) for z, c, e1, e2 in hit]
 
 
-def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> list:
+def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None, z_min: float = QUICK_Z) -> list:
     _grid_table(256), _sync_shifts()                              # build the tables once, before the threads do
     t0 = time.perf_counter()
     late = lambda: time.perf_counter() - t0 > patience
@@ -1112,7 +1128,7 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
                 c, A = running.pop(job)
                 z, twin = job.result()
                 trace("sync", c / f, z)
-                if z >= QUICK_Z:
+                if z >= z_min:
                     A = -A if twin else A                         # the twin's lattice is -A's
                     return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
             return None
@@ -1477,10 +1493,19 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
                 heapq.heappush(heap, (-nodes[key][3], k, key))
 
     def accept(key, res):
+        """Take a probe that locked, unless it sits off the lattice its neighbours agree on (more than
+        TRACK_TOL cells from their affine fit): past the picture's edge noise and screen moire lock
+        at random phases, and growing from them only spreads probes over clutter. False if not taken."""
         Qn, Pn, Jn, snr = res
-        done.add(key)
         near = [nodes[k] for k in ((key[0] + di, key[1] + dj) for di in range(-2, 3) for dj in range(-2, 3))
                 if k in nodes]
+        if len(near) >= 3:
+            A = np.c_[np.array([n[0] for n in near]), np.ones(len(near))]
+            X, _, rank, _ = np.linalg.lstsq(A, np.array([n[1] for n in near]), rcond=None)
+            if rank == 3 and (np.linalg.norm(np.r_[Qn, 1] @ X - Pn)
+                              > TRACK_TOL * np.sqrt(abs(np.linalg.det(X[:2])))):
+                return False
+        done.add(key)
         if len(near) >= 3:                                        # local cell vectors from the neighbours
             dQ = np.array([n[0] for n in near]) - Qn
             dP = np.array([n[1] for n in near]) - Pn
@@ -1488,6 +1513,7 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
                 Jn = np.linalg.lstsq(dQ, dP, rcond=None)[0].T
         nodes[key] = (Qn, Pn, Jn, snr)
         push(key)
+        return True
 
     def grow_from_heap():
         while heap and len(done) + len(tried) < budget and time.perf_counter() < until:
@@ -1507,10 +1533,9 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             tried[key] = len(around)
             res = homography_probe(lum, q, around, nc, S, coh_min, snr_min) if len(around) >= 4 else None
             res = res or probe(q, Q, P, J)
+            ok = res is not None and accept(key, res)
             if trace:
-                trace(res is not None, p)
-            if res is not None:
-                accept(key, res)
+                trace(ok, p)
 
     push((0, 0))
     while True:
@@ -1532,11 +1557,10 @@ def track(lum: np.ndarray, seed, sgn: int = 1, r: int = 6, nc: int = 8, step: in
             p = g(q[None])[0]
             on = 0 <= p[0] < lum.shape[1] and 0 <= p[1] < lum.shape[0]
             res = map_probe(lum, q, g, nc, S, coh_min, snr_min, reaim=True) if on else None
+            ok = res is not None and accept(key, res)
             if trace and on:
-                trace(res is not None, p)
-            if res:
-                accept(key, res)
-                added += 1
+                trace(ok, p)
+            added += ok
         if not added:
             break
     L_ = np.array([n[0] for n in nodes.values()])
@@ -1808,7 +1832,7 @@ def _sync_search(rgb: np.ndarray, until: float, max_seeds: int = 40) -> list:
     wrong twin tries every length, 15 s), and the known layout can't be faked any more than the
     CRC. Returns [(z, centre_xy, e1, e2)] or []."""
     with threadpool_limits(1, "blas"):
-        lum = to_lab(rgb)[..., 0]
+        lum = np.ascontiguousarray(to_lab(rgb)[..., 0])   # a strided view costs every remap a whole-picture copy
         for batch in (lambda: find_seeds(lum)[:max_seeds], lambda: _grid_seeds(lum, until=until)):
             for seed in batch():                                  # (each grid seed tracked as it's found)
                 if time.perf_counter() > until:
@@ -1862,7 +1886,7 @@ def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list 
             trace=lambda *a: None) -> dict:
     if quick == []:
         return dict(found=[], tried=0, seeds=0, overlay=draw(rgb, []))
-    lum = to_lab(rgb)[..., 0]
+    lum = np.ascontiguousarray(to_lab(rgb)[..., 0])   # a strided view costs every remap a whole-picture copy
     seeds, found, regions, tried = [], [], [], 0
 
     probed = lambda ok, p: trace("try", p, ok)

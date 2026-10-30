@@ -64,7 +64,7 @@
   <section id="enc" class="on">
     <label>Image</label>
     <input type="file" id="e-file" accept="image/*">
-    <label>Payload text (max 32 bytes; shorter = more robust)</label>
+    <label>Payload text (max 32 bytes; shorter = more robust): <span id="e-bytes"></span></label>
     <input type="text" id="e-text" value="IMPRINT1">
     <div class="row">
       <div><label>Strength δ: <span id="e-dv">auto</span> (auto = strongest that stays invisible; lower = less visible)</label>
@@ -83,6 +83,7 @@
     <input type="file" id="d-file" accept="image/*">
     <label>Condition label, optional (e.g. "30deg, lamp, 40cm")</label>
     <input type="text" id="d-label">
+    <label class="inline"><input type="checkbox" id="d-every"> Find every copy (a photo of the strength-ladder page); otherwise stop at the first text read</label>
     <button class="go" id="d-go">Decode</button>
     <div class="out" id="d-out"></div>
   </section>
@@ -106,6 +107,9 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $(b.dataset.tab).classList.add('on');
 });
+const bytes = () => { const n = new TextEncoder().encode($('e-text').value).length;   // UTF-8: Thai/emoji take 3-4 each
+  $('e-bytes').innerHTML = `<b class="${n > 32 ? 'bad' : n > 24 ? 'warn' : 'ok'}">${n} / 32 bytes</b>`; };
+$('e-text').oninput = bytes; bytes();
 $('e-delta').oninput = e => $('e-dv').textContent = +e.target.value ? e.target.value : 'auto';
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const kv = o => '<div class="kv">' + Object.entries(o).map(([k, v]) => `<b>${esc(k)}</b><span>${esc(v)}</span>`).join('') + '</div>';
@@ -142,16 +146,26 @@ async function post(url, fields, btn, out, busy = 'Working…') {
 // ---------------------------------------------------------------- streaming
 // the server sends JSON lines as the job runs: handle each one as it arrives
 async function stream(url, fd, handle) {
-  const r = await fetch(url, {method: 'POST', body: fd});
+  let r;
+  try { r = await fetch(url, {method: 'POST', body: fd}); }
+  catch { throw new Error("Couldn't reach the server, or the upload was cut off. Check the network and try again."); }
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(typeof j.detail === 'string' ? j.detail : 'upload failed (' + r.status + ')'); }
-  const reader = r.body.getReader(), dec = new TextDecoder();
-  let buf = '';
+  const reader = r.body.getReader(), dec = new TextDecoder(), t0 = performance.now();
+  let buf = '', ended = false;
+  const lost = () => new Error(`Lost the connection to the server after ${((performance.now() - t0) / 1000).toFixed(0)} s` +
+    ' (the phone slept or switched apps, or the network dropped). Keep this page open and try again.');
   for (;;) {
-    const {value, done} = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, {stream: true});
-    for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) await handle(JSON.parse(buf.slice(0, i)));
+    let chunk;
+    try { chunk = await reader.read(); } catch { throw lost(); }
+    if (chunk.done) break;
+    buf += dec.decode(chunk.value, {stream: true});
+    for (let i; (i = buf.indexOf('\n')) >= 0; buf = buf.slice(i + 1)) {
+      const ev = JSON.parse(buf.slice(0, i));
+      ended ||= ev.e === 'done' || ev.e === 'error';
+      await handle(ev);
+    }
   }
+  if (!ended) throw lost();
 }
 
 // ---------------------------------------------------------------- encode
@@ -432,7 +446,7 @@ $('d-go').onclick = async () => {
     <div class="stage"><canvas id="d-cv"></canvas><canvas id="d-gr" class="fx"></canvas><canvas id="d-fx" class="fx"></canvas></div>
     ${LEGEND}
     <div id="d-res"></div>`;
-  const fd = new FormData(); fd.append('file', f); fd.append('label', $('d-label').value);
+  const fd = new FormData(); fd.append('file', f); fd.append('label', $('d-label').value); fd.append('every', $('d-every').checked);
   const step = (n, cls) => $('d-s' + n).className = cls;
   const say = h => $('d-status').innerHTML = h;
   let cv = $('d-cv'), fx, ctx, gr, tr = null, k = 1, W, H, t0 = performance.now(), tick = 0, stage = 1;
@@ -496,7 +510,7 @@ $('l-go').onclick = async () => {
   out.innerHTML = `<table><tr><th>strength δ</th><th>SSIM</th><th>PSNR</th><th>mean ΔL*</th><th>99% ΔL*</th><th>payload tiles</th><th>reads back</th></tr>
     ${j.stats.map(s => `<tr><td>${s.delta}</td><td>${s.ssim}</td><td>${s.psnr}</td><td>${s.mean_dL}</td><td>${s.p99_dL}</td><td>${s.tiles}×</td><td>${s.reads_back ? '✓' : '<span class="bad">✗ too small</span>'}</td></tr>`).join('')}</table>
     <a class="btn" href="${j.pdf}" download="imprinted_ladder.pdf">Download test page (PDF)</a>
-    <p class="note">Each copy prints ~8.8 cm wide. Photograph the whole page; the decoder finds every copy it can read.</p>`;
+    <p class="note">Each copy prints ~8.8 cm wide. Photograph the whole page and decode it with <b>Find every copy</b> ticked.</p>`;
 };
 </script>
 </body>

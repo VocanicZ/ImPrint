@@ -13,6 +13,7 @@ import queue
 import re
 import threading
 import time
+import traceback
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(50_000_000))   # the decoder itself refuses bombs
@@ -102,13 +103,16 @@ def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
             pass
         except ValueError as e:                        # the codec's own "can't do this picture"
             events.put(dict(e="error", detail=str(e)))
+            print("job refused:", e, flush=True)
         except Exception as e:                         # the stream must end either way
             events.put(dict(e="error", detail=f"{type(e).__name__}: {e}"))
+            traceback.print_exc()
         finally:
             JOBS.release()
 
     async def stream():
         if not JOBS.acquire(blocking=False):
+            print("busy: refused a job", flush=True)
             yield json.dumps(dict(e="error", detail="busy with other pictures: try again in a moment")) + "\n"
             return
         started = False
@@ -116,13 +120,15 @@ def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
             img = await asyncio.to_thread(b64jpg, rgb, 1200)
             yield json.dumps(dict(e="preview", img=img, w=rgb.shape[1], h=rgb.shape[0])) + "\n"
             threading.Thread(target=run, daemon=True).start()
-            started = True
+            started, seen = True, time.monotonic()
             while True:
+                if time.monotonic() - seen > 1:            # also while events pour in: they never empty the queue
+                    if await request.is_disconnected():    # (the server drops writes to a gone client silently)
+                        return
+                    seen = time.monotonic()
                 try:
                     ev = events.get_nowait()
                 except queue.Empty:
-                    if await request.is_disconnected():    # (the server drops writes to a gone client silently)
-                        return
                     await asyncio.sleep(0.05)
                     continue
                 yield json.dumps(ev, default=lambda o: o.item()) + "\n"       # numpy scalars
@@ -269,14 +275,15 @@ def forward(put):
 
 
 @app.post("/api/decode")
-async def decode(request: Request, file: UploadFile = File(...), label: str = Form("")):
+async def decode(request: Request, file: UploadFile = File(...), label: str = Form(""), every: bool = Form(False)):
     """Streams JSON lines as the decoder works: the photo's preview, each quick-check probe and
-    sync read, the check's verdict, each seed tried, each payload found, then the result."""
+    sync read, the check's verdict, each seed tried, each payload found, then the result. Done at
+    the first payload unless `every` (a photo of the strength-ladder page: one per copy)."""
     rgb = read_rgb(await file.read())
 
     def work(put):
         t = time.time()
-        r = ic.decode(rgb, trace=forward(put))
+        r = ic.decode(rgb, max_found=None if every else 1, trace=forward(put))
         found = [payload(f) for f in r["found"]]
         secs = round(time.time() - t, 1)
         log(label, rgb, found, secs)
