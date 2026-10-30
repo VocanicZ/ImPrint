@@ -85,6 +85,35 @@ def test_sync_layout_reads_on_the_right_twin_only():
     assert right > 15 and wrong < 5 and max(zs[1], zs[3]) < 5, zs
 
 
+def test_quick_check_seed_faces_the_twin_its_sync_read():
+    """quick_check's sync read already knows which 180-degree twin holds the layout: the seed it
+    hands decode() points that way, so the first twin tracked from it is the one that reads (the
+    other turn was a whole wasted track, refine and two failed reads: 39.5 s instead of 25 s on a
+    clean 3000x2000 file)."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    for view in (enc, np.rot90(enc, 2), enc[::-1]):            # the turn swaps the twins
+        view = np.ascontiguousarray(view)
+        quick = ic.quick_check(view)
+        assert quick, view.shape
+        lum = ic.to_lab(view)[..., 0]
+        m, w, used, rows, cols, unit = ic.cell_means(lum, ic.track(lum, quick[0], 1))
+        ii, jj = np.mgrid[0:rows, 0:cols].reshape(2, -1)
+        assert ic.sync_find(m[used], w[used], ii[used], jj[used], unit)[0] > ic.SYNC_Z, view.shape
+
+
+def test_sync_search_seed_faces_the_twin_its_sync_read(monkeypatch):
+    """A small picture's sync search hands decode() its seed facing the twin that held the
+    layout, as quick_check does: the read then starts on the right twin."""
+    seed = (9.0, np.array([20.0, 50.0]), np.array([3.0 * ic.K, 0]), np.array([0, 3.0 * ic.K]))
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [seed])
+    monkeypatch.setattr(ic, "track", lambda *a, **k: (lambda q: q * 3.0 * ic.K, (0.0, 40.0, 0.0, 40.0), 50))
+    small = np.zeros((400, 600, 3), np.uint8)
+    for twin, s in ((False, 1), (True, -1)):
+        monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: (30.0, twin))
+        (z, c, e1, e2), = ic._sync_search(small, np.inf)
+        assert z == 30.0 and (c == seed[1]).all() and (e1 == s * seed[2]).all() and (e2 == s * seed[3]).all()
+
+
 def test_quick_check_rules_out_only_after_every_source_had_its_look(monkeypatch):
     """A busy picture's faint pilot often shows no spectral line at all, only local grids (some only
     at half scale), and on a slow machine those come well past QUICK_REJECT: ruled out on the
@@ -582,7 +611,7 @@ def test_small_picture_search_stops_at_its_patience(monkeypatch):
     untils, lattice = [], (lambda q: q * 3.0 * ic.K, (0.0, 40.0, 0.0, 40.0), 50)
     monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, until=np.inf, **_: untils.append(until) or
                         time.sleep(0.1) or lattice)
-    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 4.0)  # tracks, but holds no sync layout
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: (4.0, False))  # tracks, but holds no sync layout
     small = np.zeros((400, 600, 3), np.uint8)
     ic.to_lab(small)                                              # OpenCV's first colour conversion: ~1 s
     for look in (ic.detect, ic.existing):
@@ -595,7 +624,7 @@ def test_small_picture_search_stops_at_its_patience(monkeypatch):
     t0 = time.perf_counter()
     assert not ic.detect(small) and len(grids) == 1 and 1.0 < grids[0] - t0 < 1.1
     monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
-    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 30.0 if len(untils) >= 3 else 4.0)
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: (30.0 if len(untils) >= 3 else 4.0, False))
     for look in (ic.detect, ic.existing):
         untils.clear()
         assert look(small) and len(untils) == 3

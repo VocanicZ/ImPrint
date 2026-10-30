@@ -986,15 +986,16 @@ def _locks(img: np.ndarray, c, A, step: int = 2, S: int = K * 4) -> int:
 
 
 def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int = 120, align: int = 1,
-                  until: float = np.inf) -> float:
+                  until: float = np.inf) -> tuple[float, bool]:
     """Sync evidence for a candidate grid: track it coarsely (probes `step` cells apart, at most
     `budget` tries), read every cell through that map and run the sync matched filter. A clear
     picture settles it there; only when it doesn't, the track's frontier is retried through the
     global map (re-aimed: slower, but it reaches the far side of a tilted or curled page) and
     read again. The pilot can't tell the 180-degree twins apart: the twin lattice is the same map
     turned around and shifted by one sub-cell offset, which one probe locked the other way round
-    gives. Returns the better twin's z (0 if the grid doesn't track)."""
-    best = 0.0
+    gives. Returns the better twin's z (0 if the grid doesn't track) and whether that is the twin
+    (the lattice of -A)."""
+    best = (0.0, False)
     for frontier in (False, True):
         model = track(img, (0, c, A[:, 0], A[:, 1]), 1, r=r, step=step, budget=budget, frontier=frontier, until=until)
         if (model is None or model[2] < 8) and step > 2:           # busy or tilted: jumps that long fail, short ones hold
@@ -1003,13 +1004,14 @@ def _sync_confirm(img: np.ndarray, c, A, r: int = 4, step: int = 4, budget: int 
         if model is None or model[2] < 8 or time.perf_counter() > until:
             return best
         best = max(best, _sync_read(img, model, r, align))
-        if best >= QUICK_Z:
+        if best[0] >= QUICK_Z:
             break
     return best
 
 
-def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
-    """The sync z of a tracked model's cells, its 180-degree twin's if that reads better."""
+def _sync_read(img: np.ndarray, model, r: int, align: int) -> tuple[float, bool]:
+    """The sync z of a tracked model's cells, its 180-degree twin's if that reads better, and
+    whether it was the twin's."""
     fmap, (x0, x1, y0, y1), n = model
     p = fmap(np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]))
     tw = pilot_probe(img, np.zeros(2), np.zeros(2), p[0], -np.c_[p[1] - p[0], p[2] - p[0]])
@@ -1017,16 +1019,16 @@ def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
     if tw is not None:                                            # twin coords x <-> lattice tw[0] - x
         o = tw[0]
         models.append((lambda x: fmap(o - x), (o[0] - x1, o[0] - x0, o[1] - y1, o[1] - y0), n))
-    best = 0.0
-    for mdl in models:
+    best = (0.0, False)
+    for twin, mdl in enumerate(models):
         cm = cell_means(img, mdl, r, grow=0, align=align)
         if cm is None:
             continue
         m, w, used, rows, cols, unit = cm
         xs, ys = np.floor(mdl[1][0]), np.floor(mdl[1][2])
         ii, jj = np.mgrid[0:rows, 0:cols].reshape(2, -1) + np.array([ys, xs], int)[:, None]
-        best = max(best, sync_find(m[used], w[used], ii[used], jj[used], unit)[0])
-        if best >= QUICK_Z:                                       # the first twin read it: no need for the other
+        best = max(best, (sync_find(m[used], w[used], ii[used], jj[used], unit)[0], bool(twin)))
+        if best[0] >= QUICK_Z:                                    # the first twin read it: no need for the other
             break
     return best
 
@@ -1042,7 +1044,8 @@ def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -
     known pseudo-random bits. Past `patience` s nothing new starts: out of time = not found.
     trace(event, centre_xy, value), if given, sees each probe ("probe", locks of 5) and sync
     read ("sync", z) as they happen. Returns the confirmed seed [(z, centre_xy, e1, e2)] in rgb's
-    px, or []."""
+    px, or []: its cell vectors face the 180-degree twin the sync layout read on, so track(sgn=1)
+    from it locks the lattice that reads."""
     with threadpool_limits(1, "blas"):
         return _quick_check(rgb, patience, trace or (lambda *a: None))
 
@@ -1099,9 +1102,10 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
         def settled(block: float = 0.0):
             for job in wait(running, timeout=block, return_when=FIRST_COMPLETED)[0] if running else ():
                 c, A = running.pop(job)
-                z = job.result()
+                z, twin = job.result()
                 trace("sync", c / f, z)
                 if z >= QUICK_Z:
+                    A = -A if twin else A                         # the twin's lattice is -A's
                     return [(z, c / f, A[:, 0] / f, A[:, 1] / f)]
             return None
 
@@ -1800,11 +1804,12 @@ def _sync_search(rgb: np.ndarray, until: float, max_seeds: int = 40) -> list:
                 model = track(lum, seed, 1, budget=SMALL_TRACK, frontier=False, until=until)
                 if model is None or model[2] < 8:
                     continue
-                z = _sync_read(lum, model, 4, 1)
+                z, twin = _sync_read(lum, model, 4, 1)
                 if SMALL_HINT <= z < QUICK_Z and (model := track(lum, seed, 1, until=until)):
-                    z = max(z, _sync_read(lum, model, 4, 1))     # close: the whole lattice settles it
+                    z, twin = max((z, twin), _sync_read(lum, model, 4, 1))   # close: the whole lattice settles it
                 if z >= QUICK_Z:
-                    return [(z, *seed[1:])]
+                    s = -1 if twin else 1                         # facing the twin that read, as quick_check's
+                    return [(z, seed[1], s * seed[2], s * seed[3])]
     return []
 
 
