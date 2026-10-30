@@ -965,6 +965,39 @@ def test_cli_matrix_defaults(tmp_path, monkeypatch, capsys):
     assert " | ".join(sim.PRESETS) in out and out.count("| 0/2 | 0/2 | 0/2 | 0/2 |") == 2   # 2 deltas x 2 trials
 
 
+def test_small_bench_fails_on_a_false_alarm_or_a_slow_detect(tmp_path, monkeypatch, capsys):
+    """scripts/small_bench.py: its no-pattern extras are small pictures; a detect() that says yes
+    to one of them, or takes past BOUND, is a FAIL, a miss alone is reported but not."""
+    import pickle, time
+    monkeypatch.syspath_prepend(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import small_bench
+    extras = small_bench.extras()
+    assert len(extras) == 6 and all(p is None and im.shape == (512, 768, 3) and im.dtype == np.uint8
+                                    for p, _, im in extras)
+    assert all(im.std() > 10 for _, name, im in extras if name.startswith("halftone"))
+    cases = [(b"hi", "enc", photo_like(64, 64)), (None, "plain", photo_like(64, 64, 1))]
+    path = tmp_path / "cases.pkl"
+    pickle.dump(cases, open(path, "wb"))
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [])
+    monkeypatch.setattr(ic, "decode", lambda im, **k: dict(found=[]))
+    monkeypatch.setattr(ic, "existing", lambda im: None)
+
+    def run(detect):
+        monkeypatch.setattr(ic, "detect", detect)
+        monkeypatch.setattr(sys, "argv", ["small_bench.py", str(path)])
+        with pytest.raises(SystemExit) as e:
+            small_bench.main()
+        return e.value.code, capsys.readouterr().out
+
+    code, out = run(lambda im: False)                             # misses the encoded one, no alarm
+    assert code == 0 and "verdict: PASS" in out and "detect:enc" in out and "detect 1/2" in out
+    code, out = run(lambda im: True)                              # a yes on the plain picture
+    assert code == 1 and "false alarms ['detect:plain'" in out
+    monkeypatch.setattr(small_bench, "BOUND", 0.05)
+    code, out = run(lambda im: time.sleep(0.1) or im is cases[0][2])
+    assert code == 1 and "verdict: FAIL" in out and "false alarms []" in out
+
+
 if __name__ == "__main__":
     test_same_size_no_markers()
     test_found_without_border_any_orientation()
