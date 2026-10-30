@@ -85,6 +85,22 @@ def test_sync_layout_reads_on_the_right_twin_only():
     assert right > 15 and wrong < 5 and max(zs[1], zs[3]) < 5, zs
 
 
+def test_quick_check_seed_faces_the_twin_its_sync_read():
+    """quick_check's sync read already knows which 180-degree twin holds the layout: the seed it
+    hands decode() points that way, so the first twin tracked from it is the one that reads (the
+    other turn was a whole wasted track, refine and two failed reads: 39.5 s instead of 25 s on a
+    clean 3000x2000 file)."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    for view in (enc, np.rot90(enc, 2), enc[::-1]):            # the turn swaps the twins
+        view = np.ascontiguousarray(view)
+        quick = ic.quick_check(view)
+        assert quick, view.shape
+        lum = ic.to_lab(view)[..., 0]
+        m, w, used, rows, cols, unit = ic.cell_means(lum, ic.track(lum, quick[0], 1))
+        ii, jj = np.mgrid[0:rows, 0:cols].reshape(2, -1)
+        assert ic.sync_find(m[used], w[used], ii[used], jj[used], unit)[0] > ic.SYNC_Z, view.shape
+
+
 def test_quick_check_rules_out_only_after_every_source_had_its_look(monkeypatch):
     """A busy picture's faint pilot often shows no spectral line at all, only local grids (some only
     at half scale), and on a slow machine those come well past QUICK_REJECT: ruled out on the
