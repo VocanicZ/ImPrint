@@ -564,6 +564,51 @@ def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
     assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
 
 
+def test_small_picture_search_stops_at_its_patience(monkeypatch):
+    """A small picture's quick look can't rule it out, so detect() and existing() search it, but no
+    longer than SMALL_PATIENCE: 40 slow seeds (0.1 s each, 4 s in all) stop being tried once it's
+    up, and the track under way is handed the same deadline, as is the grid search (whose seeds are
+    tracked as it finds them: its probing takes seconds on a busy picture). A lattice whose
+    full map holds the sync layout settles it (no payload read), and so does a quick look that
+    confirms it."""
+    import time
+    seeds = [(9.0, np.array([20.0 + x, 50.0]), np.array([3.0 * ic.K, 0]), np.array([0, 3.0 * ic.K])) for x in range(40)]
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    grids = []
+    monkeypatch.setattr(ic, "_grid_seeds", lambda lum, until=np.inf, **_: grids.append(until) or iter(()))
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [])
+    monkeypatch.setattr(ic, "read", lambda *a, **k: pytest.fail("the sync settles it: no payload read"))
+    monkeypatch.setattr(ic, "SMALL_PATIENCE", 1.0)
+    untils, lattice = [], (lambda q: q * 3.0 * ic.K, (0.0, 40.0, 0.0, 40.0), 50)
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, until=np.inf, **_: untils.append(until) or
+                        time.sleep(0.1) or lattice)
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 4.0)  # tracks, but holds no sync layout
+    small = np.zeros((400, 600, 3), np.uint8)
+    ic.to_lab(small)                                              # OpenCV's first colour conversion: ~1 s
+    for look in (ic.detect, ic.existing):
+        untils.clear()
+        t0 = time.perf_counter()
+        assert not look(small)
+        assert time.perf_counter() - t0 < 2.5 and 0 < len(untils) < 30, (look, len(untils))
+        assert 1.0 < untils[0] - t0 < 1.1                     # its call's start + SMALL_PATIENCE
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [])           # nothing spectral: the grid search's turn
+    t0 = time.perf_counter()
+    assert not ic.detect(small) and len(grids) == 1 and 1.0 < grids[0] - t0 < 1.1
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 30.0 if len(untils) >= 3 else 4.0)
+    for look in (ic.detect, ic.existing):
+        untils.clear()
+        assert look(small) and len(untils) == 3
+    assert ic.existing(small) == dict(subblock_px=3, payload=None)
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [seeds[0]])
+    monkeypatch.setattr(ic, "_sync_search", lambda *a, **k: pytest.fail("confirmed: nothing to search"))
+    assert ic.detect(small)
+    monkeypatch.setattr(ic, "pilot_probe", lambda *a, **k: pytest.fail("past its deadline: nothing probed"))
+    noise = np.random.default_rng(0).normal(50, 10, (600, 800)).astype(np.float32)
+    assert ic.grid_candidates(noise[:256, :256])                   # candidates to probe, but no time to
+    assert list(ic._grid_seeds(noise, until=time.perf_counter())) == []
+
+
 def test_cell_means_grows_but_drops_cells_outside_the_photo():
     enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
     lum = ic.to_lab(enc)[..., 0]
