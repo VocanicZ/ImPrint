@@ -565,7 +565,8 @@ def _reads_back(out: np.ndarray, payload: bytes, st: dict, trace=lambda *a: None
     if min(rows, cols) >= READ_SURE_CELLS and rows * cols >= READ_SURE_TILES * T * T:
         return True
     trace("read back", None)
-    return any(f["payload"] == payload for f in decode(out, check=False)["found"])   # the payload, not detect
+    found = decode(out, max_found=1, rule_out=False)["found"]   # as a user's decode() reads it, never ruled out
+    return any(f["payload"] == payload for f in found)          # the payload, not detect
 
 
 def _cell_codes(rows: int, cols: int, payload: bytes):
@@ -1772,12 +1773,15 @@ def _quad(model) -> np.ndarray:
 
 
 def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, check: bool = True,
-           trace=None) -> dict:
+           trace=None, rule_out: bool = True) -> dict:
     """Find and decode every Imprinted payload in a photo or file (RGB, RGBA or grayscale): no border or
     outline needed. Spectral seeds first; if none of them reads, the grid search's seeds (steep tilts).
     max_found: stop once that many are found (the rest of the seeds are mostly clutter, and slow).
     check: quick_check first, and stop there if it finds no pilot (a picture without a payload: one to
     ten seconds instead of minutes); the seed it confirmed gets the first turn.
+    rule_out False: quick_check still gives its seed the first turn (up to QUICK_PATIENCE s at any
+    size), but a picture it doesn't confirm is searched in full anyway, as with check=False (encode's
+    read-back: check=False's own seeds miss some files that this seed reads).
     trace(event, centre_xy, value), if given, sees quick_check's events, then ("checked", None,
     seed or None), each seed tried ("seed", centre, None), each twin tracked from it ("twin", centre,
     sgn), every probe ("try", photo_xy, locked), the tracked and refined maps ("tracked"/"refined",
@@ -1786,9 +1790,10 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
     rgb, trace = as_rgb(rgb), trace or (lambda *a: None)
     with threadpool_limits(1, "blas"):        # tiny matrix products: BLAS threads only add overhead
         small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL      # read in full anyway: a quick look only
-        quick = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE, trace) if check else None
-        if quick == [] and small:
-            quick = None                                    # too few sync cells to rule it out
+        patience = QUICK_REJECT if small and rule_out else QUICK_PATIENCE
+        quick = quick_check(rgb, patience, trace) if check else None
+        if quick == [] and (small or not rule_out):
+            quick = None                                    # too few sync cells to rule it out, or not asked to
         trace("checked", None, quick[0] if quick else None)
         return _decode(rgb, max_seeds, max_found, quick, trace)
 
