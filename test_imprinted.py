@@ -805,6 +805,16 @@ def test_every_small_picture_encode_accepts_reads_back():
     assert {(n, 768, b) for n in ("kodim08", "kodim23") for b in (2, 8)} <= accepted, accepted
 
 
+def test_encode_accepts_kodim05_500px_whose_file_decodes():
+    """kodim05 at 500 px wide, b"IMPRINT1", printed 150 mm wide (20x31 cells, tile 14): decode()
+    reads its clean file (quick_check's seed faces the twin that reads), but the read-back decoded
+    with check=False, whose seeds miss it, and encode refused it as too small."""
+    img = kodim("kodim05", 333, 500)
+    enc, st = ic.encode(img, b"IMPRINT1", subblock_px=ic.subblock_for_print(500, 150))
+    assert (st["rows"], st["cols"]) == (20, 31), st
+    assert any(f["payload"] == b"IMPRINT1" for f in ic.decode(enc, max_found=1)["found"]), st
+
+
 def test_make_ladder_returns_a_page_for_kodim05():
     """The ladder fits kodim05 to its slot (1040x693 px, 19x28 cells of 36 px): at strength 0.75 that
     copy does not read back from its clean file, which encode refuses, so make_ladder raised and
