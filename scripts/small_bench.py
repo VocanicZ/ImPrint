@@ -4,10 +4,7 @@ and decoded (not fewer than before).
 
     python scripts/small_bench.py [--cpu] [cases.pkl]     # builds the cases on first run
 
---cpu: on a shared, loaded host wall time says more about the neighbours than the code, so every
-clock the codec reads (its patience and deadlines) and the bench's own timer run in this process's
-CPU seconds instead, one thread each for OpenCV and BLAS: about the seconds an idle machine would
-take (more, as quick_check's threads add up), and the same misses it would see.
+--cpu: see benchclock.py (CPU seconds on one thread instead of wall time).
 
 Encoded: clean 768x512 files of the 3 testdata pictures at payloads of 2/5/8 bytes, each as is,
 turned 90 degrees and cropped to its central 60%. Plain: the same pictures unencoded, at 768x512
@@ -66,12 +63,8 @@ def main():
     args = sys.argv[1:]
     clock = time.perf_counter
     if args[:1] == ["--cpu"]:
-        import types
-        from threadpoolctl import threadpool_limits
-        args, clock = args[1:], time.process_time
-        ic.time = types.SimpleNamespace(perf_counter=clock)
-        cv2.setNumThreads(1)
-        threadpool_limits(1)
+        from benchclock import use_cpu_clock
+        args, clock = args[1:], use_cpu_clock()
     path = args[0] if args else os.path.join(T, "..", "results", "small_cases.pkl")
     which = args[1].split(",") if len(args) > 1 else ["detect", "decode", "existing"]
     if not os.path.exists(path):

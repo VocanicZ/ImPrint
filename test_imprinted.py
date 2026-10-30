@@ -1179,6 +1179,99 @@ def test_small_bench_fails_on_a_false_alarm_or_a_slow_detect(tmp_path, monkeypat
     assert code == 1 and "verdict: FAIL" in out and "false alarms []" in out
 
 
+def test_benchclock_puts_the_codec_and_the_bench_on_cpu_seconds_on_one_thread(monkeypatch):
+    """scripts/benchclock.py (the benches' --cpu): the codec's deadlines and the bench's timer read
+    this process's CPU seconds, and OpenCV and BLAS get one thread each."""
+    import time
+    monkeypatch.syspath_prepend(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import benchclock
+    calls = []
+    monkeypatch.setattr(ic, "time", ic.time)                      # restored after the test
+    monkeypatch.setattr(benchclock.cv2, "setNumThreads", lambda n: calls.append(("cv2", n)))
+    monkeypatch.setattr(benchclock, "threadpool_limits", lambda n: calls.append(("blas", n)))
+    assert benchclock.use_cpu_clock() is time.process_time
+    assert ic.time.perf_counter is time.process_time and sorted(calls) == [("blas", 1), ("cv2", 1)]
+
+
+def test_detect_bench_scores_on_the_clock_it_is_given(tmp_path, monkeypatch, capsys):
+    """scripts/detect_bench.py: in-spec Imprinted pictures confirmed by 3 s / 10 s and no false alarm
+    is a PASS; --cpu times quick_check on benchclock's clock, so a slow clock there fails the bar."""
+    import pickle
+    monkeypatch.syspath_prepend(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import benchclock, detect_bench
+    cases = [(1, "kodim23 file", photo_like(64, 64)), (0, "kodim23 plain easy v4", photo_like(64, 64, 1))]
+    path = tmp_path / "cases.pkl"
+    pickle.dump(cases, open(path, "wb"))
+
+    def quick_check(im, trace=None):
+        hit = np.array_equal(im, cases[0][2])
+        if trace:
+            trace("sync", None, 9.0 if hit else 1.0)
+        return hit
+
+    monkeypatch.setattr(ic, "quick_check", quick_check)
+
+    def run(*args):
+        monkeypatch.setattr(sys, "argv", ["detect_bench.py", *args, str(path)])
+        with pytest.raises(SystemExit) as e:
+            detect_bench.main()
+        return e.value.code, capsys.readouterr().out
+
+    code, out = run()
+    assert code == 0 and "verdict: PASS" in out and "false alarms 0" in out and "best sync z 1.00" in out, out
+    ticks = iter(range(0, 1000, 20))                              # every quick_check takes 20 "CPU s"
+    monkeypatch.setattr(benchclock, "use_cpu_clock", lambda: lambda: next(ticks))
+    code, out = run("--cpu")
+    assert code == 1 and "verdict: FAIL" in out and "0% by 10 s" in out, out
+
+
+def test_speed_bench_reports_every_section_and_fails_on_a_wrong_answer(monkeypatch, capsys):
+    """scripts/speed_bench.py: a line per section (encode and check at both sizes, decode of files
+    and easy prints, detect of Imprinted and plain pictures, re-encode dL*); a wrong payload, a yes
+    on a plain picture or a re-encode that reads the wrong text is a non-zero exit."""
+    monkeypatch.syspath_prepend(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import speed_bench
+    small = photo_like(64, 96)
+    monkeypatch.setattr(speed_bench, "load", lambda n, size=(768, 512): small.copy())
+    monkeypatch.setattr(speed_bench, "SIZES", ((96, 64), (192, 128)))
+    monkeypatch.setattr(sim, "channel", lambda im, rng, preset: im)
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [])
+    monkeypatch.setattr(ic, "existing", lambda im, read=False: None)
+    monkeypatch.setattr(ic, "visibility", lambda a, b: dict(mean_dL=0.5))
+    text = {}
+
+    def encode(im, payload, out=None, mode="override"):
+        enc = im.copy()
+        enc[0, 0] = enc[0, 0] ^ 1                                 # tells an encode from its original
+        text[enc.tobytes()] = (text.get(im.tobytes(), "") + " " if mode == "append" else "") + payload
+        return enc
+
+    def run(decode, detect):
+        monkeypatch.setattr(imprinted, "encode", encode)
+        monkeypatch.setattr(imprinted, "decode", decode)
+        monkeypatch.setattr(imprinted, "detect", detect)
+        monkeypatch.setattr(ic, "decode", lambda im: dict(found=[dict(payload=text[im.tobytes()].encode())]))
+        monkeypatch.setattr(sys, "argv", ["speed_bench.py"])
+        with pytest.raises(SystemExit) as e:
+            speed_bench.main()
+        return e.value.code, capsys.readouterr().out
+
+    code, out = run(lambda im: text.get(im.tobytes()), lambda im: im.tobytes() in text)
+    assert code == 0 and "wrong: 0 []" in out, out
+    for key in ("encode 96x64", "encode 192x128", "check 96x64", "decode file 192x128", "decode easy print",
+                "detect file", "detect plain easy print", "re-encode 1536px append 'world': mean dL* 0.50"):
+        assert key in out, key
+    code, out = run(lambda im: "nope", lambda im: True)
+    assert code == 1 and "decode file 96x64: kodim23" in out and "detect plain: kodim05" in out
+
+
+def test_readme_speed_line_is_for_this_version():
+    """README's speed line and measured table are re-measured each release (scripts/speed_bench.py,
+    sim.py --acceptance, scripts/detect_bench.py): the speed line names the version it was run on."""
+    readme = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md"), encoding="utf-8").read()
+    assert f"Speed (v{imprinted.__version__}," in readme
+
+
 if __name__ == "__main__":
     test_same_size_no_markers()
     test_found_without_border_any_orientation()

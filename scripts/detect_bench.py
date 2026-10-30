@@ -5,7 +5,9 @@ but kodim05/kodim08 hard and curled, which the decoder can't read either):
   - >= 80% confirmed by 3 s, >= 95% by 10 s,
   - 0 false alarms (and report the clean pictures' best sync z: it must stay well under QUICK_Z).
 
-    python scripts/detect_bench.py [cases.pkl]     # builds the cases on first run (a few minutes)
+    python scripts/detect_bench.py [--cpu] [cases.pkl]     # builds the cases on first run (a few minutes)
+
+--cpu: see benchclock.py (CPU seconds on one thread instead of wall time).
 
 The 200 real photos used on 2026-10-29 (0 false alarms, best z 5.11) are the owner's own and not
 in the repo; this bench uses simulated prints of unencoded testdata pictures instead."""
@@ -35,7 +37,12 @@ def build():
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(T, "..", "results", "detect_cases.pkl")
+    args = sys.argv[1:]
+    clock = time.perf_counter
+    if args[:1] == ["--cpu"]:
+        from benchclock import use_cpu_clock
+        args, clock = args[1:], use_cpu_clock()
+    path = args[0] if args else os.path.join(T, "..", "results", "detect_cases.pkl")
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         pickle.dump(build(), open(path, "wb"))
@@ -45,9 +52,9 @@ def main():
     pos, neg = [], []
     for lab, name, im in cases:
         zs = []
-        t0 = time.perf_counter()
+        t0 = clock()
         hit = ic.quick_check(im, trace=lambda e, c, v: e == "sync" and zs.append(v))
-        dt = time.perf_counter() - t0
+        dt = clock() - t0
         (pos if lab else neg).append((name, bool(hit), dt, max(zs, default=0.0)))
         print(f"{'+' if lab else '-'} {'HIT ' if hit else 'miss'} {dt:5.2f}s zmax {max(zs, default=0):5.2f}  {name}", flush=True)
     spec = [p for p in pos if not oos(p[0])]
