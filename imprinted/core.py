@@ -1804,11 +1804,12 @@ def _sync_search(rgb: np.ndarray, until: float, max_seeds: int = 40) -> list:
                 model = track(lum, seed, 1, budget=SMALL_TRACK, frontier=False, until=until)
                 if model is None or model[2] < 8:
                     continue
-                z = _sync_read(lum, model, 4, 1)
+                z, twin = _sync_read(lum, model, 4, 1)
                 if SMALL_HINT <= z < QUICK_Z and (model := track(lum, seed, 1, until=until)):
-                    z = max(z, _sync_read(lum, model, 4, 1))     # close: the whole lattice settles it
+                    z, twin = max((z, twin), _sync_read(lum, model, 4, 1))   # close: the whole lattice settles it
                 if z >= QUICK_Z:
-                    return [(z, *seed[1:])]
+                    s = -1 if twin else 1                         # facing the twin that read, as quick_check's
+                    return [(z, seed[1], s * seed[2], s * seed[3])]
     return []
 
 
