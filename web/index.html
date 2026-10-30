@@ -54,7 +54,7 @@
 </head>
 <body>
 <main>
-  <h1>Imprinted: invisible, print/camera-robust image codes</h1>
+  <h1>Imprinted</h1>
   <nav>
     <button data-tab="enc" class="on">Encode</button>
     <button data-tab="dec">Decode</button>
@@ -64,12 +64,12 @@
   <section id="enc" class="on">
     <label>Image</label>
     <input type="file" id="e-file" accept="image/*">
-    <label>Payload text (max 32 bytes; shorter = more robust): <span id="e-bytes"></span></label>
+    <label>Payload text <span id="e-bytes"></span></label>
     <input type="text" id="e-text" value="IMPRINT1">
     <div class="row">
-      <div><label>Strength δ: <span id="e-dv">auto</span> (auto = strongest that stays invisible; lower = less visible)</label>
+      <div><label>Strength δ: <span id="e-dv">auto</span></label>
         <input type="range" id="e-delta" min="0" max="4" step="0.25" value="0" style="width:100%"></div>
-      <div><label>Print width (cm), sets the cell size</label><input type="number" id="e-width" value="15" min="3" step="0.5"></div>
+      <div><label>Print width (cm)</label><input type="number" id="e-width" value="15" min="3" step="0.5"></div>
       <div><label>If the picture is already Imprinted</label>
         <label class="inline"><input type="radio" name="e-mode" value="override" checked> Override: replace its text</label>
         <label class="inline"><input type="radio" name="e-mode" value="append"> Append: add this after its text</label></div>
@@ -79,22 +79,22 @@
   </section>
 
   <section id="dec">
-    <label>Photo or scan of the printed picture (no border needed: background, rotation, mirroring, even cropping are fine; fill the frame and keep it sharp)</label>
+    <label>Photo or scan of the printed picture</label>
     <input type="file" id="d-file" accept="image/*">
-    <label>Condition label, optional (e.g. "30deg, lamp, 40cm")</label>
+    <label>Label (optional)</label>
     <input type="text" id="d-label">
-    <label class="inline"><input type="checkbox" id="d-every"> Find every copy (a photo of the strength-ladder page); otherwise stop at the first text read</label>
+    <label class="inline"><input type="checkbox" id="d-every"> Find every copy (strength-ladder page)</label>
     <button class="go" id="d-go">Decode</button>
     <div class="out" id="d-out"></div>
   </section>
 
   <section id="lad">
-    <p>Makes one A4 page with your picture encoded at strengths 0.75, 1, 1.5 and 2 (the default picks ~0.8 for busy pictures, ~1.2 for smooth ones), labelled with plain text.
+    <p>Makes one A4 page with your picture encoded at strengths 0.75, 1, 1.5 and 2.
        Print it at <b>100% / actual size</b>, check which ones you can see, then photograph the page and
        decode it: each decoded copy reports its strength (payload <code>d1.5…</code>).</p>
     <label>Image</label>
     <input type="file" id="l-file" accept="image/*">
-    <label>Tag added to each payload (optional, a few characters)</label>
+    <label>Payload tag (optional)</label>
     <input type="text" id="l-tag" maxlength="8">
     <button class="go" id="l-go">Make test page</button>
     <div class="out" id="l-out"></div>
@@ -301,7 +301,7 @@ $('e-go').onclick = async () => {
         const t = $('e-tries'), s = ev.stats; t.hidden = false; pill('tried', 'done');
         t.insertAdjacentHTML('beforeend', `<tr><td>${tries}</td><td>${s.delta}</td><td>${s.ssim}</td><td>${s.mean_dL}</td><td>${pct(s.wrong_cells)}</td>
           <td class="${ev.ok ? 'ok' : 'bad'}">${ev.ok ? '✓ invisible enough' : '✗ too visible'}</td><td>${(ev.ms / 1000).toFixed(2)} s</td></tr>`);
-        say(`Try ${tries}: δ ${s.delta} is ${ev.ok ? '<span class="ok">within</span>' : '<span class="bad">over</span>'} the visibility budget (SSIM ≥ 0.955, mean ΔL* ≤ 0.99)`);
+        say(`Try ${tries}: δ ${s.delta} is ${ev.ok ? '<span class="ok">within</span>' : '<span class="bad">over</span>'} the visibility budget`);
         return;
       }
       if (ev.cells) { ev.cellsImg = await loadImg(ev.cells); layout = ev; }
@@ -354,7 +354,7 @@ $('e-go').onclick = async () => {
 // check's probes and sync tests go on ctx, the tracker's probes, fitted grid and cells on gctx (the
 // read's drawings play in order, each as long as its animation), the seed being read pulses on fctx
 const LEGEND = `<div class="legend"><b>check:</b><span><i style="background:#3fa7ff"></i>grid locks</span><span><i style="background:#ffb020"></i>weak lock</span><span><i style="background:#999"></i>no lock</span>
-      <b>read:</b><span><i style="background:#2bd96b"></i>probe locked</span><span><i style="background:#e05555"></i>probe missed</span><span><i style="background:#3fd0ff"></i>fitted grid</span><span><i style="background:#3fa7ff;border-radius:2px"></i>sync cell</span><span><i style="background:#2bd96b;border-radius:2px"></i>bit read right</span><span><i style="background:#ff4d4d;border-radius:2px"></i>bit read wrong (corrected)</span></div>`;
+      <b>read:</b><span><i style="background:#2bd96b"></i>probe locked</span><span><i style="background:#e05555"></i>probe missed</span><span><i style="background:#3fd0ff"></i>fitted grid</span><span><i style="background:#3fa7ff;border-radius:2px"></i>sync cell</span><span><i style="background:#2bd96b;border-radius:2px"></i>bit read right</span><span><i style="background:#ff4d4d;border-radius:2px"></i>bit read wrong</span></div>`;
 function tracer(ctx, gctx, fctx, say, secs) {
   const t = {k: 1, probes: 0, syncs: 0, tried: 0, seed: null, queue: Promise.resolve()};
   const gr = gctx.canvas, fx = fctx.canvas;
@@ -398,7 +398,7 @@ function tracer(ctx, gctx, fctx, say, secs) {
       t.tried++; t.seed = ev.xy; dot(ev.xy, 3, 'rgba(43,217,107,.6)');
     } else if (ev.e === 'twin') {
       later(() => { locked = []; missed = []; lines = []; t.seed = ev.xy; redraw();
-        say(`Spot ${t.tried}: following the hidden grid probe by probe from here${ev.sgn < 0 ? ', the lattice turned 180° (the pilot alone can\'t tell which way up it is)' : ''} · ${secs()}`); });
+        say(`Spot ${t.tried}: following the hidden grid probe by probe from here${ev.sgn < 0 ? ', turned 180°' : ''} · ${secs()}`); });
     } else if (ev.e === 'try') {
       later(() => { (ev.ok ? locked : missed).push(ev.xy);
         gctx.fillStyle = ev.ok ? '#2bd96b' : 'rgba(224,85,85,.75)'; gctx.beginPath(); gctx.arc(ev.xy[0] * t.k, ev.xy[1] * t.k, ev.ok ? 2.2 : 1.6, 0, 7); gctx.fill();
@@ -407,14 +407,14 @@ function tracer(ctx, gctx, fctx, say, secs) {
     } else if (ev.e === 'tracked' || ev.e === 'refined') {
       later(() => { if (!ev.lines.length) return say(`Spot ${t.tried}: the grid didn't track from here · ${secs()}`);
         lines = ev.lines; lineCol = ev.e === 'tracked' ? '#3fd0ff' : '#b07cff';
-        say(ev.e === 'tracked' ? `Spot ${t.tried}: fitted one map (perspective + paper curl) through ${ev.probes} locked probes · ${secs()}`
+        say(ev.e === 'tracked' ? `Spot ${t.tried}: fitted the grid through ${ev.probes} locked probes · ${secs()}`
                                : `Spot ${t.tried}: refined the map on the pilot inside every cell block · ${secs()}`);
         return frames(450, a => { redraw(); drawLines(a); }); });
     } else if (ev.e === 'cells') {
       later(() => {
         const n = ev.kind.length, cnt = [0, 0, 0, 0]; ev.kind.forEach(c => cnt[c]++);
         const col = ['#3fa7ff', '#2bd96b', '#ff4d4d', 'rgba(255,255,255,.65)'], r = Math.max(1.5, ev.cell * t.k * .3);
-        say(ev.sync_found ? `Spot ${t.tried}: averaged ${n} cells through the map; found the sync layout (z ${ev.z}): ${cnt[0]} sync cells set aside, ${n - cnt[0]} payload cells${cnt[3] ? ' — error correction found no payload in them' : `, ${cnt[2]} read wrong and fixed by error correction`} · ${secs()}`
+        say(ev.sync_found ? `Spot ${t.tried}: averaged ${n} cells through the map; found the sync layout (z ${ev.z}): ${cnt[0]} sync cells set aside, ${n - cnt[0]} payload cells${cnt[3] ? ' — no payload in them' : `, ${cnt[2]} read wrong`} · ${secs()}`
                           : `Spot ${t.tried}: averaged ${n} cells through the map, but no sync layout in them (z ${ev.z}) · ${secs()}`);
         let shown = 0;
         return frames(Math.min(1200, 300 + n / 2), a => {
@@ -494,7 +494,7 @@ $('d-go').onclick = async () => {
 function result(j) {
   const head = j.found.length
     ? j.found.map((f, i) => `<div class="big ok">#${i + 1} ✓ ${esc(f.text)}</div>` + kv({
-        'raw cell error': pct(f.raw_ber) + ' (fixed by error correction)', 'cells read': `${f.cells} (${f.tiles} payload tiles)`,
+        'raw cell error': pct(f.raw_ber), 'cells read': `${f.cells} (${f.tiles} payload tiles)`,
         'photo px / sub-block': f.photo_px_per_subblock, 'mirrored photo': f.mirrored ? 'yes' : 'no'})).join('')
     : `<div class="big bad">✗ nothing decoded</div>
        <p class="note">${j.tried ? `Sync candidates: ${j.seeds}, tried ${j.tried}. ` : 'The quick check found no hidden sync pattern: not Imprinted, or too blurred or small to tell. '}Try: closer so the picture fills the frame, sharper focus, less glare.</p>`;

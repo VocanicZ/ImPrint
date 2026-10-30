@@ -3,14 +3,27 @@
 # release with the same files. Asks for your PyPI API token (pypi-...) without echoing it;
 # nothing is saved. Bump __version__ in imprinted/__init__.py and push first: PyPI refuses a
 # version it already has, and the release must point at code that is on GitHub.
+# A new major version (README "Versioning") also keeps the previous major on a branch named after
+# its last release (1.0.0 -> branch 0.7.1). The README must be finished first: the script stops
+# if README.md or its figure (versus.png, stamped with the version) hasn't changed since the last
+# release. --force publishes anyway.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+force=0; [ "${1:-}" = "--force" ] && force=1
 ver=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' imprinted/__init__.py)
 git fetch -q origin
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "commit your changes first"; exit 1; }
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "push main first (HEAD != origin/main)"; exit 1; }
 ! git rev-parse -q --verify "refs/tags/v$ver" >/dev/null || { echo "v$ver is already tagged: bump __version__"; exit 1; }
 [ -x .venv/bin/python ] || python3 -m venv .venv
+prev=$(git tag -l 'v*' --sort=-v:refname | head -1); prev=${prev#v}   # the last release before this one
+if [ -n "$prev" ] && [ $force = 0 ]; then
+  for f in README.md versus.png; do
+    git diff --quiet "v$prev" HEAD -- "$f" || continue
+    echo "WARNING: $f is unchanged since v$prev: update the README (versus.png: scripts/readme_image.py) first, or run with --force"
+    exit 1
+  done
+fi
 .venv/bin/pip install -q -U build twine
 rm -rf dist build imprinted.egg-info
 .venv/bin/python -m build
@@ -20,4 +33,8 @@ echo
 TWINE_USERNAME=__token__ TWINE_PASSWORD="$token" .venv/bin/twine upload dist/*
 git tag -a "v$ver" -m "imprinted $ver"
 git push -q origin "v$ver"
+if [ -n "$prev" ] && [ "${ver%%.*}" != "${prev%%.*}" ] && ! git ls-remote -q --exit-code --heads origin "$prev" >/dev/null; then
+  git push -q origin "v$prev^{commit}:refs/heads/$prev"           # new major: keep the old one on its branch
+  echo "major ${prev%%.*} kept on branch $prev"
+fi
 gh release create "v$ver" dist/* --verify-tag --title "v$ver" --generate-notes

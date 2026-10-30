@@ -1,174 +1,113 @@
-# Imprinted: invisible, camera-robust data in images
+# Imprinted
+
+[![PyPI](https://img.shields.io/pypi/v/imprinted)](https://pypi.org/project/imprinted/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
+Hide up to 32 bytes in a picture, invisibly, and read them back from the file or from a phone photo of a print or screen.
 
 ![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](https://raw.githubusercontent.com/VocanicZ/Imprinted/main/versus.png)
 
-*Made by `scripts/readme_image.py` with the current encoder: kodim23 at default strength, payload `Imprinted`, then printed and photographed through `sim.py`'s curled-page channel (tilt, curl, mirror, clutter, JPEG).*
+- **Invisible:** same size, no border or markers (SSIM ≥ 0.955, mean ΔL\* ≤ 1).
+- **Camera-robust:** reads from a photo at an angle, in odd light, printed in grayscale, mirrored, curled, cropped or with clutter around it.
+- **Pixels only:** survives screenshots and metadata stripping.
 
-Imprinted hides a short payload (up to 32 bytes) inside an ordinary picture. The encoded image:
+The payload is plain bytes checked by CRC-32, not encrypted or signed. Typical uses: provenance tags, case IDs, leak forensics, linking a print to its record.
 
-* **looks like the original**: same size, no border, no QR-style markers, no visible pattern (SSIM ≥ 0.955, mean ΔL\* ≤ 1 by default);
-* **decodes from the pixels alone**, not from metadata: from the file, a screenshot, a crop, or a **phone photo of a print or a screen**, at an angle, in odd light, printed in grayscale, mirrored, gently curled, with clutter around it.
-
-Typical uses: provenance tags, case or session IDs, leak forensics, linking a printed photo back to its record. The payload is plain bytes (checked by CRC-32, not encrypted or signed); bind a signature or ledger entry to it if you need proof.
-
-> Status: research prototype. The format and API may still change. Simulated results are below; real printers and phones are the final judge.
-
----
-
-## How it works
-
-The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so color shifts, white balance and grayscale printing don't matter.
-
-**Data cells.** The image is split into cells of 4×4 sub-blocks (a sub-block prints at about 0.8 mm). Each cell carries one bit as the correlation of its sub-block means with a fixed ±1 pattern. The patterns are orthogonal to flat color and linear ramps, so lighting gradients and printer drift cancel out. The bit is quantized onto a lattice (QIM): the encoder moves each cell only to the nearest lattice point that reads the right bit, so busy texture costs a small bounded nudge instead of a lost cell.
-
-**Error correction and tiling.** The payload plus CRC-32 is encoded with a rate-½ LDPC code. The codeword fills a T×T-cell tile, and the tile repeats over the whole picture, so any large enough piece decodes. The decoder soft-combines every repeat and runs belief propagation; CRC-32 rejects false reads.
-
-**Hidden sync (the invisible finder).** Instead of corner markers, four faint cosines are locked to the cell grid. Each shows up as one sharp line in the spectrum, so the decoder can find the grid (spacing, rotation, mirror, perspective) anywhere in a photo. The encoder first notches the picture's own content at those frequencies so texture can't drown them. From a spectral seed the decoder tracks the pilot outward probe by probe, fits perspective and curl, then reads the cells. When a steep tilt smears every spectral line, a grid search tries plausible local grids directly and keeps the ones neighbouring probes confirm.
-
-**Sync cells and the quick check.** A fixed pseudo-random quarter of the cells carry known bits instead of payload. The pilot is a lattice, and so is anything repetitive (halftone dots in a print, windows, fabric): those can look like a pilot, but nothing except an Imprinted picture correlates with the known bits. So `detect()` can say yes or no fast: it shrinks the photo to 2048 px, finds candidate grids from the spectrum (or, for steep tilts, a grid search), probes them, tracks the promising ones coarsely and runs a matched filter for the sync cells. It answers in stages: an Imprinted picture as soon as a tracked grid's sync cells confirm it; a picture with nothing promising under way once every candidate source has been probed (the spectrum, then the grid search at full and half scale: a busy picture's faint pilot often shows only there) is ruled out then; the rest are searched up to ten seconds. `scripts/detect_bench.py --cpu` (CPU seconds on one core) confirmed the 49 simulated prints and files within the acceptance envelope in 1.1–5.0 s: 92% by 3 s and all by 10 s, none ruled out in the first second. Its 36 simulated prints of plain pictures were all ruled out, in 1.7–10.3 s, with no false alarm (best sync z 4.17, threshold 6). `decode()` runs that check first and gives up on a picture without an Imprinted pattern in seconds, instead of searching it for minutes. A picture under 1 MP has too few sync cells for the coarse look to be sure of: `detect()` tracks its candidate grids at full resolution instead and runs the same matched filter through that map (a clean 768×512 file scores far past the threshold), and starts nothing new after seven seconds; `decode()` reads it in full. `scripts/small_bench.py --cpu` (27 encoded 768×512 files of the testdata pictures, as is, turned and cropped, and 30 small pictures without a pattern: plain, simulated prints, halftone screens, noise) got every answer right: yes in 0.7–1.8 s, no in 5.7–7.2 s; `decode()` took 1.8–77 s on the encoded ones and 10–98 s on the others. The decoder treats sync cells as erasures, and they also tell the two 180° turns of the lattice apart.
-
-**Strength.** A perceptual mask (luminance adaptation, contrast sensitivity at the printed pattern frequency, contrast masking) sets how much each pixel may change; clipped pixels (pure black, white, saturated) are never touched. By default the encoder picks the strongest overall strength δ (up to 2.4) that keeps SSIM ≥ 0.955 and mean |ΔL\*| ≤ 0.99. Smooth pictures land near δ 1.2, busy ones near δ 0.8. Pass `delta=` to force a value.
-
-### Measured (simulated)
-
-`sim.py --acceptance` on v1.0.0: 15 cm print, 5 trials, default strength, payload `IMPRINT1`, the codec's time budgets in CPU seconds on one core (`scripts/benchclock.py`). Every acceptance row passes.
-
-| image | δ | SSIM | mean ΔL\* | clean / turned / mirrored | 60% crops | print easy | gray | hard | curled |
-|---|---|---|---|---|---|---|---|---|---|
-| kodim23 (smooth) | 1.21 | 0.956 | 0.74 | all | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
-| kodim05 (busy) | 0.83 | 0.976 | 0.99 | all | 5/5 | 5/5 | 4/5 | – | – |
-| kodim08 (busy, periodic) | 0.92 | 0.979 | 0.99 | all | 5/5 | 5/5 | 5/5 | – | – |
-
-`hard` is tilt up to ~40°, 0.6 camera px per printed px, JPEG 75. `sim.py` models print (AM halftone, dot gain, grayscale) and photo (3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; confirm on real hardware with the strength ladder page.
-
-Speed (v1.0.0, `scripts/speed_bench.py --cpu` on the three testdata pictures: CPU seconds on one core, so about what one idle core takes): encoding takes 1.6–1.8 s for a 768×512 picture and 40–41 s for 3000×2000, plus the already-Imprinted check `encode()` makes first (1.9–3.1 s at 3000×2000, 7.0 s at 768×512). Decoding a clean file takes 4.0–4.8 s at 768×512 and 9.7–10.3 s at 3000×2000, and a simulated `easy` phone photo of a 15 cm print 25–28 s. `detect()` says yes in 1.0–2.6 s; it says no in 1.9–5.8 s on a photo of a plain print and in 7.0 s on a plain 768×512 file.
-
----
+> **Status:** research prototype. Results below are simulated; confirm on your printer and phone.
 
 ## Install
-
-Needs Python 3.10+ (tested on 3.12).
 
 ```bash
 pip install imprinted
 ```
 
-That installs the `imprinted` library only (numpy, opencv-python-headless, pillow). For the web UI, simulator and tests, clone the repo:
+Python 3.10+. Installs the library only. For the web UI, simulator and tests, clone the repo:
 
 ```bash
-git clone https://github.com/VocanicZ/Imprinted.git
-cd Imprinted
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+git clone https://github.com/VocanicZ/Imprinted.git && cd Imprinted
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
-On Windows use `.venv\Scripts\pip` and `.venv\Scripts\python`.
-
-## Use
-
-**Python:**
+## Usage
 
 ```python
 import imprinted
 
-imprinted.encode("photo.png", "hello", "photo_imprinted.png")   # save as PNG
-imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")   # now reads "hello world"
-imprinted.decode("phone_shot.jpg")                            # -> "hello", or None
-imprinted.detect("phone_shot.jpg")                            # -> True if it holds an Imprinted pattern
+imprinted.encode("photo.png", "hello", "photo_imprinted.png")                 # save as PNG
+imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")  # now reads "hello world"
+imprinted.decode("phone_shot.jpg")   # -> "hello", or None
+imprinted.detect("phone_shot.jpg")   # -> True if it holds an Imprinted pattern
 ```
 
-* `encode(image, payload, out=None, *, mode="override", print_width_cm=15.0, strength=None)` takes a path, PIL image or RGB uint8 array, and a `str` or `bytes` payload of 1 to 32 bytes. It returns the encoded PIL image (same size and mode) and saves it to `out` if given. Set `print_width_cm` to how wide the picture will be printed or shown: it sizes the pattern to about 0.8 mm per sub-block. `strength=None` picks the strongest setting inside the visibility budget. Raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
-  * A picture that is already Imprinted is encoded again on its own grid and at its own strength (`print_width_cm` doesn't apply), with its old text taken out first, so exactly one text reads afterwards: `mode="override"` replaces the text, `mode="append"` writes `"<old text> <payload>"` (`ValueError` if that is over 32 bytes, or if the old text doesn't read). On kodim23 that costs a little visibility: mean ΔL\* vs the original 0.82–0.83 after a re-encode at 768 px wide (0.74 for the single encode) and 0.90–0.92 at 1536 px (0.83), for override with a same-length or longer text and for append (`scripts/speed_bench.py reencode`). `mode=None` skips the check (on one core 1.9–3.1 s for a plain 3000×2000 picture, 7.0 s for a plain 768×512 one) for pictures you know are plain. `core.existing`, `core.unembed` and `core.reencode` are the parts.
-* `decode(image, raw=False, check=True)` returns the first payload found as a `str`, as `bytes` with `raw=True`, or `None` if nothing is found. It runs `detect()` first and returns `None` right away when that finds no pattern (a picture under 1 MP is read in full instead: 10–98 s on one core for the small pictures without a pattern above). Pictures made with 0.7.x have no sync cells: read those with `check=False`.
-* `detect(image)` returns `True` when the picture holds an Imprinted pattern, without reading the payload. On one core (the benches above) Imprinted pictures answered in 0.7–5.0 s and pictures without a pattern were ruled out in 1.7–10.3 s; halftone screens and other repetitive textures didn't fool it.
-
-The full codec is `imprinted.core`: `core.encode` also returns stats (strength, SSIM, mean ΔL\*, tiles), `core.decode` returns every payload found in a photo with its bit error rate and outline, and `core.make_ladder` builds the strength-test page.
-
-**Web UI** (from a clone: encode, decode, print a strength ladder; works from a phone on the same network):
-
-```bash
-.venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765
-# open http://<this-pc-ip>:8765
-```
-
-Set the print width when encoding: it picks the sub-block size so the pattern prints at about 0.8 mm. Decode attempts are logged to `results/decode_log.csv`.
-
-**Simulator:**
-
-```bash
-nice .venv/bin/python sim.py --trials 2 photo.png    # decode rates by strength x print/photo preset
-nice .venv/bin/python sim.py --acceptance            # full acceptance table, exits 0 only on PASS
-nice .venv/bin/python sim.py --quick                 # kodim23, 1 trial
-```
-
-`--acceptance` writes `acceptance.json`, each encoded image, its ×10 difference view and its strength ladder to `results/acceptance`.
-
----
-
-## Repository layout
-
-| path | what |
+| function | does |
 |---|---|
-| `imprinted/__init__.py` | the library's simple `encode` / `decode` |
-| `imprinted/core.py` | the codec: full `encode`, `decode`, `make_ladder` |
-| `pyproject.toml` | pip package (`imprinted`) |
-| `web.py`, `web/index.html` | FastAPI web UI |
-| `sim.py` | print/photo simulator and acceptance benchmark |
-| `test_imprinted.py` | test suite |
-| `testdata/` | Kodak test images (kodim05, 08, 23) |
-| `scripts/ci-local.sh` | local CI gate |
-| `scripts/readme_image.py` | regenerates `versus.png` |
-| `scripts/speed_bench.py`, `detect_bench.py`, `small_bench.py` | the speed, detection and small-picture numbers above (`--cpu`: CPU seconds on one core, `scripts/benchclock.py`) |
-| `docs/reports/` | experiment reports |
-| `imprint.py`, `utils/`, `test.py`, `PROTOTYPE.md` | the earlier color-variant (CVP) prototype with visible corner markers, kept for reference |
+| `encode(image, payload, out=None, *, mode="override", print_width_cm=15.0, strength=None)` | Encodes a path, PIL image or RGB array; returns the PIL image and saves it to `out`. `print_width_cm` is the printed width. `strength=None` picks the strongest invisible setting. An already-Imprinted picture is re-encoded on its own grid: `mode="override"` replaces its text, `"append"` adds to it, `None` skips the check. Raises `ValueError` if the picture can't carry the payload. |
+| `decode(image, raw=False, check=True)` | Returns the payload as `str` (`bytes` with `raw=True`) or `None`. Pictures made with 0.7.x need `check=False`. |
+| `detect(image)` | `True` if the picture holds an Imprinted pattern, without reading it. |
 
----
+`imprinted.core` is the full codec: stats, every payload in a photo, and `make_ladder` (a printable strength-test page).
 
-## Contributing
-
-Bug reports and PRs are welcome. Open PRs against `main`.
-
-**Reporting a bug.** Include the input image (or a small one that reproduces it), the exact command or code, the payload, and what you expected vs. what happened. For decode failures, attach the photo and say how it was taken (printer, paper size, phone, distance, angle).
-
-**Making a change.**
-
-1. Branch from `main`.
-2. Run the tests that cover your change while you work, then the full gate before you open the PR (below).
-3. If you touch the codec, run `sim.py --acceptance` and put the table in the PR. A change that makes any row FAIL needs a strong reason.
-4. If the encoder's output changes, regenerate the README figure: `.venv/bin/python scripts/readme_image.py` (exits non-zero if it no longer decodes).
-5. Use conventional commit messages (`feat:`, `fix:`, `docs:`, ...) and reference the issue (`closes #N`).
-
-There is no GitHub CI: `scripts/ci-local.sh` is the gate, and it builds `.venv` itself if missing.
-
-### Versioning
-
-Versions are `x.y.z` (`__version__` in `imprinted/__init__.py`):
-
-* **x, major:** a heavy change after which pictures made by an older major version no longer decode (a format change). Every release within one major version decodes pictures made by any other `x.*.*` release of it.
-* **y, minor:** new features or changes that keep every picture made within the same major version decoding.
-* **z, patch:** hotfixes, bug fixes and small changes.
-
-**Branches.** `main` is always the newest major version. When a new major version lands on `main`, the previous one is kept on a branch named after its last release. When 1.0.0 landed, 0.7.x moved to branch `0.7.1`. After a 2.0.0 there would be three branches: `0.7.1`, `1.y.z` (the last 1.x release) and `main` (2.x). Fixes for an older major version go on its branch, and the branch is renamed to the new last release.
-
-Before you bump `y` or `z`, check that files made by the previous release still decode (`scripts/compare_versions.py`). If they don't, the change needs a new major version.
-
-### Test loop (rtdd, then ci-local)
-
-The suite is slow (each test encodes and decodes a full image), so don't rerun all of it on every edit. [rtdd](https://github.com/VocanicZ/rtdd) keeps a per-test coverage map (`.rtdd/map.jsonl`, committed) and runs only the tests that cover your change:
+**Web UI** (encode, decode, strength ladder; works from a phone on the same network):
 
 ```bash
-rtdd which --base origin/main           # tests covering your diff + changed lines nothing covers; runs nothing
-rtdd run   --base origin/main           # run just those tests, refresh their map rows
-scripts/ci-local.sh                      # full gate before you push/merge
+.venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765    # open http://<this-pc-ip>:8765
 ```
 
-* `rtdd` runs pytest through `scripts/rtdd-pytest.sh` (adapter: `.rtdd/adapters/python.yaml`). It reuses ci-local's `.venv`, adds `pytest-cov` + `pytest-reportlog`, and runs under `nice -n 10`.
-* An empty selection is not green: the map knows nothing about that change, so run `scripts/ci-local.sh`.
-* Keep `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` at **4 or lower** (both scripts default to 4) and run sims under `nice`, e.g. `OMP_NUM_THREADS=4 nice -n 10 .venv/bin/python sim.py --trials 2 photo.png`. Unbounded BLAS threads stall everything else on a shared machine.
-* After adding or renaming tests, re-seed with `rtdd seed` (one full instrumented run) and commit `.rtdd/map.jsonl`. Never commit `.rtdd/junit.xml`, `.rtdd/meta.json` or `.coverage`.
+## How it works
 
----
+The codec (`imprinted/core.py`) only changes lightness (L\* in CIE Lab), so colour shifts and grayscale printing don't matter.
+
+- **Data cells:** the picture is split into cells of 4×4 sub-blocks (about 0.8 mm printed). Each cell carries one bit as a ±1 pattern, quantized (QIM) so busy texture costs a small nudge, not a lost bit.
+- **Error correction:** payload + CRC-32, rate-½ LDPC, in a tile repeated over the whole picture, so any large enough piece decodes.
+- **Hidden sync:** four faint cosines locked to the cell grid show as sharp spectral lines, so the decoder finds the grid at any turn, scale, mirror or perspective. It tracks the grid probe by probe, ignoring locks off the lattice, fits perspective and curl, then reads the cells.
+- **Sync cells:** a fixed pseudo-random quarter of the cells hold known bits. Repetitive textures (halftones, windows, fabric) can fake the grid but not these bits, so `detect()` answers in seconds with no false alarms.
+- **Strength:** a perceptual mask sets how much each pixel may change. The encoder picks the strongest setting within the visibility budget.
+
+## Performance
+
+`sim.py --acceptance` (v1.0.0, 15 cm print, 5 trials, default strength). All rows pass.
+
+| image | δ | SSIM | mean ΔL\* | file, turned, mirrored | 60% crop | print easy | gray | hard | curled |
+|---|---|---|---|---|---|---|---|---|---|
+| kodim23 (smooth) | 1.21 | 0.956 | 0.74 | ✓ | 5/5 | 5/5 | 5/5 | 5/5 | 5/5 |
+| kodim05 (busy) | 0.83 | 0.976 | 0.99 | ✓ | 5/5 | 5/5 | 4/5 | – | – |
+| kodim08 (busy, periodic) | 0.92 | 0.979 | 0.99 | ✓ | 5/5 | 5/5 | 5/5 | – | – |
+
+`hard`: tilt up to ~40°, 0.6 camera px per printed px, JPEG 75.
+
+Speed (v1.0.0, CPU seconds on one core, `scripts/speed_bench.py --cpu`):
+
+| task | 768×512 | 3000×2000 |
+|---|---|---|
+| encode | 1.2–1.3 s | 21–24 s |
+| already-Imprinted check (in `encode`) | 7.0 s | 2.6–3.2 s |
+| decode file | 2.4–2.9 s | 2.5–3.0 s |
+
+Decoding a simulated phone photo of a 15 cm print takes 4.7–5.6 s. `detect` says yes in 0.7–1.6 s and no in 2.8–7.0 s, with no false alarms on 66 pictures without a pattern (`scripts/detect_bench.py`, `scripts/small_bench.py`).
+
+## Development
+
+```bash
+scripts/ci-local.sh                      # test suite (the gate; there is no GitHub CI)
+rtdd run --base origin/main              # only the tests covering your change (rtdd)
+nice .venv/bin/python sim.py --acceptance   # acceptance table, exits 0 only on PASS
+.venv/bin/python scripts/readme_image.py    # regenerate versus.png
+```
+
+Keep `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` at 4 or lower and run sims under `nice`. `imprint.py`, `utils/`, `test.py` and `PROTOTYPE.md` are the earlier visible-marker prototype, kept for reference.
+
+**Contributing.** Branch from `main` and use conventional commits (`feat:`, `fix:`, …) with `closes #N`. Codec changes need a passing `sim.py --acceptance`. If the encoder's output changes, regenerate `versus.png`. Bug reports: include the image, code, payload, and how the photo was taken.
+
+**Versioning** (`x.y.z`, `__version__` in `imprinted/__init__.py`):
+
+- **x, major:** pictures from an older major version no longer decode. Every release within one major version decodes pictures from any other release of it.
+- **y, minor:** new features; same-major pictures still decode.
+- **z, patch:** fixes and small changes.
+
+Check that the previous release's pictures still decode (`scripts/compare_versions.py`) before bumping `y` or `z`. `main` is the newest major version. Each older major version lives on a branch named after its last release (`0.7.1`; after 2.0.0 also `1.y.z`).
+
+**Releasing:** update the README and `versus.png`, bump `__version__`, push `main`, then run `scripts/publish.sh`. It stops if the README or figure is unchanged since the last release (`--force` overrides), publishes to PyPI, tags, creates the GitHub release, and keeps the previous major version on its branch.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Test images in `testdata/` are from the Kodak Lossless True Color Image Suite, released for unrestricted use.
+MIT. Test images in `testdata/` are from the Kodak Lossless True Color Image Suite.
