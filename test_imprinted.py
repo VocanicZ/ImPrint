@@ -805,6 +805,30 @@ def test_every_small_picture_encode_accepts_reads_back():
     assert {(n, 768, b) for n in ("kodim08", "kodim23") for b in (2, 8)} <= accepted, accepted
 
 
+def test_make_ladder_returns_a_page_for_kodim05():
+    """The ladder fits kodim05 to its slot (1040x693 px, 19x28 cells of 36 px): at strength 0.75 that
+    copy does not read back from its clean file, which encode refuses, so make_ladder raised and
+    sim.py --acceptance crashed. Now the copy stays on the page, labelled, with reads_back False."""
+    page, stats = ic.make_ladder(kodim("kodim05"))
+    assert page.shape == (ic.PAGE_H, ic.PAGE_W, 3)
+    assert [s["delta"] for s in stats] == list(ic.LADDER_DELTAS)
+    assert [s["reads_back"] for s in stats] == [False, True, True, True], stats
+    assert (page[260:260 + 693, 150:150 + 1040] < 250).mean() > 0.5        # the 0.75 copy is on the page
+
+
+def test_web_ladder_reports_strengths_that_do_not_read_back(monkeypatch):
+    """A ladder copy that does not read back is a column in the page's stats, not a 400."""
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    import web
+    monkeypatch.setattr(ic, "decode", lambda img, **kw: {"found": []})     # no copy reads back
+    ok, png = cv2.imencode(".png", photo_like(480, 720))
+    r = TestClient(web.app).post("/api/ladder", files={"file": ("a.png", png.tobytes(), "image/png")})
+    assert r.status_code == 200, r.text
+    stats = r.json()["stats"]
+    assert [s["delta"] for s in stats] == list(ic.LADDER_DELTAS) and not any(s["reads_back"] for s in stats)
+
+
 def test_existing_finds_the_grid_with_and_without_reading():
     """existing() gives an Imprinted file's grid (so a new encode can land on it) without reading,
     and its text when asked to; a plain picture gives None (one over 1 MP: ruled out in a second)."""

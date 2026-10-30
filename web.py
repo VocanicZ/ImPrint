@@ -305,4 +305,4 @@ async def ladder(file: UploadFile = File(...), tag: str = Form("")):
     buf = io.BytesIO()
     Image.fromarray(page).save(buf, "PDF", resolution=ic.LADDER_DPI)
     return dict(pdf="data:application/pdf;base64," + base64.b64encode(buf.getvalue()).decode(),
-                stats=[{k: s[k] for k in ("delta", "ssim", "psnr", "mean_dL", "p99_dL", "tiles")} for s in stats])
+                stats=[{k: s[k] for k in ("delta", "ssim", "psnr", "mean_dL", "p99_dL", "tiles", "reads_back")} for s in stats])

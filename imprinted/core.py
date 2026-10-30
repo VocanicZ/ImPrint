@@ -547,18 +547,25 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
             else:
                 hi = d
         out, st = best or _embed(rgb, payload, DELTA_MIN, subblock_px, cache, trace)
-    rows, cols, T = st["rows"], st["cols"], st["tile"]
-    if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
-        trace("read back", None)
-        if not any(f["payload"] == payload for f in decode(out, check=False)["found"]):   # the payload, not detect
-            raise ValueError(f"picture too small to read back: encoded at this size ({rows}x{cols} cells of "
-                             f"{K * st['subblock_px']} px) it does not decode; use a larger picture, a shorter "
-                             f"text or a smaller sub-block (a wider print size)")
+    if not _reads_back(out, payload, st, trace):
+        raise ValueError(f"picture too small to read back: encoded at this size ({st['rows']}x{st['cols']} cells "
+                         f"of {K * st['subblock_px']} px) it does not decode; use a larger picture, a shorter "
+                         f"text or a smaller sub-block (a wider print size)")
     if st["wrong_cells"] > WRONG_WARN:
         warnings.warn(f"{st['wrong_cells']:.0%} of the cells read wrong in the clean file: little gamut "
                       f"headroom (clipped black/white or saturated areas), the payload may not read back",
                       RuntimeWarning, stacklevel=2)
     return out, st
+
+
+def _reads_back(out: np.ndarray, payload: bytes, st: dict, trace=lambda *a: None) -> bool:
+    """False when encode's out (stats st) is a small picture (under READ_SURE_CELLS a side or
+    READ_SURE_TILES tiles) whose clean file does not decode to payload; a larger one is not decoded."""
+    rows, cols, T = st["rows"], st["cols"], st["tile"]
+    if min(rows, cols) >= READ_SURE_CELLS and rows * cols >= READ_SURE_TILES * T * T:
+        return True
+    trace("read back", None)
+    return any(f["payload"] == payload for f in decode(out, check=False)["found"])   # the payload, not detect
 
 
 def _cell_codes(rows: int, cols: int, payload: bytes):
@@ -1928,7 +1935,9 @@ LADDER_DELTAS = (0.75, 1.0, 1.5, 2.0)   # around the budget's defaults (busy ~0.
 
 
 def make_ladder(rgb: np.ndarray, tag: str = "") -> tuple[np.ndarray, list[dict]]:
-    """A4 test page: the same picture encoded at 4 strengths (payload 'd<delta>' + tag), text labels only."""
+    """A4 test page: the same picture encoded at 4 strengths (payload 'd<delta>' + tag), text labels only.
+    A strength whose copy is too small to read back from its clean file (what encode refuses) stays on
+    the page, labelled so, with reads_back False in its stats: the page shows where reading stops."""
     page = np.full((PAGE_H, PAGE_W, 3), 255, np.uint8)
     cw, ch = 1040, 1300                    # slot for each copy (8.8 x 11 cm)
     h, w = rgb.shape[:2]
@@ -1937,11 +1946,14 @@ def make_ladder(rgb: np.ndarray, tag: str = "") -> tuple[np.ndarray, list[dict]]
     b = subblock_for_print(cw, cw / LADDER_DPI * 25.4)
     put = lambda t, x, y, s=1.0: cv2.putText(page, t, (x, y), cv2.FONT_HERSHEY_SIMPLEX, s, (0, 0, 0), 2, cv2.LINE_AA)
     put("Imprinted strength ladder - print A4 at 100%, photograph, decode", 150, 170, 1.2)
-    stats = []
+    stats, cache = [], {}                                       # the host's notch: the same at every delta
     for i, d in enumerate(LADDER_DELTAS):
-        enc, st = encode(img, f"d{d:g}{tag}".encode()[:MAX_BYTES], delta=d, subblock_px=b)
+        payload = f"d{d:g}{tag}".encode()[:MAX_BYTES]
+        enc, st = _embed(img, payload, d, b, cache)
+        st = dict(st, reads_back=_reads_back(enc, payload, st))
         x, y = 150 + (i % 2) * (cw + 100), 260 + (i // 2) * (ch + 260)
         page[y:y + enc.shape[0], x:x + enc.shape[1]] = enc
-        put(f"strength {d:g}   SSIM {st['ssim']}", x, y + enc.shape[0] + 60, 0.8)
+        put(f"strength {d:g}   SSIM {st['ssim']}" + ("" if st["reads_back"] else "   - does not read back"),
+            x, y + enc.shape[0] + 60, 0.8)
         stats.append(st)
     return page, stats
