@@ -5,7 +5,7 @@
 
 Hide up to 32 bytes in a picture, invisibly, and read them back from the file or from a phone photo of a print or screen.
 
-![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](https://raw.githubusercontent.com/VocanicZ/Imprinted/main/versus.png)
+![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
 
 - **Invisible:** same size, no border or markers (SSIM ≥ 0.955, mean ΔL\* ≤ 1).
 - **Camera-robust:** reads from a photo at an angle, in odd light, printed in grayscale, mirrored, curled, cropped or with clutter around it.

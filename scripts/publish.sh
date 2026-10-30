@@ -26,7 +26,11 @@ if [ -n "$prev" ] && [ $force = 0 ]; then
 fi
 .venv/bin/pip install -q -U build twine
 rm -rf dist build imprinted.egg-info
+# README links versus.png relatively (each branch shows its own); PyPI needs a full URL: this tag's
+cp README.md README.md.orig; trap 'mv -f README.md.orig README.md' EXIT
+sed -i "s#](versus.png)#](https://raw.githubusercontent.com/VocanicZ/Imprinted/v$ver/versus.png)#" README.md
 .venv/bin/python -m build
+mv -f README.md.orig README.md; trap - EXIT
 .venv/bin/twine check dist/*
 read -rsp "PyPI API token (pypi-...): " token
 echo
