@@ -29,7 +29,8 @@ texture made of cells, each a KxK grid of sub-blocks. On top of the cells:
   Imprinted picture correlates with them, however lattice-like its texture (halftone dots, windows),
   so they make detection certain where the pilot alone can be faked: quick_check finds a candidate
   grid, tracks it coarsely and runs their matched filter (most Imprinted pictures within a second;
-  nothing promising under way at one second rules a picture out; the rest up to ten). The decoder reads
+  nothing promising under way once every candidate source has had its look rules a picture out;
+  the rest up to ten). The decoder reads
   them as erasures, and they also tell the two 180-degree twins apart.
 
 Patterns are orthogonal to flat color and linear ramps (lighting, white balance, printer drift and
@@ -869,8 +870,9 @@ QUICK_TOP = 96              # spectral candidates quick_check probes
 QUICK_BEST = 3              # distinct grids kept per spectral region
 QUICK_LOCKS = 3             # of a probe and its 4 neighbours, this many must lock before the sync test
 QUICK_CONFIRM = 24          # locked candidates read for the sync layout, at most, per candidate source
-QUICK_REJECT = 1.0          # s: no sync read under way by now = not Imprinted (every in-spec Imprinted
-                            # picture not yet confirmed has one running; 1/4 of other pictures don't)
+QUICK_REJECT = 1.0          # s: past this, once every candidate source has been probed, no sync read
+                            # under way = not Imprinted (a busy picture's faint pilot may lock only in
+                            # the grid search's half-scale windows, seconds in)
 QUICK_PATIENCE = 10.0       # s: otherwise nothing new starts after this; out of time = not found
 QUICK_THREADS = 4           # threads that scan and probe; one more confirms (more only fight over the GIL)
 QUICK_GRACE = 0.25          # s past QUICK_PATIENCE that running confirms get
@@ -963,8 +965,8 @@ def _sync_read(img: np.ndarray, model, r: int, align: int) -> float:
 
 def quick_check(rgb: np.ndarray, patience: float = QUICK_PATIENCE, trace=None) -> list:
     """Is this picture Imprinted? At any size, turn, mirror or scale, and nothing else passes: most
-    Imprinted pictures within a second, most others ruled out by QUICK_REJECT (nothing promising
-    under way), the rest searched up to `patience` s. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
+    Imprinted pictures within a second, others ruled out once every candidate source has been
+    probed with nothing promising under way (QUICK_REJECT), the rest searched up to `patience` s. The picture is shrunk to QUICK_SIDE px (gray: the pattern only moves lightness);
     candidate grids come from its spectrum (the pilot's lines, two pyramid levels) and, failing
     those, from the grid search's central windows (steep tilts); each is probed (_locks), and one
     that locks is tracked coarsely and read for the sync layout (_sync_confirm) while probing goes
@@ -1021,6 +1023,9 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
         stop = t0 + patience + QUICK_GRACE                        # running confirms give up here
         until[...] = stop
         running, spare, hit = {}, [], None
+        # nothing promising: past QUICK_REJECT with no confirm running. Asked only once every source
+        # has been probed: a busy picture's faint pilot often shows no spectral line at all, only
+        # local grids, some only at half scale (ruled out before those, it was lost)
         hopeless = lambda: not running and time.perf_counter() - t0 > QUICK_REJECT
 
         def settled(block: float = 0.0):
@@ -1040,7 +1045,7 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
                 break
             todo, confirms = source(), 0                          # each source gets its own confirms
             for i in range(0, len(todo), 8):
-                if (hit := settled()) or late() or hopeless():
+                if (hit := settled()) or late():
                     break
                 batch = todo[i:i + 8]
                 for k, (_, c, A) in sorted(zip(pool.map(lambda t: _locks(img, t[1], t[2]), batch), batch),
@@ -1053,8 +1058,8 @@ def _quick_check(rgb: np.ndarray, patience: float, trace=lambda *a: None) -> lis
                         spare.append((c, A))
             if hit:
                 return hit
-            if hopeless():
-                return []
+        if hopeless():
+            return []
         for c, A in spare[:QUICK_CONFIRM]:                         # weaker locks last
             if late() or hopeless():
                 break

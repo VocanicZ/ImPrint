@@ -85,6 +85,18 @@ def test_sync_layout_reads_on_the_right_twin_only():
     assert right > 15 and wrong < 5 and max(zs[1], zs[3]) < 5, zs
 
 
+def test_quick_check_rules_out_only_after_every_source_had_its_look(monkeypatch):
+    """A busy picture's faint pilot often shows no spectral line at all, only local grids (some only
+    at half scale), and on a slow machine those come well past QUICK_REJECT: ruled out on the
+    spectrum alone, it was lost (0.8.0 lost busy print photos that 0.7.1 reads). Nothing promising
+    once the grid search has had its look still rules a picture out."""
+    enc, _ = ic.encode(photo_like(), b"hi", delta=2, subblock_px=6)
+    monkeypatch.setattr(ic, "_level_sync", lambda *a, **k: [])          # no spectral line anywhere
+    monkeypatch.setattr(ic, "QUICK_REJECT", 0.0)                         # a machine too slow for any of it
+    assert ic.quick_check(enc)
+    assert ic.quick_check(photo_like(seed=1)) == []
+
+
 def test_quick_check_rejects_halftone_dots_fast():
     """A halftone screen is a lattice too, and locks the pilot probes; without the sync layout it
     isn't Imprinted. And the gate gives up in bounded time, at any picture size."""
