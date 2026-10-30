@@ -72,11 +72,13 @@ On Windows use `.venv\Scripts\pip` and `.venv\Scripts\python`.
 import imprinted
 
 imprinted.encode("photo.png", "hello", "photo_imprinted.png")   # save as PNG
+imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")   # now reads "hello world"
 imprinted.decode("phone_shot.jpg")                            # -> "hello", or None
 imprinted.detect("phone_shot.jpg")                            # -> True if it holds an Imprinted pattern
 ```
 
-* `encode(image, payload, out=None, *, print_width_cm=15.0, strength=None)` takes a path, PIL image or RGB uint8 array, and a `str` or `bytes` payload of 1 to 32 bytes. It returns the encoded PIL image (same size and mode) and saves it to `out` if given. Set `print_width_cm` to how wide the picture will be printed or shown: it sizes the pattern to about 0.8 mm per sub-block. `strength=None` picks the strongest setting inside the visibility budget. Raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
+* `encode(image, payload, out=None, *, mode="override", print_width_cm=15.0, strength=None)` takes a path, PIL image or RGB uint8 array, and a `str` or `bytes` payload of 1 to 32 bytes. It returns the encoded PIL image (same size and mode) and saves it to `out` if given. Set `print_width_cm` to how wide the picture will be printed or shown: it sizes the pattern to about 0.8 mm per sub-block. `strength=None` picks the strongest setting inside the visibility budget. Raises `ValueError` when the picture is too small to read back or too clipped to carry the payload.
+  * A picture that is already Imprinted is encoded again on its own grid and at its own strength (`print_width_cm` doesn't apply), with its old text taken out first, so exactly one text reads afterwards: `mode="override"` replaces the text, `mode="append"` writes `"<old text> <payload>"` (`ValueError` if that is over 32 bytes, or if the old text doesn't read). The change from the original stays about as small as a single encode's (mean ΔL\* 0.8–0.9 on kodim23, against 1.3–1.5 when the old text was taken out whole). `mode=None` skips the check (about a second, up to eight under 1 MP) for pictures you know are plain. `core.existing`, `core.unembed` and `core.reencode` are the parts.
 * `decode(image, raw=False, check=True)` returns the first payload found as a `str`, as `bytes` with `raw=True`, or `None` if nothing is found. It runs `detect()` first and returns `None` right away when that finds no pattern. Pictures made with 0.7.x have no sync cells: read those with `check=False`.
 * `detect(image)` returns `True` when the picture holds an Imprinted pattern, without reading the payload (a picture under 1 MP is read). Most Imprinted pictures answer within a second, most others are ruled out at one, none takes much over ten, and repetitive textures don't fool it.
 

@@ -2,6 +2,7 @@
 
     import imprinted
     imprinted.encode("photo.png", "hello", "photo_imprinted.png")
+    imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")   # reads "hello world"
     imprinted.decode("phone_shot.jpg")          # -> "hello", or None
     imprinted.detect("phone_shot.jpg")          # -> True if it holds an Imprinted pattern
 
@@ -32,18 +33,30 @@ def _load(image) -> np.ndarray:
     return np.asarray(image)
 
 
-def encode(image, payload: str | bytes, out=None, *, print_width_cm: float = 15.0,
+def encode(image, payload: str | bytes, out=None, *, mode: str | None = "override", print_width_cm: float = 15.0,
            strength: float | None = None) -> Image.Image:
     """Hide payload (1..32 bytes; a str is UTF-8 encoded) in image (a path, PIL image or RGB uint8
     array). Returns the encoded picture (same size and mode) and saves it to out when given; save
     it lossless (PNG). print_width_cm: how wide it will be printed or shown, which sets the pattern
     size. strength: None takes the strongest within the visibility budget (SSIM >= 0.955, mean
-    dL* <= 0.99). ValueError when the picture is too small or too clipped to carry the payload."""
+    dL* <= 0.99). ValueError when the picture is too small or too clipped to carry the payload.
+
+    An image that is already Imprinted is encoded again on its own grid and at its own strength
+    (print_width_cm doesn't apply), with its old text taken out first, so exactly one text reads:
+    mode "override" writes payload, "append" writes "<old text> <payload>" (ValueError over 32
+    bytes, or if the old text doesn't read). mode None skips that check (it takes a second, up to
+    eight on a picture under 1 MP) for pictures known to be plain."""
+    if mode not in ("override", "append", None):
+        raise ValueError(f"mode must be 'override', 'append' or None, not {mode!r}")
     rgb = _load(image)
     if isinstance(payload, str):
         payload = payload.encode()
-    b = core.subblock_for_print(rgb.shape[1], print_width_cm * 10)
-    enc, _ = core.encode(rgb, payload, delta=strength, subblock_px=b)
+    old = core.existing(rgb, read=True) if mode else None
+    if old:
+        enc, _, _ = core.reencode(rgb, payload, old, mode, delta=strength)
+    else:
+        b = core.subblock_for_print(rgb.shape[1], print_width_cm * 10)
+        enc, _ = core.encode(rgb, payload, delta=strength, subblock_px=b)
     img = Image.fromarray(enc)
     if out is not None:
         img.save(out)

@@ -572,21 +572,80 @@ def _cell_codes(rows: int, cols: int, payload: bytes):
     return np.where(on[:, None, None], sp, D), np.where(on, sb, s), on
 
 
+def _file_unit(lum: np.ndarray, rows: int, cols: int, c: int) -> float:
+    """The data lattice unit of an Imprinted file's cells (lum: whole cells only), as encode set it:
+    the median pilot amplitude at PILOT = 1 (the encode's notch left only the pilot at its lines)."""
+    pa = pilot_amp(lum, rows, cols, c)
+    return float(np.median(pa[pa > 0])) / PILOT if (pa > 0).any() else 1.0
+
+
 def unembed(img: np.ndarray, payload: bytes, subblock_px: int) -> np.ndarray:
-    """Take an encode of payload back out of img (an Imprinted file, uncropped, at subblock_px): each
-    cell loses its component along that cell's pattern, so the old bits no longer read. Encoding on
-    top without this leaves both texts readable (the decoder returns whichever it reaches first);
-    the next encode's notch replaces the old pilot. Same size and layout as img."""
+    """Take an encode of payload back out of img (an Imprinted file, uncropped, at subblock_px), so
+    the old bits no longer read: encoding on top without this leaves both texts readable (the
+    decoder returns whichever it reaches first). Only the old nudge goes, not the host: each payload
+    cell's correlation with its pattern moves to the nearest bit flip of the data lattice, where it
+    says nothing (to 0 within a step of it: there the plain sign would still be the old bit). Sync
+    cells stay (the layout is the same for every payload), and the next encode's notch replaces the
+    old pilot. The change follows the encoder's mask. Same size and layout as img."""
     rgb = as_rgb(img)
     b = int(subblock_px)
     c = K * b
     rows, cols = rgb.shape[0] // c, rgb.shape[1] // c
-    D, _, _ = _cell_codes(rows, cols, payload)
+    D, _, on = _cell_codes(rows, cols, payload)
     lab = to_lab(rgb)
     lum = lab[:rows * c, :cols * c, 0]                          # view into lab
-    unit = measure(field(np.ones(rows * cols, np.float32), rows, cols, b, D), rows, cols, b, D)
-    lum -= field((measure(lum, rows, cols, b, D) / unit).astype(np.float32), rows, cols, b, D)
+    unit = _file_unit(lum, rows, cols, c)
+    mean_cell = _cells(lum, c).mean(axis=(0, 1))               # the pilot, as encode took it out
+    u = measure(lum - np.tile(mean_cell, (rows, cols)), rows, cols, b, D) / unit
+    target = np.where(np.abs(u) < QIM_STEP, 0.0, np.round(u / QIM_STEP) * QIM_STEP)
+    m = mask(lum, b)
+    g = measure(field(np.ones(rows * cols, np.float32), rows, cols, b, D) * m, rows, cols, b, D)
+    a = np.where(on | (g <= 1e-6), 0.0, (target - u) * unit / np.maximum(g, 1e-6))
+    lum += field(a.astype(np.float32), rows, cols, b, D) * m
     return like(to_rgb(lab), img)
+
+
+def strength(img: np.ndarray, subblock_px: int) -> float:
+    """The delta an Imprinted file (uncropped, at subblock_px) was encoded at, as seen from its pilot:
+    encoding it again at this strength lands the new data on the same lattice as the old, so a cell
+    whose bit stays put doesn't move. (encode's own search would go stronger: the old pattern reads
+    to the mask as texture.) Within DELTA_MIN..DELTA_MAX."""
+    lum = to_lab(as_rgb(img))[..., 0]
+    b = int(subblock_px)
+    c = K * b
+    rows, cols = lum.shape[0] // c, lum.shape[1] // c
+    lum = lum[:rows * c, :cols * c]
+    pm = np.minimum(mask(lum, b), PILOT_HI)
+    pa = pilot_amp(pilot_field(rows * c, cols * c, c) * pm, rows, cols, c)
+    per_delta = float(np.median(pa[pa > 0])) if (pa > 0).any() else 1.0
+    return float(np.clip(_file_unit(lum, rows, cols, c) / per_delta, DELTA_MIN, DELTA_MAX))
+
+
+def reencode(img: np.ndarray, payload: bytes, old: dict, mode: str = "override", delta: float | None = None,
+             trace=None):
+    """Encode payload into an already Imprinted picture: old is existing(img, read=True). On the old
+    grid (on any other the old text stays the readable one), with the old text taken out first
+    (unembed; not needed when the new text's tile is the same size: the same patterns, so the new
+    bits overwrite the old), at the old strength (delta None: strength()). mode "override" writes
+    payload, "append" writes old + b" " + payload. Returns (image, stats, the payload written).
+    ValueError if the old text doesn't read (it can't be taken out), for an unknown mode, or when
+    the appended text is over MAX_BYTES."""
+    if mode not in ("override", "append"):
+        raise ValueError(f"mode must be 'override' or 'append', not {mode!r}")
+    if old["payload"] is None:
+        raise ValueError("this picture is already Imprinted but its text doesn't read, so it can't be "
+                         "taken out: encode the original picture instead")
+    b = old["subblock_px"]
+    if mode == "append":
+        payload = old["payload"] + b" " + payload
+        if len(payload) > MAX_BYTES:
+            raise ValueError(f"old and new text together are {len(payload)} bytes, over the "
+                             f"{MAX_BYTES}-byte limit: shorten the new text or use override")
+    host = img
+    if 1 <= len(payload) <= MAX_BYTES and tile_size(len(payload)) != tile_size(len(old["payload"])):
+        host = unembed(img, old["payload"], b)
+    out, st = encode(host, payload, delta=strength(img, b) if delta is None else delta, subblock_px=b, trace=trace)
+    return out, st, payload
 
 
 def _embed(img: np.ndarray, payload: bytes, delta: float, subblock_px: int, cache: dict | None = None,
