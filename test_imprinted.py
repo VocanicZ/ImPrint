@@ -776,6 +776,51 @@ def test_every_small_picture_encode_accepts_reads_back():
     assert {(n, 768, b) for n in ("kodim08", "kodim23") for b in (2, 8)} <= accepted, accepted
 
 
+def test_existing_finds_the_grid_with_and_without_reading():
+    """existing() gives an Imprinted file's grid (so a new encode can land on it) without reading,
+    and its text when asked to; a plain picture gives None (one over 1 MP: ruled out in a second)."""
+    enc, _ = ic.encode(photo_like(), b"hello", subblock_px=6)
+    assert ic.existing(enc) == dict(subblock_px=6, payload=None)
+    assert ic.existing(enc, read=True) == dict(subblock_px=6, payload=b"hello")
+    assert ic.existing(photo_like(1080, 1620, seed=1)) is None
+
+
+def test_unembed_takes_out_only_the_old_nudge():
+    """unembed() leaves no readable old text, at under 0.6x the encode's own change: it moves each
+    payload cell to the nearest bit flip instead of taking out the cell's whole component along
+    its pattern, which took the host's share too (0.74x of the encode on kodim23, 1.24x on kodim05)."""
+    img = kodim("kodim23")
+    enc, st = ic.encode(img, b"hello", subblock_px=4)
+    host = ic.unembed(enc, b"hello", 4)
+    assert host.shape == enc.shape
+    assert ic.visibility(enc, host)["mean_dL"] <= 0.6 * st["mean_dL"], (ic.visibility(enc, host), st)
+    assert b"hello" not in [f["payload"] for f in ic.decode(host, check=False)["found"]]
+    assert ic.strength(enc, 4) == pytest.approx(st["delta"], rel=0.1)       # the old strength, from its pilot
+
+
+def test_reencode_leaves_exactly_one_text_close_to_the_original():
+    """Encoding an Imprinted picture again (the library as the web does it): override leaves only
+    the new text, append only "old new", and the change from the original stays near a single
+    encode's (it was 1.3-1.5 mean dL* when unembed took each cell's whole component out and the
+    new encode's strength search read the old pattern as texture and went 60% stronger). A new
+    text with a tile of the same size overwrites the old on the same patterns: no unembed."""
+    for w, cases in ((768, (("override", "a longer new text", "a longer new text"),
+                            ("append", "world", "hello world"), ("override", "world", "world"))),
+                     (1536, (("override", "a longer new text", "a longer new text"),))):
+        orig = kodim("kodim23", w * 2 // 3, w) if w != 768 else kodim("kodim23")
+        enc = np.asarray(imprinted.encode(orig, "hello"))
+        for mode, text, want in cases:
+            out = np.asarray(imprinted.encode(enc, text, mode=mode))
+            assert [f["payload"] for f in ic.decode(out)["found"]] == [want.encode()], (w, mode, text)
+            assert ic.visibility(orig, out)["mean_dL"] <= 1.1, (w, mode, text, ic.visibility(orig, out))
+    with pytest.raises(ValueError, match="32-byte"):
+        imprinted.encode(enc, "x" * 30, mode="append")
+    with pytest.raises(ValueError, match="mode"):
+        imprinted.encode(enc, "x", mode="replace")
+    with pytest.raises(ValueError, match="doesn't read"):
+        ic.reencode(enc, b"x", dict(subblock_px=8, payload=None))
+
+
 def test_grayscale_and_rgba_pictures_round_trip():
     """Grayscale in, grayscale out; RGBA keeps its alpha; both decode. Other shapes: ValueError."""
     rgb = photo_like(360, 540)
