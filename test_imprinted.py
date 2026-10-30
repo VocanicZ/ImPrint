@@ -757,6 +757,25 @@ def test_encode_rejects_pictures_too_small_to_read_back():
     assert found and found[0]["payload"] == b"hello", st
 
 
+def test_every_small_picture_encode_accepts_reads_back():
+    """Default settings, the testdata pictures at 512-768 px wide, 2/8/16-byte payloads: encode either
+    refuses (too small) or returns a file that decodes. kodim05 at 768x512 with b"hi" (16x24 cells)
+    was accepted and read nothing: READ_SURE_CELLS predated the sync cells' quarter of every tile.
+    The ones that read back are not refused."""
+    accepted = set()
+    for name in ("kodim05", "kodim08", "kodim23"):
+        for w in (512, 640, 768):
+            for p in (b"hi", b"IMPRINT1", b"0123456789abcdef"):
+                try:
+                    enc, st = ic.encode(kodim(name, w * 2 // 3, w), p)
+                except ValueError as e:
+                    assert "too small" in str(e), (name, w, p, e)
+                    continue
+                assert any(f["payload"] == p for f in ic.decode(enc)["found"]), (name, w, p, st)
+                accepted.add((name, w, len(p)))
+    assert {(n, 768, b) for n in ("kodim08", "kodim23") for b in (2, 8)} <= accepted, accepted
+
+
 def test_grayscale_and_rgba_pictures_round_trip():
     """Grayscale in, grayscale out; RGBA keeps its alpha; both decode. Other shapes: ValueError."""
     rgb = photo_like(360, 540)
