@@ -296,7 +296,7 @@ $('e-go').onclick = async () => {
         $('e-s-' + st).style.cursor = 'pointer'; $('e-s-' + st).onclick = () => show(st); }
     } else if (ev.e === 'error') {
       fail('Encoding failed', ev.detail);
-    } else if (check) {
+    } else if (check && ev.e !== 'done') {
       if (ev.e === 'seed') say(`Reading its text: trying spot ${check.tried + 1} · ${secs()}`);
       await check.draw(ev);
     } else if (ev.e === 'done') {
