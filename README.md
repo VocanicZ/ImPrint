@@ -94,7 +94,7 @@ nice .venv/bin/python sim.py --acceptance   # acceptance table, exits 0 only on 
 .venv/bin/python scripts/readme_image.py    # regenerate versus.png
 ```
 
-Keep `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` at 4 or lower and run sims under `nice`. `imprint.py`, `utils/`, `test.py` and `PROTOTYPE.md` are the earlier visible-marker prototype, kept for reference.
+Keep `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` at 4 or lower and run sims under `nice`.
 
 **Contributing.** Branch from `main` and use conventional commits (`feat:`, `fix:`, …) with `closes #N`. Codec changes need a passing `sim.py --acceptance`. If the encoder's output changes, regenerate `versus.png`. Bug reports: include the image, code, payload, and how the photo was taken.
 
