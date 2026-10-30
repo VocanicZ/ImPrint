@@ -814,6 +814,68 @@ def test_existing_finds_the_grid_with_and_without_reading():
     assert ic.existing(photo_like(1080, 1620, seed=1)) is None
 
 
+def test_existing_traces_the_check_and_the_read():
+    """existing(trace=) streams what decode(trace=) does (the encode page draws it): quick_check's
+    probes and sync reads, the verdict, then the read's seeds, probes, cells and payload; a plain
+    picture only the probes and a verdict of None."""
+    enc, _ = ic.encode(photo_like(), b"hello", subblock_px=6)
+    seen = []
+    assert ic.existing(enc, read=True, trace=lambda e, c, v: seen.append((e, v)))["payload"] == b"hello"
+    events = [e for e, _ in seen]
+    i = events.index("checked")
+    assert {"probe", "sync"} <= set(events[:i]) and seen[i][1] is not None
+    assert {"seed", "try", "tracked", "cells", "found"} <= set(events[i + 1:])
+    seen.clear()
+    assert ic.existing(photo_like(1080, 1620, seed=1), read=True, trace=lambda e, c, v: seen.append((e, v))) is None
+    assert "probe" in [e for e, _ in seen] and seen[-1] == ("checked", None)
+
+
+def test_web_encode_streams_the_check_like_the_decode_page():
+    """The encode endpoint's step 0 forwards existing()'s events converted as the decode endpoint
+    converts them (one shared conversion): probes, sync reads, the verdict, the read's grid lines and
+    cells, before the encoder's stages."""
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    import web
+    enc, _ = ic.encode(photo_like(), b"old", subblock_px=6)
+    ok, png = cv2.imencode(".png", cv2.cvtColor(enc, cv2.COLOR_RGB2BGR))
+    r = TestClient(web.app).post("/api/encode", files={"file": ("a.png", png.tobytes(), "image/png")},
+                                 data={"text": "new", "mode": "override"})
+    evs = [json.loads(line) for line in r.text.splitlines()]
+    names = [ev["e"] for ev in evs]
+    assert names[-1] == "done", evs[-1]
+    i, j = names.index("checked"), names.index("existing")
+    assert {"probe", "sync"} <= set(names[:i]) and evs[i]["ok"] and i < j
+    assert {"seed", "try", "tracked", "cells", "found"} <= set(names[i:j])
+    assert j < names.index("stage", j)                             # then the usual stages
+    probe = next(ev for ev in evs if ev["e"] == "probe")
+    assert probe == web.trace_event("probe", probe["xy"], probe["locks"])
+    cells = next(ev for ev in evs if ev["e"] == "cells")
+    assert set(cells) >= {"xy", "kind", "cell", "z", "sync_found"}
+    tracked = next(ev for ev in evs if ev["e"] == "tracked" and ev["lines"])
+    assert len(tracked["lines"][0][0]) == 2
+
+
+def test_web_decode_streams_the_same_events(tmp_path, monkeypatch):
+    """The decode endpoint streams the decoder's events through the same conversion as the encode
+    page's check: probes, the verdict, the read, the payload found, then the result."""
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    import web
+    monkeypatch.setattr(web, "LOG", tmp_path / "log.csv")
+    enc, _ = ic.encode(photo_like(), b"hello", subblock_px=6)
+    ok, png = cv2.imencode(".png", cv2.cvtColor(enc, cv2.COLOR_RGB2BGR))
+    r = TestClient(web.app).post("/api/decode", files={"file": ("a.png", png.tobytes(), "image/png")})
+    evs = [json.loads(line) for line in r.text.splitlines()]
+    names = [ev["e"] for ev in evs]
+    assert names[0] == "preview" and names[-1] == "done" and evs[-1]["found"][0]["text"] == "hello"
+    i = names.index("checked")
+    assert "probe" in names[:i] and evs[i]["ok"] and {"seed", "try", "cells", "found"} <= set(names[i:])
+    assert next(ev for ev in evs if ev["e"] == "found")["text"] == "hello"
+    assert web.trace_event("unknown", None, None) is None
+    assert "hello" in (tmp_path / "log.csv").read_text()
+
+
 def test_unembed_takes_out_only_the_old_nudge():
     """unembed() leaves no readable old text, at under 0.6x the encode's own change: it moves each
     payload cell to the nearest bit flip instead of taking out the cell's whole component along

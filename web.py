@@ -147,7 +147,8 @@ def gray(a: np.ndarray, signed: bool, top: np.ndarray) -> tuple[np.ndarray, floa
 async def encode(request: Request, file: UploadFile = File(...), text: str = Form(...), delta: float = Form(0.0),
                  width_cm: float = Form(15.0), mode: str = Form("override")):
     """delta <= 0: the encoder's default, the strongest within its visibility budget. Streams the
-    encoder's stages as it computes them (their working data, once: later strengths only rescale
+    check for an older pattern as the decode endpoint streams it (probes, sync reads, the verdict and,
+    if found, the read), then the encoder's stages as it computes them (their working data, once: later strengths only rescale
     it), each strength tried, then the result. A picture that is already Imprinted is encoded again
     (core.reencode: on its own grid, at its own strength, with its old text taken out first, else
     both read, or only the old one): mode "override" replaces the text, "append" encodes "old new"."""
@@ -182,7 +183,7 @@ async def encode(request: Request, file: UploadFile = File(...), text: str = For
 
         nonlocal b, message
         put(dict(e="stage", stage="check", ms=round((time.time() - t0) * 1000)))
-        old = ic.existing(rgb, read=True)
+        old = ic.existing(rgb, read=True, trace=forward(put))      # its events drawn as on the decode page
         put(dict(e="existing", found=old is not None, ms=round((time.time() - t0) * 1000),
                  **(dict(subblock_px=old["subblock_px"], old=None if old["payload"] is None else
                          old["payload"].decode("utf-8", "replace")) if old else {})))
@@ -238,6 +239,35 @@ def read_cells(info: dict) -> dict:
                 z=round(float(info["z"]), 1), sync_found=info["sync"] is not None)
 
 
+def trace_event(ev: str, c, v) -> dict | None:
+    """A decoder trace event (core.decode's docstring) as the JSON line the page draws, or None."""
+    if ev == "probe":
+        return dict(e=ev, xy=xy(c), locks=int(v))
+    if ev == "sync":
+        return dict(e=ev, xy=xy(c), z=round(float(v), 1))
+    if ev == "checked":
+        return dict(e=ev, ok=v is not None, **(dict(z=round(float(v[0]), 1), xy=xy(v[1]), e1=xy(v[2]),
+                                                    e2=xy(v[3])) if v is not None else {}))
+    if ev == "seed":
+        return dict(e=ev, xy=xy(c))
+    if ev == "twin":
+        return dict(e=ev, xy=xy(c), sgn=int(v))
+    if ev == "try":
+        return dict(e=ev, xy=xy(c), ok=bool(v))
+    if ev in ("tracked", "refined"):
+        return dict(e=ev, lines=grid_lines(v) if v else [], probes=int(v[2]) if v else 0)
+    if ev == "cells":
+        return dict(e=ev, **read_cells(v))
+    if ev == "found":
+        return dict(e=ev, **payload(v))
+    return None
+
+
+def forward(put):
+    """A core trace function that puts each decoder event as trace_event converts it."""
+    return lambda ev, c, v: (j := trace_event(ev, c, v)) is not None and put(j)
+
+
 @app.post("/api/decode")
 async def decode(request: Request, file: UploadFile = File(...), label: str = Form("")):
     """Streams JSON lines as the decoder works: the photo's preview, each quick-check probe and
@@ -245,29 +275,8 @@ async def decode(request: Request, file: UploadFile = File(...), label: str = Fo
     rgb = read_rgb(await file.read())
 
     def work(put):
-        def trace(ev, c, v):
-            if ev == "probe":
-                put(dict(e=ev, xy=xy(c), locks=int(v)))
-            elif ev == "sync":
-                put(dict(e=ev, xy=xy(c), z=round(float(v), 1)))
-            elif ev == "checked":
-                put(dict(e=ev, ok=v is not None, **(dict(z=round(float(v[0]), 1), xy=xy(v[1]), e1=xy(v[2]),
-                                                      e2=xy(v[3])) if v is not None else {})))
-            elif ev == "seed":
-                put(dict(e=ev, xy=xy(c)))
-            elif ev == "twin":
-                put(dict(e=ev, xy=xy(c), sgn=int(v)))
-            elif ev == "try":
-                put(dict(e=ev, xy=xy(c), ok=bool(v)))
-            elif ev in ("tracked", "refined"):
-                put(dict(e=ev, lines=grid_lines(v) if v else [], probes=int(v[2]) if v else 0))
-            elif ev == "cells":
-                put(dict(e=ev, **read_cells(v)))
-            elif ev == "found":
-                put(dict(e=ev, **payload(v)))
-
         t = time.time()
-        r = ic.decode(rgb, trace=trace)
+        r = ic.decode(rgb, trace=forward(put))
         found = [payload(f) for f in r["found"]]
         secs = round(time.time() - t, 1)
         log(label, rgb, found, secs)
