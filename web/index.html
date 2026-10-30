@@ -173,21 +173,26 @@ $('e-go').onclick = async () => {
   btn.disabled = true;
   out.innerHTML = `<div class="steps">${Object.entries(STAGES).map(([k, [n, t]]) => `<span id="e-s-${k}">${n} · ${t}</span>`).join('')}</div>
     <div class="status" id="e-status">Uploading…</div>
-    <div class="stage"><canvas id="e-cv" class="cmp"></canvas><canvas id="e-fx" class="fx"></canvas></div>
+    <div class="stage"><canvas id="e-cv" class="cmp"></canvas><canvas id="e-gr" class="fx"></canvas><canvas id="e-fx" class="fx"></canvas></div>
+    <div id="e-legend">${LEGEND}</div>
     <div class="zoom"><canvas id="e-zoom" width="256" height="256"></canvas><div><div id="e-cap"></div><div class="note" id="e-zcap"></div></div></div>
     <table id="e-tries" hidden><tr><th>try</th><th>strength δ</th><th>SSIM</th><th>mean ΔL*</th><th>cells reading wrong</th><th>verdict</th><th>at</th></tr></table>
     <div id="e-res"></div>`;
   const fd = new FormData();
   const mode = document.querySelector('input[name=e-mode]:checked').value;
   for (const [k, v] of Object.entries({file: f, text: $('e-text').value, delta: $('e-delta').value, width_cm: $('e-width').value, mode})) fd.append(k, v);
-  const cv = $('e-cv'), fx = $('e-fx'), zoom = $('e-zoom'), ctx = cv.getContext('2d'), fctx = fx.getContext('2d'), zctx = zoom.getContext('2d');
-  const say = h => $('e-status').innerHTML = h, t0 = performance.now();
+  const cv = $('e-cv'), gr = $('e-gr'), fx = $('e-fx'), zoom = $('e-zoom'), ctx = cv.getContext('2d'), gctx = gr.getContext('2d'), fctx = fx.getContext('2d'), zctx = zoom.getContext('2d');
+  const say = h => $('e-status').innerHTML = h, t0 = performance.now(), secs = () => ((performance.now() - t0) / 1000).toFixed(1) + ' s';
   let photo, W, H, k = 1, layout, tries = 0, delta = '', final = null, split = null, diffOn = false, fade = 0;
+  let check = null, tick = 0;                            // step 0: the decoder's check (and read) drawn live, as on the decode tab
+  const checked = () => { clearInterval(tick); check && check.stop(); };
+  const unchecked = () => {                              // that layer off before step 1 draws
+    checked(); check = null; gctx.clearRect(0, 0, gr.width, gr.height); $('e-legend').hidden = true; };
   const seen = {};                                       // stage -> its event (with the working data)
   const pill = (stage, cls) => $('e-s-' + stage).className = cls;
   localPreview(f, cv, 1400).then(im => im && !photo && (fx.width = cv.width, fx.height = cv.height));
   const fail = (title, why) => {                        // as loud as a failed decode
-    cancelAnimationFrame(fade);
+    cancelAnimationFrame(fade); checked();
     Object.keys(STAGES).forEach(s => $('e-s-' + s).className !== 'done' && pill(s, 'fail'));
     say(`<div class="big bad">✗ ${esc(title)}</div><p class="bad" style="margin:0 0 8px">${esc(why)}</p>`);
     fctx.clearRect(0, 0, fx.width, fx.height); fctx.fillStyle = 'rgba(210,59,59,.28)'; fctx.fillRect(0, 0, fx.width, fx.height);
@@ -243,18 +248,33 @@ $('e-go').onclick = async () => {
   const handle = async ev => {
     if (ev.e === 'preview') {
       photo = await loadImg(ev.img); W = ev.w; H = ev.h; k = photo.naturalWidth / W;
-      cv.width = fx.width = photo.naturalWidth; cv.height = fx.height = photo.naturalHeight;
+      cv.width = fx.width = gr.width = photo.naturalWidth; cv.height = fx.height = gr.height = photo.naturalHeight;
       ctx.drawImage(photo, 0, 0); say('Encoding…');
+      check = tracer(ctx, gctx, fctx, say, secs); check.k = k;
+    } else if (ev.e === 'checked') {
+      clearInterval(tick);
+      if (ev.ok) { check.grid(ev); say(`<span class="warn">An Imprinted pattern is already here</span> (sync z ${ev.z}, in ${secs()}). Reading its text to take it out…`); }
+      else say(`No Imprinted pattern found (${secs()})`);
     } else if (ev.e === 'existing') {
+      if (check) { await check.queue; checked(); }
       pill('check', 'done');
       if (!ev.found) say(`Not Imprinted yet · ${(ev.ms / 1000).toFixed(1)} s`);
       else $('e-res').insertAdjacentHTML('beforebegin', `<p class="warn" id="e-again">Already Imprinted${ev.old != null ? ` with “${esc(ev.old)}”` : ''} (found in ${(ev.ms / 1000).toFixed(1)} s).
         The old text is taken out, then ${mode === 'append' ? 'old and new text are encoded together' : 'the new text is encoded'} on the picture's own grid (${ev.subblock_px} px sub-blocks; the print width setting is ignored).
         Taking it out leaves traces, so the change is about 1.8× as visible as one encode: encode the original picture instead if you still have it.</p>`);
+      if (ev.found) {                                     // what it read, a moment before step 1 covers it
+        say(`<span class="warn">Already Imprinted</span>${ev.old != null ? ` with “${esc(ev.old)}”` : ', but its text didn\'t read'} · taking it out…`);
+        await new Promise(ok => setTimeout(ok, 1200));
+      }
     } else if (ev.e === 'stage') {
       const st = ev.stage;
-      if (st === 'check') { pill('check', 'run'); return say('Is it already Imprinted? If so, reading its text to take it out…'); }
+      if (st === 'check') {
+        pill('check', 'run'); ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, 0, cv.width, cv.height); check.start();
+        tick = setInterval(() => say(`Is it already Imprinted? Looking for a hidden grid… ${check.probes} spots probed, ${check.syncs} sync tests · ${secs()}`), 100);
+        return;
+      }
       if (st === 'read back') return say('Small picture: decoding it once to make sure it reads back…');
+      if (check) unchecked();
       const [n] = STAGES[st];
       Object.entries(STAGES).forEach(([s, [m]]) => m < n && $('e-s-' + s).className !== 'done' && pill(s, 'done'));
       pill(st, 'run');
@@ -276,6 +296,9 @@ $('e-go').onclick = async () => {
         $('e-s-' + st).style.cursor = 'pointer'; $('e-s-' + st).onclick = () => show(st); }
     } else if (ev.e === 'error') {
       fail('Encoding failed', ev.detail);
+    } else if (check) {
+      if (ev.e === 'seed') say(`Reading its text: trying spot ${check.tried + 1} · ${secs()}`);
+      await check.draw(ev);
     } else if (ev.e === 'done') {
       Object.keys(STAGES).forEach(s => pill(s, 'done'));
       const j = ev, s = j.stats, warn = [];
@@ -312,6 +335,93 @@ $('e-go').onclick = async () => {
   finally { btn.disabled = false; }
 };
 
+// ---------------------------------------------------------------- the decoder at work, drawn live
+// the decode tab and the encode tab's step 0 get the same trace events (web.py trace_event): the
+// check's probes and sync tests go on ctx, the tracker's probes, fitted grid and cells on gctx (the
+// read's drawings play in order, each as long as its animation), the seed being read pulses on fctx
+const LEGEND = `<div class="legend"><b>check:</b><span><i style="background:#3fa7ff"></i>grid locks</span><span><i style="background:#ffb020"></i>weak lock</span><span><i style="background:#999"></i>no lock</span>
+      <b>read:</b><span><i style="background:#2bd96b"></i>probe locked</span><span><i style="background:#e05555"></i>probe missed</span><span><i style="background:#3fd0ff"></i>fitted grid</span><span><i style="background:#3fa7ff;border-radius:2px"></i>sync cell</span><span><i style="background:#2bd96b;border-radius:2px"></i>bit read right</span><span><i style="background:#ff4d4d;border-radius:2px"></i>bit read wrong (corrected)</span></div>`;
+function tracer(ctx, gctx, fctx, say, secs) {
+  const t = {k: 1, probes: 0, syncs: 0, tried: 0, seed: null, queue: Promise.resolve()};
+  const gr = gctx.canvas, fx = fctx.canvas;
+  let locked = [], missed = [], lines = [], lineCol = '#3fd0ff', pulse = 0;   // the current attempt's tracker state
+  const later = fn => t.queue = t.queue.then(fn);
+  const frames = (ms, draw) => new Promise(done => { const t1 = performance.now();
+    const f = () => { const a = Math.min(1, (performance.now() - t1) / ms); draw(a); a < 1 ? requestAnimationFrame(f) : done(); }; f(); });
+  const redraw = () => {                                // probes and fitted grid of the current attempt
+    gctx.clearRect(0, 0, gr.width, gr.height);
+    for (const [pts, col, r] of [[missed, 'rgba(224,85,85,.75)', 1.6], [locked, '#2bd96b', 2.2]]) {
+      gctx.fillStyle = col; for (const p of pts) { gctx.beginPath(); gctx.arc(p[0] * t.k, p[1] * t.k, r, 0, 7); gctx.fill(); } }
+  };
+  const drawLines = (a = 1) => { gctx.strokeStyle = lineCol; gctx.lineWidth = 1.3; gctx.beginPath();
+    for (const l of lines.slice(0, Math.ceil(a * lines.length))) l.forEach((p, i) => i ? gctx.lineTo(p[0] * t.k, p[1] * t.k) : gctx.moveTo(p[0] * t.k, p[1] * t.k));
+    gctx.stroke(); };
+  const dot = (p, r, col, fill = true) => { ctx.beginPath(); ctx.arc(p[0] * t.k, p[1] * t.k, r, 0, 7);
+    if (fill) { ctx.fillStyle = col; ctx.fill(); } else { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke(); } };
+  const live = () => {                       // the seed being read: a pulsing crosshair
+    fctx.clearRect(0, 0, fx.width, fx.height);
+    if (t.seed) { const r = 10 + 8 * Math.abs(Math.sin(performance.now() / 180)), [x, y] = [t.seed[0] * t.k, t.seed[1] * t.k];
+      fctx.strokeStyle = '#2bd96b'; fctx.lineWidth = 2.5; fctx.beginPath(); fctx.arc(x, y, r, 0, 7);
+      fctx.moveTo(x - r - 8, y); fctx.lineTo(x + r + 8, y); fctx.moveTo(x, y - r - 8); fctx.lineTo(x, y + r + 8); fctx.stroke(); }
+    pulse = requestAnimationFrame(live);
+  };
+  t.start = () => { cancelAnimationFrame(pulse); pulse = requestAnimationFrame(live); };
+  t.stop = () => { cancelAnimationFrame(pulse); t.seed = null; fctx.clearRect(0, 0, fx.width, fx.height); };
+  t.grid = ev => {                                      // the hidden grid the check found, 6 cells each way
+    ctx.strokeStyle = 'rgba(43,217,107,.8)'; ctx.lineWidth = 1.2;
+    const n = 6, P = (a, b) => [(ev.xy[0] + a * ev.e1[0] + b * ev.e2[0]) * t.k, (ev.xy[1] + a * ev.e1[1] + b * ev.e2[1]) * t.k];
+    ctx.beginPath();
+    for (let i = -n; i <= n; i++) { ctx.moveTo(...P(i, -n)); ctx.lineTo(...P(i, n)); ctx.moveTo(...P(-n, i)); ctx.lineTo(...P(n, i)); }
+    ctx.stroke();
+  };
+  t.draw = async ev => {                                // every event but "checked" (each tab has its own words for it)
+    if (ev.e === 'probe') {
+      t.probes++; dot(ev.xy, ev.locks >= 4 ? 6 : 4, ev.locks >= 4 ? '#3fa7ff' : ev.locks >= 3 ? '#ffb020' : 'rgba(170,170,170,.7)');
+    } else if (ev.e === 'sync') {
+      t.syncs++; dot(ev.xy, 13, ev.z >= 6 ? '#2bd96b' : '#e05555', false);
+      ctx.font = 'bold 13px system-ui'; ctx.fillStyle = ev.z >= 6 ? '#2bd96b' : '#e05555'; ctx.fillText('z ' + ev.z, ev.xy[0] * t.k + 16, ev.xy[1] * t.k - 8);
+    } else if (ev.e === 'seed') {
+      t.tried++; t.seed = ev.xy; dot(ev.xy, 3, 'rgba(43,217,107,.6)');
+    } else if (ev.e === 'twin') {
+      later(() => { locked = []; missed = []; lines = []; t.seed = ev.xy; redraw();
+        say(`Spot ${t.tried}: following the hidden grid probe by probe from here${ev.sgn < 0 ? ', the lattice turned 180° (the pilot alone can\'t tell which way up it is)' : ''} · ${secs()}`); });
+    } else if (ev.e === 'try') {
+      later(() => { (ev.ok ? locked : missed).push(ev.xy);
+        gctx.fillStyle = ev.ok ? '#2bd96b' : 'rgba(224,85,85,.75)'; gctx.beginPath(); gctx.arc(ev.xy[0] * t.k, ev.xy[1] * t.k, ev.ok ? 2.2 : 1.6, 0, 7); gctx.fill();
+        if (locked.length % 25 === 1 || !ev.ok && missed.length % 25 === 1)
+          say(`Spot ${t.tried}: tracking the hidden grid: ${locked.length} probes locked, ${missed.length} missed · ${secs()}`); });
+    } else if (ev.e === 'tracked' || ev.e === 'refined') {
+      later(() => { if (!ev.lines.length) return say(`Spot ${t.tried}: the grid didn't track from here · ${secs()}`);
+        lines = ev.lines; lineCol = ev.e === 'tracked' ? '#3fd0ff' : '#b07cff';
+        say(ev.e === 'tracked' ? `Spot ${t.tried}: fitted one map (perspective + paper curl) through ${ev.probes} locked probes · ${secs()}`
+                               : `Spot ${t.tried}: refined the map on the pilot inside every cell block · ${secs()}`);
+        return frames(450, a => { redraw(); drawLines(a); }); });
+    } else if (ev.e === 'cells') {
+      later(() => {
+        const n = ev.kind.length, cnt = [0, 0, 0, 0]; ev.kind.forEach(c => cnt[c]++);
+        const col = ['#3fa7ff', '#2bd96b', '#ff4d4d', 'rgba(255,255,255,.65)'], r = Math.max(1.5, ev.cell * t.k * .3);
+        say(ev.sync_found ? `Spot ${t.tried}: averaged ${n} cells through the map; found the sync layout (z ${ev.z}): ${cnt[0]} sync cells set aside, ${n - cnt[0]} payload cells${cnt[3] ? ' — error correction found no payload in them' : `, ${cnt[2]} read wrong and fixed by error correction`} · ${secs()}`
+                          : `Spot ${t.tried}: averaged ${n} cells through the map, but no sync layout in them (z ${ev.z}) · ${secs()}`);
+        let shown = 0;
+        return frames(Math.min(1200, 300 + n / 2), a => {
+          const upto = Math.ceil(a * n);
+          for (; shown < upto; shown++) { gctx.fillStyle = col[ev.kind[shown]];
+            gctx.fillRect(ev.xy[2 * shown] * t.k - r, ev.xy[2 * shown + 1] * t.k - r, 2 * r, 2 * r); } }); });
+    } else if (ev.e === 'found') {
+      await t.queue;
+      const q = ev.quad.map(p => [p[0] * t.k, p[1] * t.k]), g = gctx;  // on top of the cells it was read from
+      g.beginPath(); q.forEach((p, i) => i ? g.lineTo(...p) : g.moveTo(...p)); g.closePath();
+      g.fillStyle = 'rgba(43,217,107,.12)'; g.fill(); g.strokeStyle = '#2bd96b'; g.lineWidth = 3; g.stroke();
+      const c = q.reduce((a, p) => [a[0] + p[0] / 4, a[1] + p[1] / 4], [0, 0]);
+      g.font = 'bold 28px system-ui'; const tw = g.measureText(ev.text).width;
+      g.fillStyle = 'rgba(0,0,0,.75)'; g.fillRect(c[0] - tw / 2 - 10, c[1] - 30, tw + 20, 42);
+      g.fillStyle = '#fff'; g.fillText(ev.text, c[0] - tw / 2, c[1]);
+    } else return false;
+    return true;
+  };
+  return t;
+}
+
 // ---------------------------------------------------------------- decode
 $('d-go').onclick = async () => {
   const f = $('d-file').files[0], out = $('d-out'), btn = $('d-go');
@@ -320,116 +430,50 @@ $('d-go').onclick = async () => {
   out.innerHTML = `<div class="steps"><span id="d-s1">1 · Is it Imprinted?</span><span id="d-s2">2 · Reading the payload</span><span id="d-s3">3 · Result</span></div>
     <div class="status" id="d-status">Uploading…</div>
     <div class="stage"><canvas id="d-cv"></canvas><canvas id="d-gr" class="fx"></canvas><canvas id="d-fx" class="fx"></canvas></div>
-    <div class="legend"><b>check:</b><span><i style="background:#3fa7ff"></i>grid locks</span><span><i style="background:#ffb020"></i>weak lock</span><span><i style="background:#999"></i>no lock</span>
-      <b>read:</b><span><i style="background:#2bd96b"></i>probe locked</span><span><i style="background:#e05555"></i>probe missed</span><span><i style="background:#3fd0ff"></i>fitted grid</span><span><i style="background:#3fa7ff;border-radius:2px"></i>sync cell</span><span><i style="background:#2bd96b;border-radius:2px"></i>bit read right</span><span><i style="background:#ff4d4d;border-radius:2px"></i>bit read wrong (corrected)</span></div>
+    ${LEGEND}
     <div id="d-res"></div>`;
   const fd = new FormData(); fd.append('file', f); fd.append('label', $('d-label').value);
   const step = (n, cls) => $('d-s' + n).className = cls;
   const say = h => $('d-status').innerHTML = h;
-  let cv = $('d-cv'), fx, ctx, fctx, gr, gctx, k = 1, W, H, t0 = performance.now(), tick = 0, pulse = 0, seed = null, tried = 0, probes = 0, syncs = 0, stage = 1;
-  let locked = [], missed = [], lines = [], lineCol = '#3fd0ff', twin = 1;   // the current attempt's tracker state
-  let queue = Promise.resolve();                       // drawings play in order, each as long as its animation
-  const later = fn => queue = queue.then(fn);
-  const frames = (ms, draw) => new Promise(done => { const t1 = performance.now();
-    const f = () => { const a = Math.min(1, (performance.now() - t1) / ms); draw(a); a < 1 ? requestAnimationFrame(f) : done(); }; f(); });
-  const redraw = () => {                                // probes and fitted grid of the current attempt
-    gctx.clearRect(0, 0, gr.width, gr.height);
-    for (const [pts, col, r] of [[missed, 'rgba(224,85,85,.75)', 1.6], [locked, '#2bd96b', 2.2]]) {
-      gctx.fillStyle = col; for (const p of pts) { gctx.beginPath(); gctx.arc(p[0] * k, p[1] * k, r, 0, 7); gctx.fill(); } }
-  };
-  const drawLines = (a = 1) => { gctx.strokeStyle = lineCol; gctx.lineWidth = 1.3; gctx.beginPath();
-    for (const l of lines.slice(0, Math.ceil(a * lines.length))) l.forEach((p, i) => i ? gctx.lineTo(p[0] * k, p[1] * k) : gctx.moveTo(p[0] * k, p[1] * k));
-    gctx.stroke(); };
+  let cv = $('d-cv'), fx, ctx, gr, tr = null, k = 1, W, H, t0 = performance.now(), tick = 0, stage = 1;
   { const im = await localPreview(f, cv, 1200);         // the picked file at once; the server's preview replaces it
     if (im) { W = im.naturalWidth; H = im.naturalHeight; k = cv.width / W; } }
   const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + ' s';
-  const dot = (p, r, col, fill = true) => { ctx.beginPath(); ctx.arc(p[0] * k, p[1] * k, r, 0, 7);
-    if (fill) { ctx.fillStyle = col; ctx.fill(); } else { ctx.strokeStyle = col; ctx.lineWidth = 2.5; ctx.stroke(); } };
-  const live = () => {                       // the seed being read: a pulsing crosshair
-    fctx.clearRect(0, 0, fx.width, fx.height);
-    if (seed) { const r = 10 + 8 * Math.abs(Math.sin(performance.now() / 180)), [x, y] = [seed[0] * k, seed[1] * k];
-      fctx.strokeStyle = '#2bd96b'; fctx.lineWidth = 2.5; fctx.beginPath(); fctx.arc(x, y, r, 0, 7);
-      fctx.moveTo(x - r - 8, y); fctx.lineTo(x + r + 8, y); fctx.moveTo(x, y - r - 8); fctx.lineTo(x, y + r + 8); fctx.stroke(); }
-    pulse = requestAnimationFrame(live);
-  };
   const handle = async ev => {
     if (ev.e === 'preview') {
       const img = await loadImg(ev.img); W = ev.w; H = ev.h; k = img.naturalWidth / W;
       fx = $('d-fx'); gr = $('d-gr'); cv.width = fx.width = gr.width = img.naturalWidth; cv.height = fx.height = gr.height = img.naturalHeight;
-      ctx = cv.getContext('2d'); fctx = fx.getContext('2d'); gctx = gr.getContext('2d'); ctx.drawImage(img, 0, 0);
+      ctx = cv.getContext('2d'); ctx.drawImage(img, 0, 0);
       ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(0, 0, cv.width, cv.height);
-      step(1, 'run'); tick = setInterval(() => stage === 1 && say(`Looking for the hidden grid… ${probes} spots probed, ${syncs} sync tests · ${secs()}`), 100);
-      pulse = requestAnimationFrame(live);
-    } else if (ev.e === 'probe') {
-      probes++; dot(ev.xy, ev.locks >= 4 ? 6 : 4, ev.locks >= 4 ? '#3fa7ff' : ev.locks >= 3 ? '#ffb020' : 'rgba(170,170,170,.7)');
-    } else if (ev.e === 'sync') {
-      syncs++; dot(ev.xy, 13, ev.z >= 6 ? '#2bd96b' : '#e05555', false);
-      ctx.font = 'bold 13px system-ui'; ctx.fillStyle = ev.z >= 6 ? '#2bd96b' : '#e05555'; ctx.fillText('z ' + ev.z, ev.xy[0] * k + 16, ev.xy[1] * k - 8);
+      tr = tracer(ctx, gr.getContext('2d'), fx.getContext('2d'), say, secs); tr.k = k;
+      step(1, 'run'); tick = setInterval(() => stage === 1 && say(`Looking for the hidden grid… ${tr.probes} spots probed, ${tr.syncs} sync tests · ${secs()}`), 100);
+      tr.start();
     } else if (ev.e === 'checked') {
       stage = 2;
       if (!ev.ok) { step(1, 'fail'); step(2, 'skip'); say(`<span class="bad">No Imprinted pattern in this photo</span> (checked in ${secs()})`); return; }
-      step(1, 'done'); step(2, 'run');
-      ctx.strokeStyle = 'rgba(43,217,107,.8)'; ctx.lineWidth = 1.2;            // the hidden grid it found, 6 cells each way
-      const n = 6, P = (a, b) => [(ev.xy[0] + a * ev.e1[0] + b * ev.e2[0]) * k, (ev.xy[1] + a * ev.e1[1] + b * ev.e2[1]) * k];
-      ctx.beginPath();
-      for (let i = -n; i <= n; i++) { ctx.moveTo(...P(i, -n)); ctx.lineTo(...P(i, n)); ctx.moveTo(...P(-n, i)); ctx.lineTo(...P(n, i)); }
-      ctx.stroke();
+      step(1, 'done'); step(2, 'run'); tr.grid(ev);
       say(`<span class="ok">Imprinted pattern found</span> (sync z ${ev.z}, in ${secs()}). Reading the payload…`);
     } else if (ev.e === 'seed') {
-      tried++; seed = ev.xy; dot(ev.xy, 3, 'rgba(43,217,107,.6)');
+      await tr.draw(ev);
       const sure = $('d-s1').className === 'done';
       if (!sure) step(2, 'run');            // a small picture is read in full whatever the check said
-      say(sure ? `<span class="ok">Imprinted.</span> Reading the payload: trying spot ${tried} · ${secs()}`
-               : `Small picture: too few sync cells to be sure, so reading it in full: spot ${tried} · ${secs()}`);
-    } else if (ev.e === 'twin') {
-      later(() => { locked = []; missed = []; lines = []; twin = ev.sgn; seed = ev.xy; redraw();
-        say(`Spot ${tried}: following the hidden grid probe by probe from here${ev.sgn < 0 ? ', the lattice turned 180° (the pilot alone can\'t tell which way up it is)' : ''} · ${secs()}`); });
-    } else if (ev.e === 'try') {
-      later(() => { (ev.ok ? locked : missed).push(ev.xy);
-        gctx.fillStyle = ev.ok ? '#2bd96b' : 'rgba(224,85,85,.75)'; gctx.beginPath(); gctx.arc(ev.xy[0] * k, ev.xy[1] * k, ev.ok ? 2.2 : 1.6, 0, 7); gctx.fill();
-        if (locked.length % 25 === 1 || !ev.ok && missed.length % 25 === 1)
-          say(`Spot ${tried}: tracking the hidden grid: ${locked.length} probes locked, ${missed.length} missed · ${secs()}`); });
-    } else if (ev.e === 'tracked' || ev.e === 'refined') {
-      later(() => { if (!ev.lines.length) return say(`Spot ${tried}: the grid didn't track from here · ${secs()}`);
-        lines = ev.lines; lineCol = ev.e === 'tracked' ? '#3fd0ff' : '#b07cff';
-        say(ev.e === 'tracked' ? `Spot ${tried}: fitted one map (perspective + paper curl) through ${ev.probes} locked probes · ${secs()}`
-                               : `Spot ${tried}: refined the map on the pilot inside every cell block · ${secs()}`);
-        return frames(450, a => { redraw(); drawLines(a); }); });
-    } else if (ev.e === 'cells') {
-      later(() => {
-        const n = ev.kind.length, cnt = [0, 0, 0, 0]; ev.kind.forEach(t => cnt[t]++);
-        const col = ['#3fa7ff', '#2bd96b', '#ff4d4d', 'rgba(255,255,255,.65)'], r = Math.max(1.5, ev.cell * k * .3);
-        say(ev.sync_found ? `Spot ${tried}: averaged ${n} cells through the map; found the sync layout (z ${ev.z}): ${cnt[0]} sync cells set aside, ${n - cnt[0]} payload cells${cnt[3] ? ' — error correction found no payload in them' : `, ${cnt[2]} read wrong and fixed by error correction`} · ${secs()}`
-                          : `Spot ${tried}: averaged ${n} cells through the map, but no sync layout in them (z ${ev.z}) · ${secs()}`);
-        let shown = 0;
-        return frames(Math.min(1200, 300 + n / 2), a => {
-          const upto = Math.ceil(a * n);
-          for (; shown < upto; shown++) { gctx.fillStyle = col[ev.kind[shown]];
-            gctx.fillRect(ev.xy[2 * shown] * k - r, ev.xy[2 * shown + 1] * k - r, 2 * r, 2 * r); } }); });
-    } else if (ev.e === 'found') {
-      await queue;
-      const q = ev.quad.map(p => [p[0] * k, p[1] * k]), g = gctx;  // on top of the cells it was read from
-      g.beginPath(); q.forEach((p, i) => i ? g.lineTo(...p) : g.moveTo(...p)); g.closePath();
-      g.fillStyle = 'rgba(43,217,107,.12)'; g.fill(); g.strokeStyle = '#2bd96b'; g.lineWidth = 3; g.stroke();
-      const c = q.reduce((a, p) => [a[0] + p[0] / 4, a[1] + p[1] / 4], [0, 0]);
-      g.font = 'bold 28px system-ui'; const tw = g.measureText(ev.text).width;
-      g.fillStyle = 'rgba(0,0,0,.75)'; g.fillRect(c[0] - tw / 2 - 10, c[1] - 30, tw + 20, 42);
-      g.fillStyle = '#fff'; g.fillText(ev.text, c[0] - tw / 2, c[1]);
+      say(sure ? `<span class="ok">Imprinted.</span> Reading the payload: trying spot ${tr.tried} · ${secs()}`
+               : `Small picture: too few sync cells to be sure, so reading it in full: spot ${tr.tried} · ${secs()}`);
     } else if (ev.e === 'done' || ev.e === 'error') {
-      await queue;
-      clearInterval(tick); cancelAnimationFrame(pulse); seed = null; fctx && fctx.clearRect(0, 0, fx.width, fx.height);
+      if (tr) { await tr.queue; tr.stop(); }
+      clearInterval(tick);
       if (ev.e === 'error') { step(3, 'fail'); return say(`<span class="bad">${esc(ev.detail)}</span>`); }
       if ($('d-s2').className === 'run') step(2, ev.found.length ? 'done' : 'fail');
       step(3, ev.found.length ? 'done' : 'fail');
       if (ev.found.length && $('d-s1').className === 'fail') step(1, 'done');
-      if (stage === 2 && ($('d-s1').className === 'done' || tried)) say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>`
+      if (stage === 2 && ($('d-s1').className === 'done' || tr.tried)) say(ev.found.length ? `<span class="ok">Read ${ev.found.length} payload${ev.found.length > 1 ? 's' : ''} in ${ev.seconds} s</span>`
         : $('d-s1').className === 'done' ? `<span class="bad">Pattern found but the payload didn't read</span> (${ev.seconds} s)`
         : `<span class="bad">No Imprinted payload in this picture</span> (small picture, read in full: ${ev.seconds} s)`);
       $('d-res').innerHTML = result(ev);
-    }
+    } else await tr.draw(ev);
   };
   try { await stream('/api/decode', fd, handle); }
-  catch (e) { clearInterval(tick); cancelAnimationFrame(pulse); $('d-status') ? say(`<span class="bad">${esc(e.message)}</span>`) : out.innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
+  catch (e) { clearInterval(tick); tr && tr.stop(); $('d-status') ? say(`<span class="bad">${esc(e.message)}</span>`) : out.innerHTML = `<p class="bad">${esc(e.message)}</p>`; }
   finally { btn.disabled = false; }
 };
 

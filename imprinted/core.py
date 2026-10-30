@@ -1813,16 +1813,19 @@ def _sync_search(rgb: np.ndarray, until: float, max_seeds: int = 40) -> list:
     return []
 
 
-def existing(rgb: np.ndarray, read: bool = False) -> dict | None:
+def existing(rgb: np.ndarray, read: bool = False, trace=None) -> dict | None:
     """An Imprinted pattern already in rgb: dict(subblock_px (its grid, so a new encode can land on
     the same one: on any other the old text stays the readable one), payload (only when read:
     reading costs seconds, finding it doesn't; None if it doesn't read)), or None if there is none.
-    Pictures under QUICK_SMALL px get a quick look, then _sync_search (see detect)."""
-    rgb, t0 = as_rgb(rgb), time.perf_counter()
+    Pictures under QUICK_SMALL px get a quick look, then _sync_search (see detect).
+    trace(event, centre_xy, value), if given, sees decode's events: quick_check's, ("checked",
+    None, seed or None), then the read's (only when read)."""
+    rgb, t0, trace = as_rgb(rgb), time.perf_counter(), trace or (lambda *a: None)
     small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL
-    q = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE)
+    q = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE, trace)
     if not q and small:
         q = _sync_search(rgb, t0 + SMALL_PATIENCE)
+    trace("checked", None, q[0] if q else None)
     if not q:
         return None
     _, _, e1, e2 = q[0]
@@ -1830,7 +1833,7 @@ def existing(rgb: np.ndarray, read: bool = False) -> dict | None:
     if not read:
         return dict(subblock_px=sub, payload=None)
     with threadpool_limits(1, "blas"):
-        found = _decode(rgb, 40, 1, q)["found"]
+        found = _decode(rgb, 40, 1, q, trace)["found"]
     return dict(subblock_px=sub, payload=found[0]["payload"] if found else None)
 
 
