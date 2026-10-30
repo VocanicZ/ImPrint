@@ -1,6 +1,6 @@
 # Imprinted: invisible, camera-robust data in images
 
-![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](https://raw.githubusercontent.com/VocanicZ/Imprinted/main/versus.png)
+![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
 
 *Made by `scripts/readme_image.py` with the current encoder: kodim23 at default strength, payload `Imprinted`, then printed and photographed through `sim.py`'s curled-page channel (tilt, curl, mirror, clutter, JPEG).*
 
