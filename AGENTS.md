@@ -25,3 +25,15 @@ selection is weaker evidence. `rtdd doctor` reports which fidelity this reposito
 achieve, and why.
 
 <!-- END rtdd -->
+
+## Versioning
+
+`x.y.z` (`__version__` in `imprinted/__init__.py`):
+
+- **x, major:** heavy change after which pictures made by an older major version no longer decode (format change). All releases within one major version decode each other's pictures.
+- **y, minor:** new features or changes; every picture from the same major version still decodes.
+- **z, patch:** hotfixes, bug fixes, small changes.
+
+Before bumping `y` or `z`, confirm the previous release's files still decode (`scripts/compare_versions.py`). If they don't, the change needs a new major version.
+
+Branches: `main` = newest major. When a new major lands on `main`, the previous major is kept on a branch named after its last release (1.0.0 moved 0.7.x to branch `0.7.1`; after 2.0.0: `0.7.1`, `1.y.z`, `main`). Fixes for an older major go on its branch, renamed to the new last release.

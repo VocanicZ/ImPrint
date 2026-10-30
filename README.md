@@ -31,7 +31,7 @@ The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so
 
 ### Measured (simulated)
 
-`sim.py --acceptance` on v0.8.0: 15 cm print, 5 trials, default strength, payload `IMPRINT1`, the codec's time budgets in CPU seconds on one core (`scripts/benchclock.py`). Every acceptance row passes.
+`sim.py --acceptance` on v1.0.0: 15 cm print, 5 trials, default strength, payload `IMPRINT1`, the codec's time budgets in CPU seconds on one core (`scripts/benchclock.py`). Every acceptance row passes.
 
 | image | δ | SSIM | mean ΔL\* | clean / turned / mirrored | 60% crops | print easy | gray | hard | curled |
 |---|---|---|---|---|---|---|---|---|---|
@@ -41,7 +41,7 @@ The codec is `imprinted/core.py`. It only changes lightness (L\* in CIE Lab), so
 
 `hard` is tilt up to ~40°, 0.6 camera px per printed px, JPEG 75. `sim.py` models print (AM halftone, dot gain, grayscale) and photo (3D tilt, curl, cluttered scene, light, white balance, blur, noise, JPEG, mirror). It predicts; confirm on real hardware with the strength ladder page.
 
-Speed (v0.8.0, `scripts/speed_bench.py --cpu` on the three testdata pictures: CPU seconds on one core, so about what one idle core takes): encoding takes 1.6–1.8 s for a 768×512 picture and 40–41 s for 3000×2000, plus the already-Imprinted check `encode()` makes first (1.9–3.1 s at 3000×2000, 7.0 s at 768×512). Decoding a clean file takes 4.0–4.8 s at 768×512 and 9.7–10.3 s at 3000×2000, and a simulated `easy` phone photo of a 15 cm print 25–28 s. `detect()` says yes in 1.0–2.6 s; it says no in 1.9–5.8 s on a photo of a plain print and in 7.0 s on a plain 768×512 file.
+Speed (v1.0.0, `scripts/speed_bench.py --cpu` on the three testdata pictures: CPU seconds on one core, so about what one idle core takes): encoding takes 1.6–1.8 s for a 768×512 picture and 40–41 s for 3000×2000, plus the already-Imprinted check `encode()` makes first (1.9–3.1 s at 3000×2000, 7.0 s at 768×512). Decoding a clean file takes 4.0–4.8 s at 768×512 and 9.7–10.3 s at 3000×2000, and a simulated `easy` phone photo of a 15 cm print 25–28 s. `detect()` says yes in 1.0–2.6 s; it says no in 1.9–5.8 s on a photo of a plain print and in 7.0 s on a plain 768×512 file.
 
 ---
 
@@ -139,6 +139,18 @@ Bug reports and PRs are welcome. Open PRs against `main`.
 5. Use conventional commit messages (`feat:`, `fix:`, `docs:`, ...) and reference the issue (`closes #N`).
 
 There is no GitHub CI: `scripts/ci-local.sh` is the gate, and it builds `.venv` itself if missing.
+
+### Versioning
+
+Versions are `x.y.z` (`__version__` in `imprinted/__init__.py`):
+
+* **x, major:** a heavy change after which pictures made by an older major version no longer decode (a format change). Every release within one major version decodes pictures made by any other `x.*.*` release of it.
+* **y, minor:** new features or changes that keep every picture made within the same major version decoding.
+* **z, patch:** hotfixes, bug fixes and small changes.
+
+**Branches.** `main` is always the newest major version. When a new major version lands on `main`, the previous one is kept on a branch named after its last release. When 1.0.0 landed, 0.7.x moved to branch `0.7.1`. After a 2.0.0 there would be three branches: `0.7.1`, `1.y.z` (the last 1.x release) and `main` (2.x). Fixes for an older major version go on its branch, and the branch is renamed to the new last release.
+
+Before you bump `y` or `z`, check that files made by the previous release still decode (`scripts/compare_versions.py`). If they don't, the change needs a new major version.
 
 ### Test loop (rtdd, then ci-local)
 
