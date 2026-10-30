@@ -493,8 +493,8 @@ $('l-go').onclick = async () => {
   if (!f) return out.innerHTML = '<p class="bad">Choose an image.</p>';
   const j = await post('/api/ladder', {file: f, tag: $('l-tag').value}, $('l-go'), out, 'Encoding 4 copies…');
   if (!j) return;
-  out.innerHTML = `<table><tr><th>strength δ</th><th>SSIM</th><th>PSNR</th><th>mean ΔL*</th><th>99% ΔL*</th><th>payload tiles</th></tr>
-    ${j.stats.map(s => `<tr><td>${s.delta}</td><td>${s.ssim}</td><td>${s.psnr}</td><td>${s.mean_dL}</td><td>${s.p99_dL}</td><td>${s.tiles}×</td></tr>`).join('')}</table>
+  out.innerHTML = `<table><tr><th>strength δ</th><th>SSIM</th><th>PSNR</th><th>mean ΔL*</th><th>99% ΔL*</th><th>payload tiles</th><th>reads back</th></tr>
+    ${j.stats.map(s => `<tr><td>${s.delta}</td><td>${s.ssim}</td><td>${s.psnr}</td><td>${s.mean_dL}</td><td>${s.p99_dL}</td><td>${s.tiles}×</td><td>${s.reads_back ? '✓' : '<span class="bad">✗ too small</span>'}</td></tr>`).join('')}</table>
     <a class="btn" href="${j.pdf}" download="imprinted_ladder.pdf">Download test page (PDF)</a>
     <p class="note">Each copy prints ~8.8 cm wide. Photograph the whole page; the decoder finds every copy it can read.</p>`;
 };
