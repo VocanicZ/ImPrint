@@ -64,5 +64,5 @@ def decode(image, raw: bool = False, check: bool = True) -> str | bytes | None:
 def detect(image) -> bool:
     """Does image hold an Imprinted pattern? Most Imprinted pictures answer within a second, most
     others are ruled out at one; the rest are searched up to ten seconds (small pictures, under
-    1 MP, are read in full instead). decode() makes the same check first."""
+    1 MP, are tracked closely for that long instead). decode() makes the same check first."""
     return core.detect(_load(image))

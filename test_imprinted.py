@@ -564,6 +564,51 @@ def test_decode_turns_a_lone_locked_twin_around(monkeypatch):
     assert np.allclose(found[0]["quad"], [[150, 100], [50, 100], [50, 0], [150, 0]])
 
 
+def test_small_picture_search_stops_at_its_patience(monkeypatch):
+    """A small picture's quick look can't rule it out, so detect() and existing() search it, but no
+    longer than SMALL_PATIENCE: 40 slow seeds (0.1 s each, 4 s in all) stop being tried once it's
+    up, and the track under way is handed the same deadline, as is the grid search (whose seeds are
+    tracked as it finds them: its probing takes seconds on a busy picture). A lattice whose
+    full map holds the sync layout settles it (no payload read), and so does a quick look that
+    confirms it."""
+    import time
+    seeds = [(9.0, np.array([20.0 + x, 50.0]), np.array([3.0 * ic.K, 0]), np.array([0, 3.0 * ic.K])) for x in range(40)]
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    grids = []
+    monkeypatch.setattr(ic, "_grid_seeds", lambda lum, until=np.inf, **_: grids.append(until) or iter(()))
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [])
+    monkeypatch.setattr(ic, "read", lambda *a, **k: pytest.fail("the sync settles it: no payload read"))
+    monkeypatch.setattr(ic, "SMALL_PATIENCE", 1.0)
+    untils, lattice = [], (lambda q: q * 3.0 * ic.K, (0.0, 40.0, 0.0, 40.0), 50)
+    monkeypatch.setattr(ic, "track", lambda lum, seed, sgn, until=np.inf, **_: untils.append(until) or
+                        time.sleep(0.1) or lattice)
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 4.0)  # tracks, but holds no sync layout
+    small = np.zeros((400, 600, 3), np.uint8)
+    ic.to_lab(small)                                              # OpenCV's first colour conversion: ~1 s
+    for look in (ic.detect, ic.existing):
+        untils.clear()
+        t0 = time.perf_counter()
+        assert not look(small)
+        assert time.perf_counter() - t0 < 2.5 and 0 < len(untils) < 30, (look, len(untils))
+        assert 1.0 < untils[0] - t0 < 1.1                     # its call's start + SMALL_PATIENCE
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: [])           # nothing spectral: the grid search's turn
+    t0 = time.perf_counter()
+    assert not ic.detect(small) and len(grids) == 1 and 1.0 < grids[0] - t0 < 1.1
+    monkeypatch.setattr(ic, "find_seeds", lambda lum: seeds)
+    monkeypatch.setattr(ic, "_sync_read", lambda img, model, *a: 30.0 if len(untils) >= 3 else 4.0)
+    for look in (ic.detect, ic.existing):
+        untils.clear()
+        assert look(small) and len(untils) == 3
+    assert ic.existing(small) == dict(subblock_px=3, payload=None)
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [seeds[0]])
+    monkeypatch.setattr(ic, "_sync_search", lambda *a, **k: pytest.fail("confirmed: nothing to search"))
+    assert ic.detect(small)
+    monkeypatch.setattr(ic, "pilot_probe", lambda *a, **k: pytest.fail("past its deadline: nothing probed"))
+    noise = np.random.default_rng(0).normal(50, 10, (600, 800)).astype(np.float32)
+    assert ic.grid_candidates(noise[:256, :256])                   # candidates to probe, but no time to
+    assert list(ic._grid_seeds(noise, until=time.perf_counter())) == []
+
+
 def test_cell_means_grows_but_drops_cells_outside_the_photo():
     enc, _ = ic.encode(photo_like(), b"hello", delta=2, subblock_px=6)
     lum = ic.to_lab(enc)[..., 0]
@@ -918,6 +963,39 @@ def test_cli_matrix_defaults(tmp_path, monkeypatch, capsys):
     sim.main()
     out = capsys.readouterr().out
     assert " | ".join(sim.PRESETS) in out and out.count("| 0/2 | 0/2 | 0/2 | 0/2 |") == 2   # 2 deltas x 2 trials
+
+
+def test_small_bench_fails_on_a_false_alarm_or_a_slow_detect(tmp_path, monkeypatch, capsys):
+    """scripts/small_bench.py: its no-pattern extras are small pictures; a detect() that says yes
+    to one of them, or takes past BOUND, is a FAIL, a miss alone is reported but not."""
+    import pickle, time
+    monkeypatch.syspath_prepend(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    import small_bench
+    extras = small_bench.extras()
+    assert len(extras) == 6 and all(p is None and im.shape == (512, 768, 3) and im.dtype == np.uint8
+                                    for p, _, im in extras)
+    assert all(im.std() > 10 for _, name, im in extras if name.startswith("halftone"))
+    cases = [(b"hi", "enc", photo_like(64, 64)), (None, "plain", photo_like(64, 64, 1))]
+    path = tmp_path / "cases.pkl"
+    pickle.dump(cases, open(path, "wb"))
+    monkeypatch.setattr(ic, "quick_check", lambda rgb, *a, **k: [])
+    monkeypatch.setattr(ic, "decode", lambda im, **k: dict(found=[]))
+    monkeypatch.setattr(ic, "existing", lambda im: None)
+
+    def run(detect):
+        monkeypatch.setattr(ic, "detect", detect)
+        monkeypatch.setattr(sys, "argv", ["small_bench.py", str(path)])
+        with pytest.raises(SystemExit) as e:
+            small_bench.main()
+        return e.value.code, capsys.readouterr().out
+
+    code, out = run(lambda im: False)                             # misses the encoded one, no alarm
+    assert code == 0 and "verdict: PASS" in out and "detect:enc" in out and "detect 1/2" in out
+    code, out = run(lambda im: True)                              # a yes on the plain picture
+    assert code == 1 and "false alarms ['detect:plain'" in out
+    monkeypatch.setattr(small_bench, "BOUND", 0.05)
+    code, out = run(lambda im: time.sleep(0.1) or im is cases[0][2])
+    assert code == 1 and "verdict: FAIL" in out and "false alarms []" in out
 
 
 if __name__ == "__main__":

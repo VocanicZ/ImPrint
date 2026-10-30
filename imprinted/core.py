@@ -879,7 +879,14 @@ QUICK_GRACE = 0.25          # s past QUICK_PATIENCE that running confirms get
 QUICK_Z = 6.0               # sync z that makes it Imprinted (pictures without one stay under ~4.8)
 QUICK_SMALL = 1_000_000     # px: a picture this small has too few sync cells to always reach QUICK_Z
                             # (16x24 cells: ~96, z 5-6 even clean), and its full search takes seconds:
-                            # decode() searches it whatever quick_check says, detect() reads it
+                            # decode() searches it whatever quick_check says; detect() and existing()
+                            # track it in full (_sync_search)
+SMALL_PATIENCE = 7.0        # s: _sync_search starts nothing new after this (a track under way stops
+                            # there too; the sync read after it, a second at most): detect() <= 10 s
+SMALL_TRACK = 120           # probes a _sync_search track tries first: a clean 768x512 file's z ~17
+                            # there, where its whole lattice scores ~30
+SMALL_HINT = 4.5            # sync z on that part that gets the lattice tracked in full (a busy crop
+                            # reads 5-6 on its part)
 
 
 def _level_sync(img: np.ndarray, n: int, pool, stride: int = 2) -> list:
@@ -1323,7 +1330,13 @@ def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
     (GRID_SNR) and so do at least two of the four probes `step` cells away along its cell vectors,
     each finding its cells where the centre's lattice puts them: noise or an alias grid that
     catches some of the lines can fake one probe, not a lattice. Returns [(score, centre_xy, e1, e2)], best first."""
-    seeds, img, f = [], lum.astype(np.float32), 1
+    return sorted(_grid_seeds(lum, n, step), key=lambda s: -s[0])
+
+
+def _grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4, until: float = np.inf):
+    """grid_seeds' seeds, each as its window finds it; none after `until` (perf_counter s): probing
+    a window's candidates is the slow part, seconds on a busy picture without a pattern."""
+    img, f = lum.astype(np.float32), 1
     for _ in range(2):
         if min(img.shape) < n:
             break
@@ -1333,6 +1346,8 @@ def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
                 y = min(max(int(fy * img.shape[0]) - n // 2, 0), img.shape[0] - n)
                 ctr = np.array([x + n / 2, y + n / 2]) * f - 0.5
                 for A in grid_candidates(img[y:y + n, x:x + n], n):
+                    if time.perf_counter() > until:
+                        return
                     hit = pilot_probe(lum, np.zeros(2), np.zeros(2), ctr, A * f, snr_min=GRID_SNR)
                     if hit is None:
                         continue
@@ -1343,10 +1358,9 @@ def grid_seeds(lum: np.ndarray, n: int = 256, step: int = 4) -> list:
                         # a true lattice predicts where the neighbour's cells start, an alias doesn't
                         good += r is not None and np.abs((r[0] - d - Q + 0.5) % 1 - 0.5).max() < 0.25
                     if good >= 2:
-                        seeds.append((good + snr, P, J[:, 0], J[:, 1]))
+                        yield good + snr, P, J[:, 0], J[:, 1]
                         break                                     # this window has its seed
         img, f = cv2.pyrDown(img), f * 2
-    return sorted(seeds, key=lambda s: -s[0])
 
 
 # ---------------------------------------------------------------- decode
@@ -1707,38 +1721,60 @@ def decode(rgb: np.ndarray, max_seeds: int = 40, max_found: int | None = None, c
         return _decode(rgb, max_seeds, max_found, quick, trace)
 
 
+def _sync_search(rgb: np.ndarray, until: float, max_seeds: int = 40) -> list:
+    """For a picture under QUICK_SMALL px that quick_check can't settle: decode's seeds (spectral,
+    then the grid search's, as it finds them), each tracked at full resolution (SMALL_TRACK probes,
+    no frontier retry) and read for the sync layout through that map (both 180-degree twins), in
+    full when that comes close (SMALL_HINT), until one holds it (QUICK_Z) or `until` (perf_counter
+    s). The decoder's map reads cells the quick look's coarse one misreads: a clean small file's
+    lattice scores z ~30 where the quick look sees 5-6. No payload read: that is the slow part (a
+    wrong twin tries every length, 15 s), and the known layout can't be faked any more than the
+    CRC. Returns [(z, centre_xy, e1, e2)] or []."""
+    with threadpool_limits(1, "blas"):
+        lum = to_lab(rgb)[..., 0]
+        for batch in (lambda: find_seeds(lum)[:max_seeds], lambda: _grid_seeds(lum, until=until)):
+            for seed in batch():                                  # (each grid seed tracked as it's found)
+                if time.perf_counter() > until:
+                    return []
+                model = track(lum, seed, 1, budget=SMALL_TRACK, frontier=False, until=until)
+                if model is None or model[2] < 8:
+                    continue
+                z = _sync_read(lum, model, 4, 1)
+                if SMALL_HINT <= z < QUICK_Z and (model := track(lum, seed, 1, until=until)):
+                    z = max(z, _sync_read(lum, model, 4, 1))     # close: the whole lattice settles it
+                if z >= QUICK_Z:
+                    return [(z, *seed[1:])]
+    return []
+
+
 def existing(rgb: np.ndarray, read: bool = False) -> dict | None:
     """An Imprinted pattern already in rgb: dict(subblock_px (its grid, so a new encode can land on
     the same one: on any other the old text stays the readable one), payload (only when read:
     reading costs seconds, finding it doesn't; None if it doesn't read)), or None if there is none.
-    Pictures under QUICK_SMALL px are read to find out (see detect)."""
-    rgb = as_rgb(rgb)
+    Pictures under QUICK_SMALL px get a quick look, then _sync_search (see detect)."""
+    rgb, t0 = as_rgb(rgb), time.perf_counter()
     small = rgb.shape[0] * rgb.shape[1] <= QUICK_SMALL
-    q = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE)  # a small one gets a quick look, then a read
-    if q:
-        _, _, e1, e2 = q[0]
-        sub = round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K)
-        if not read:
-            return dict(subblock_px=sub, payload=None)
-        with threadpool_limits(1, "blas"):
-            found = _decode(rgb, 40, 1, q)["found"]
-    elif small:
-        found = decode(rgb, max_found=1, check=False)["found"]
-        if not found:
-            return None
-        sub = round(found[0]["photo_px_per_subblock"])
-    else:
+    q = quick_check(rgb, QUICK_REJECT if small else QUICK_PATIENCE)
+    if not q and small:
+        q = _sync_search(rgb, t0 + SMALL_PATIENCE)
+    if not q:
         return None
-    return dict(subblock_px=sub, payload=found[0]["payload"] if found and read else None)
+    _, _, e1, e2 = q[0]
+    sub = round(float(np.sqrt(abs(e1[0] * e2[1] - e1[1] * e2[0]))) / K)
+    if not read:
+        return dict(subblock_px=sub, payload=None)
+    with threadpool_limits(1, "blas"):
+        found = _decode(rgb, 40, 1, q)["found"]
+    return dict(subblock_px=sub, payload=found[0]["payload"] if found else None)
 
 
 def detect(rgb: np.ndarray) -> bool:
-    """Is this picture Imprinted? quick_check, and for a picture under QUICK_SMALL px that it rules
-    out, a full read (a payload that reads passes its CRC: no false alarm either way)."""
-    rgb = as_rgb(rgb)
+    """Is this picture Imprinted? quick_check, and for a picture under QUICK_SMALL px that its quick
+    look (QUICK_REJECT s) can't settle, _sync_search for the rest of SMALL_PATIENCE s."""
+    rgb, t0 = as_rgb(rgb), time.perf_counter()
     if rgb.shape[0] * rgb.shape[1] > QUICK_SMALL:
         return bool(quick_check(rgb))
-    return bool(decode(rgb, max_found=1)["found"])          # its own quick look, then a full read
+    return bool(quick_check(rgb, QUICK_REJECT) or _sync_search(rgb, t0 + SMALL_PATIENCE))
 
 
 def _decode(rgb: np.ndarray, max_seeds: int, max_found: int | None, quick: list | None,
