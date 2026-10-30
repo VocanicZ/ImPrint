@@ -509,12 +509,14 @@ VIS_DL = 0.99               # mean |dL*| ceiling (PRD: <= 1.0; measured rounded 
 DELTA_MIN, DELTA_MAX = 0.5, 2.4
 # Smallest picture encode accepts: one that reads back from its clean file. The decoder scans no
 # side under READ_MIN_SIDE px (its spectral windows and grid search). Above that, how few cells the
-# pilot can still lock on depends on the picture: busy kodim05 read nothing at 15x22 cells (3.3
-# tiles) where kodim08 and kodim23 read at 14x21, while all three read at 16x20 and 17x17 (2.2 and
-# 2.0 tiles). So a picture under READ_SURE_CELLS a side or READ_SURE_TILES tiles (a margin over
-# those) is decoded once before encode returns it, and is too small when that finds nothing.
+# pilot can still lock on depends on the picture. Calibrated for 0.8, where sync cells take a quarter
+# of every tile's cells (testdata pictures at 512-1152 px wide, sub-blocks 4-8 px, 2-16 byte
+# payloads): busy kodim05 read nothing at 18x27 cells (4.9 tiles) or 21x32 (3.4 tiles), and kodim08
+# nothing at 18x28 (1.6 tiles), while all three read at 24x36, 25x38 and 32x48 (2.7 tiles and up).
+# So a picture under READ_SURE_CELLS a side or READ_SURE_TILES tiles (a margin over those) is
+# decoded once before encode returns it, and is too small when that finds nothing.
 READ_MIN_SIDE = 256
-READ_SURE_CELLS, READ_SURE_TILES = 16, 3
+READ_SURE_CELLS, READ_SURE_TILES = 28, 3
 WRONG_WARN = 0.25           # warn when this fraction of the clean file's cells read wrong (clipped
                             # cells carry nothing: the decoder skips them, but they add up)
 
@@ -549,9 +551,9 @@ def encode(rgb: np.ndarray, payload: bytes, delta: float | None = None, subblock
     if min(rows, cols) < READ_SURE_CELLS or rows * cols < READ_SURE_TILES * T * T:
         trace("read back", None)
         if not any(f["payload"] == payload for f in decode(out, check=False)["found"]):   # the payload, not detect
-            raise ValueError(f"image too small to read back: its clean file ({rows}x{cols} cells of "
-                             f"{K * st['subblock_px']} px, {st['tiles']} {T}x{T} tiles) does not decode; use a "
-                             f"larger picture, a smaller sub-block or a shorter payload")
+            raise ValueError(f"picture too small to read back: encoded at this size ({rows}x{cols} cells of "
+                             f"{K * st['subblock_px']} px) it does not decode; use a larger picture, a shorter "
+                             f"text or a smaller sub-block (a wider print size)")
     if st["wrong_cells"] > WRONG_WARN:
         warnings.warn(f"{st['wrong_cells']:.0%} of the cells read wrong in the clean file: little gamut "
                       f"headroom (clipped black/white or saturated areas), the payload may not read back",
