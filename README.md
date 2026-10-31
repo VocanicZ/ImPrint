@@ -5,6 +5,8 @@
 
 Hide up to 32 bytes in a picture, invisibly, and read them back from the file or from a phone photo of a print or screen.
 
+**Try it online:** <https://imprinted.rainbowcreation.net/>
+
 ![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
 
 - **Invisible:** same size, no border or markers (SSIM ≥ 0.955, mean ΔL\* ≤ 1).
@@ -47,7 +49,7 @@ imprinted.detect("phone_shot.jpg")   # -> True if it holds an Imprinted pattern
 
 `imprinted.core` is the full codec: stats, every payload in a photo, and `make_ladder` (a printable strength-test page).
 
-**Web UI** (encode, decode, strength ladder; works from a phone on the same network):
+**Web UI** (encode, decode, strength ladder; works from a phone on the same network; hosted at <https://imprinted.rainbowcreation.net/>):
 
 ```bash
 .venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765    # open http://<this-pc-ip>:8765
