@@ -152,6 +152,7 @@ async function post(url, fields, btn, out, busy = 'Working…') {
 
 // ---------------------------------------------------------------- streaming
 // the server sends JSON lines as the job runs: handle each one as it arrives
+const queued = n => n ? `Waiting in line: ${n} ahead of you…` : 'Waiting for a free slot: other pictures are being worked on…';
 async function stream(url, fd, handle) {
   let r;
   try { r = await fetch(url, {method: 'POST', body: fd}); }
@@ -267,6 +268,7 @@ $('e-go').onclick = async () => {
   }
 
   const handle = async ev => {
+    if (ev.e === 'queued') return say(queued(ev.ahead));
     if (ev.e === 'preview') {
       photo = await loadImg(ev.img); W = ev.w; H = ev.h; k = photo.naturalWidth / W;
       cv.width = fx.width = gr.width = photo.naturalWidth; cv.height = fx.height = gr.height = photo.naturalHeight;
@@ -461,6 +463,7 @@ $('d-go').onclick = async () => {
     if (im) { W = im.naturalWidth; H = im.naturalHeight; k = cv.width / W; } }
   const secs = () => ((performance.now() - t0) / 1000).toFixed(1) + ' s';
   const handle = async ev => {
+    if (ev.e === 'queued') return say(queued(ev.ahead));
     if (ev.e === 'preview') {
       const img = await loadImg(ev.img); W = ev.w; H = ev.h; k = img.naturalWidth / W;
       fx = $('d-fx'); gr = $('d-gr'); cv.width = fx.width = gr.width = img.naturalWidth; cv.height = fx.height = gr.height = img.naturalHeight;

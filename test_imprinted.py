@@ -827,6 +827,33 @@ def test_make_ladder_returns_a_page_for_kodim05():
     assert (page[260:260 + 693, 150:150 + 1040] < 250).mean() > 0.5        # the 0.75 copy is on the page
 
 
+def test_web_line_runs_slots_in_arrival_order_and_limits_each_visitor(monkeypatch):
+    """The web work queue: SLOTS jobs run at once, the rest wait in arrival order; a visitor over
+    PER_VISITOR jobs in the line or RATE starts gets 429, a full line 503."""
+    from fastapi import HTTPException
+    import web
+    line = web.Line()
+    a1, b1, c1, a2 = line.join("a"), line.join("b"), line.join("c"), line.join("a")
+    assert [line.ahead(t) for t in (a1, b1, c1, a2)] == [None, None, 0, 1]      # a, b run; c, a wait
+    with pytest.raises(HTTPException) as e:
+        line.join("a")                                                          # PER_VISITOR = 2
+    assert e.value.status_code == 429
+    line.leave(a1, True)
+    assert line.ahead(a2) == 1 and line.ahead(c1) is None and line.ahead(a2) == 0   # c's turn first
+    line.leave(a2, False)                                                       # a gave up waiting
+    line.join("a")
+    monkeypatch.setattr(web, "RATE", (2, 600))
+    for _ in range(2):
+        line.leave(line.join("d"), False)
+    with pytest.raises(HTTPException) as e:
+        line.join("d")
+    assert e.value.status_code == 429 and "try again in" in e.value.detail
+    monkeypatch.setattr(web, "WAITING", 1)
+    with pytest.raises(HTTPException) as e:
+        line.join("e")
+    assert e.value.status_code == 503
+
+
 def test_web_ladder_reports_strengths_that_do_not_read_back(monkeypatch):
     """A ladder copy that does not read back is a column in the page's stats, not a 400."""
     pytest.importorskip("httpx")

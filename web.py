@@ -83,7 +83,96 @@ def logo():
     return FileResponse(ROOT / "web" / "logo.png")
 
 
-JOBS = threading.BoundedSemaphore(2)    # encodes/decodes at once: each one already uses every core
+SLOTS = 2                 # jobs at once: each one already uses every core
+WAITING = 20              # jobs waiting for a slot; more are refused
+PER_VISITOR = 2           # jobs one visitor may have waiting or running (2: people share IPs behind CGNAT)
+RATE = (30, 600)          # jobs one visitor may start per 600 s
+KEEPALIVE = 15            # s between "queued" lines while waiting (Cloudflare drops a silent request at 100 s)
+
+
+def visitor(request: Request) -> str:
+    """Who sent a request: Cloudflare's client IP when it came through the tunnel on this host
+    (cloudflared connects from localhost), else the peer address."""
+    peer = request.client.host if request.client else ""
+    return request.headers.get("cf-connecting-ip", peer) if peer in ("127.0.0.1", "::1") else peer
+
+
+class Ticket:
+    __slots__ = ("who",)
+
+    def __init__(self, who: str):
+        self.who = who
+
+
+class Line:
+    """The work queue: SLOTS jobs run at once, the rest wait in arrival order. Each visitor has at
+    most PER_VISITOR jobs in it and starts at most RATE[0] per RATE[1] seconds, so no one visitor
+    keeps the others waiting. Shared by the event loop and the job threads."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = 0
+        self.waiting: list[Ticket] = []          # oldest first
+        self.held: dict[str, int] = {}           # visitor -> jobs waiting or running
+        self.started: dict[str, list] = {}       # visitor -> start times within RATE[1]
+
+    def join(self, who: str) -> Ticket:
+        """A place at the end of the line, or HTTPException (429: this visitor's limits, 503: full)."""
+        now = time.monotonic()
+        with self.lock:
+            if self.held.get(who, 0) >= PER_VISITOR:
+                raise HTTPException(429, "you already have pictures in progress: wait for them to finish")
+            times = [t for t in self.started.get(who, ()) if now - t < RATE[1]]
+            if len(times) >= RATE[0]:
+                raise HTTPException(429, f"too many pictures in a row: try again in {int(RATE[1] - (now - times[0])) + 1} s")
+            if len(self.waiting) >= WAITING:
+                raise HTTPException(503, "busy with other pictures: try again in a moment")
+            if len(self.started) > 10_000:                  # forget visitors gone quiet
+                self.started = {k: v for k, v in self.started.items() if now - v[-1] < RATE[1]}
+            self.started[who] = times + [now]
+            self.held[who] = self.held.get(who, 0) + 1
+            t = Ticket(who)
+            self.waiting.append(t)
+            return t
+
+    def ahead(self, t: Ticket) -> int | None:
+        """How many wait before t, or None: t has just taken a slot (leave(t, True) frees it)."""
+        with self.lock:
+            i = self.waiting.index(t)
+            if i == 0 and self.running < SLOTS:
+                self.waiting.pop(0)
+                self.running += 1
+                return None
+            return i
+
+    def waits(self, t: Ticket) -> bool:
+        with self.lock:
+            return t in self.waiting
+
+    def leave(self, t: Ticket, ran: bool):
+        with self.lock:
+            if ran:
+                self.running -= 1
+            else:
+                self.waiting.remove(t)
+            self.held[t.who] -= 1
+            if not self.held[t.who]:
+                del self.held[t.who]
+
+    async def turn(self, t: Ticket, request: Request):
+        """Yields how many wait before t (on a change, and every KEEPALIVE s) until t takes a
+        slot; returns early if the client goes away (t still waiting: leave(t, False))."""
+        last, said = None, 0.0
+        while (n := self.ahead(t)) is not None:
+            if n != last or time.monotonic() - said > KEEPALIVE:
+                yield n
+                last, said = n, time.monotonic()
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(0.25)
+
+
+LINE = Line()
 
 
 class Cancelled(Exception):
@@ -91,9 +180,10 @@ class Cancelled(Exception):
 
 
 def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
-    """Run work(put) in a thread and stream JSON lines: the photo's preview, every event work puts
-    as it happens, then work's result ("done") or its failure ("error"). At most JOBS run at once;
-    a job whose client goes away stops at its next event (put raises)."""
+    """Run work(put) in a thread and stream JSON lines: its place in the line while it waits
+    ("queued", how many are ahead), the photo's preview, every event work puts as it happens, then
+    work's result ("done") or its failure ("error", also when the line refuses it). A job whose
+    client goes away stops at its next event (put raises)."""
     events: queue.Queue = queue.Queue()
     gone = threading.Event()
 
@@ -102,7 +192,7 @@ def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
             raise Cancelled
         events.put(ev)
 
-    def run():
+    def run(ticket):
         try:
             events.put(dict(e="done", **work(put)))
         except Cancelled:
@@ -114,18 +204,25 @@ def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
             events.put(dict(e="error", detail=f"{type(e).__name__}: {e}"))
             traceback.print_exc()
         finally:
-            JOBS.release()
+            LINE.leave(ticket, True)
 
     async def stream():
-        if not JOBS.acquire(blocking=False):
-            print("busy: refused a job", flush=True)
-            yield json.dumps(dict(e="error", detail="busy with other pictures: try again in a moment")) + "\n"
-            return
-        started = False
         try:
+            ticket = LINE.join(visitor(request))
+        except HTTPException as e:
+            print("refused a job:", e.detail, flush=True)
+            yield json.dumps(dict(e="error", detail=e.detail)) + "\n"
+            return
+        slot = started = False
+        try:
+            async for n in LINE.turn(ticket, request):
+                yield json.dumps(dict(e="queued", ahead=n)) + "\n"
+            if LINE.waits(ticket):                         # the client went away while waiting
+                return
+            slot = True
             img = await asyncio.to_thread(b64jpg, rgb, 1200)
             yield json.dumps(dict(e="preview", img=img, w=rgb.shape[1], h=rgb.shape[0])) + "\n"
-            threading.Thread(target=run, daemon=True).start()
+            threading.Thread(target=run, args=(ticket,), daemon=True).start()
             started, seen = True, time.monotonic()
             while True:
                 if time.monotonic() - seen > 1:            # also while events pour in: they never empty the queue
@@ -143,7 +240,7 @@ def streamed(request: Request, rgb: np.ndarray, work) -> StreamingResponse:
         finally:                                       # finished, or the client went away
             gone.set()
             if not started:
-                JOBS.release()
+                LINE.leave(ticket, slot)
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
@@ -309,12 +406,21 @@ def log(label: str, rgb: np.ndarray, found: list, secs: float):
 
 
 @app.post("/api/ladder")
-async def ladder(file: UploadFile = File(...), tag: str = Form("")):
+async def ladder(request: Request, file: UploadFile = File(...), tag: str = Form("")):
     rgb = read_rgb(await file.read())
+    ticket = LINE.join(visitor(request))               # in the line too: 4 encodes, off the event loop
+    slot = False
     try:
-        page, stats = ic.make_ladder(rgb, tag)
+        async for _ in LINE.turn(ticket, request):
+            pass
+        if LINE.waits(ticket):
+            raise HTTPException(499, "client went away")
+        slot = True
+        page, stats = await asyncio.to_thread(ic.make_ladder, rgb, tag)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    finally:
+        LINE.leave(ticket, slot)
     buf = io.BytesIO()
     Image.fromarray(page).save(buf, "PDF", resolution=ic.LADDER_DPI)
     return dict(pdf="data:application/pdf;base64," + base64.b64encode(buf.getvalue()).decode(),
