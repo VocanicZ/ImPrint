@@ -17,7 +17,7 @@ from PIL import Image, ImageOps
 
 from . import core
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __all__ = ["encode", "decode", "detect", "core"]
 
 

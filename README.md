@@ -87,15 +87,15 @@ The codec (`imprinted/core.py`) only changes lightness (L\* in CIE Lab), so colo
 
 `hard`: tilt up to ~40°, 0.6 camera px per printed px, JPEG 75.
 
-Speed (v1.0.1, CPU seconds on one core, `scripts/speed_bench.py --cpu`):
+Speed (v1.0.2, CPU seconds on one core, `scripts/speed_bench.py --cpu`):
 
 | task | 768×512 | 3000×2000 |
 |---|---|---|
-| encode | 1.0–1.1 s | 18–20 s |
-| already-Imprinted check (in `encode`) | 6.0–7.0 s | 2.6–2.8 s |
-| decode file | 2.0–2.5 s | 2.4–2.5 s |
+| encode | 1.1–1.2 s | 20–21 s |
+| already-Imprinted check (in `encode`) | 7.0 s | 2.7–3.0 s |
+| decode file | 2.5–2.9 s | 2.6–3.0 s |
 
-Decoding a simulated phone photo of a 15 cm print takes 4.1–4.6 s. `detect` says yes in 0.7–1.6 s and no in 2.8–7.0 s, with no false alarms on 66 pictures without a pattern (`scripts/detect_bench.py`, `scripts/small_bench.py`).
+Decoding a simulated phone photo of a 15 cm print takes 4.7–5.0 s. `detect` says yes in 0.7–1.6 s and no in 2.8–7.0 s, with no false alarms on 66 pictures without a pattern (`scripts/detect_bench.py`, `scripts/small_bench.py`).
 
 ## Development
 
