@@ -5,8 +5,6 @@
 
 Hide up to 32 bytes in a picture, invisibly, and read them back from the file or from a phone photo of a print or screen.
 
-**Try it online:** <https://imprinted.rainbowcreation.net/>
-
 ![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
 
 - **Invisible:** same size, no border or markers (SSIM ≥ 0.955, mean ΔL\* ≤ 1).
@@ -17,18 +15,29 @@ The payload is plain bytes checked by CRC-32, not encrypted or signed. Typical u
 
 > **Status:** research prototype. Results below are simulated; confirm on your printer and phone.
 
+## Try it
+
+The web UI encodes, decodes and makes strength ladders, and works from a phone.
+
+**Online:** <https://imprinted.rainbowcreation.net/>. Nothing to install.
+
+**Self-hosted:** run the same web UI on your own machine:
+
+```bash
+git clone https://github.com/VocanicZ/Imprinted.git && cd Imprinted
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765    # open http://<this-pc-ip>:8765
+```
+
+Phones on the same network can open it too. The clone also has the simulator and tests (see [Development](#development)).
+
 ## Install
 
 ```bash
 pip install imprinted
 ```
 
-Python 3.10+. Installs the library only. For the web UI, simulator and tests, clone the repo:
-
-```bash
-git clone https://github.com/VocanicZ/Imprinted.git && cd Imprinted
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-```
+Python 3.10+. Installs the library only.
 
 ## Usage
 
@@ -48,12 +57,6 @@ imprinted.detect("phone_shot.jpg")   # -> True if it holds an Imprinted pattern
 | `detect(image)` | `True` if the picture holds an Imprinted pattern, without reading it. |
 
 `imprinted.core` is the full codec: stats, every payload in a photo, and `make_ladder` (a printable strength-test page).
-
-**Web UI** (encode, decode, strength ladder; works from a phone on the same network; hosted at <https://imprinted.rainbowcreation.net/>):
-
-```bash
-.venv/bin/uvicorn web:app --host 0.0.0.0 --port 8765    # open http://<this-pc-ip>:8765
-```
 
 ## How it works
 
