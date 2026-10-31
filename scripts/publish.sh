@@ -6,7 +6,8 @@
 # A new major version (README "Versioning") also keeps the previous major on a branch named after
 # its last release (1.0.0 -> branch 0.7.1). The README must be finished first: the script stops
 # if README.md or its figure (versus.png, stamped with the version) hasn't changed since the last
-# release. --force publishes anyway.
+# release. --force publishes anyway. Last, scripts/deploy.sh puts this version on
+# https://imprinted.rainbowcreation.net/ (asks for the host's password unless you have a key).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 force=0; [ "${1:-}" = "--force" ] && force=1
@@ -43,3 +44,4 @@ if [ -n "$prev" ] && [ "${ver%%.*}" != "${prev%%.*}" ] && ! git ls-remote -q --e
   echo "major ${prev%%.*} kept on branch $prev"
 fi
 gh release create "v$ver" dist/* --verify-tag --title "v$ver" --generate-notes
+scripts/deploy.sh
