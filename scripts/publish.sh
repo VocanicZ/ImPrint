@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the `imprinted` package, upload it to PyPI, then tag v<version> and create the GitHub
-# release with the same files. Asks for your PyPI API token (pypi-...) without echoing it;
-# nothing is saved. Bump __version__ in imprinted/__init__.py and push first: PyPI refuses a
-# version it already has, and the release must point at code that is on GitHub.
+# Push main, build the `imprinted` package, upload it to PyPI, then tag v<version> and create the
+# GitHub release with the same files. Asks for your PyPI API token (pypi-...) without echoing it;
+# nothing is saved. Bump __version__ in imprinted/__init__.py and commit on main first: PyPI
+# refuses a version it already has, and the release must point at code that is on GitHub.
 # A new major version (README "Versioning") also keeps the previous major on a branch named after
 # its last release (1.0.0 -> branch 0.7.1). The README must be finished first: the script stops
 # if README.md or its figure (versus.png, stamped with the version) hasn't changed since the last
@@ -14,7 +14,8 @@ force=0; [ "${1:-}" = "--force" ] && force=1
 ver=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' imprinted/__init__.py)
 git fetch -q origin
 [ -z "$(git status --porcelain --untracked-files=no)" ] || { echo "commit your changes first"; exit 1; }
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "push main first (HEAD != origin/main)"; exit 1; }
+[ "$(git branch --show-current)" = main ] || { echo "publish from main"; exit 1; }
+git merge-base --is-ancestor origin/main HEAD || { echo "main is behind origin/main: pull first"; exit 1; }
 ! git rev-parse -q --verify "refs/tags/v$ver" >/dev/null || { echo "v$ver is already tagged: bump __version__"; exit 1; }
 [ -x .venv/bin/python ] || python3 -m venv .venv
 prev=$(git tag -l 'v*' --sort=-v:refname | head -1); prev=${prev#v}   # the last release before this one
@@ -25,6 +26,7 @@ if [ -n "$prev" ] && [ $force = 0 ]; then
     exit 1
   done
 fi
+git push -q origin main                                            # the release's code on GitHub first
 .venv/bin/pip install -q -U build twine
 rm -rf dist build imprinted.egg-info
 # README links versus.png and the logo relatively (each branch shows its own); PyPI needs full URLs: this tag's
