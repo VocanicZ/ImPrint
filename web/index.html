@@ -4,16 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Imprinted</title>
+<link rel="icon" type="image/png" href="/logo.png">
 <style>
   :root { --bg:#f6f6f4; --card:#fff; --fg:#1d1d1b; --muted:#6b6b66; --line:#ddddd8; --acc:#2f6fdf; --ok:#1f9d55; --warn:#d48a00; --bad:#d23b3b; }
   @media (prefers-color-scheme: dark) { :root { --bg:#151515; --card:#1f1f1f; --fg:#ececea; --muted:#9a9a95; --line:#333; --acc:#6b9bff; } }
   * { box-sizing:border-box; }
   body { margin:0; font:15px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
   main { max-width:980px; margin:0 auto; padding:16px; }
-  h1 { font-size:20px; margin:4px 0 12px; }
+  h1 { font-size:20px; margin:4px 0 12px; display:flex; align-items:center; gap:8px; }
+  h1 img { width:44px; height:44px; border:0; }
+  h1 .ver { font-size:13px; font-weight:400; color:var(--muted); }
   nav { display:flex; gap:6px; margin-bottom:14px; }
   nav button { flex:1; padding:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:8px; font-size:15px; cursor:pointer; }
   nav button.on { border-color:var(--acc); color:var(--acc); font-weight:600; }
+  nav button.minor { flex:0 0 auto; padding:10px 12px; font-size:13px; color:var(--muted); }
+  footer { display:flex; gap:8px; justify-content:center; margin:18px 0 6px; }
+  footer a { padding:6px 14px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font-size:13px; text-decoration:none; }
   section { display:none; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
   section.on { display:block; }
   label { display:block; margin:10px 0 4px; color:var(--muted); font-size:13px; }
@@ -54,11 +60,11 @@
 </head>
 <body>
 <main>
-  <h1>Imprinted</h1>
+  <h1><img src="/logo.png" alt="">Imprinted <span class="ver">v{{version}}</span></h1>
   <nav>
     <button data-tab="enc" class="on">Encode</button>
     <button data-tab="dec">Decode</button>
-    <button data-tab="lad">Strength ladder</button>
+    <button data-tab="lad" class="minor">Strength ladder</button>
   </nav>
 
   <section id="enc" class="on">
@@ -99,6 +105,7 @@
     <button class="go" id="l-go">Make test page</button>
     <div class="out" id="l-out"></div>
   </section>
+  <footer><a href="https://github.com/VocanicZ/Imprinted">GitHub</a><a href="https://pypi.org/project/imprinted/">PyPI</a></footer>
 </main>
 
 <script>
@@ -476,6 +483,8 @@ $('d-go').onclick = async () => {
     } else if (ev.e === 'done' || ev.e === 'error') {
       if (tr) { await tr.queue; tr.stop(); }
       clearInterval(tick);
+      if (fx && (ev.e === 'error' || !ev.found.length)) {  // nothing read: tint it red, as a failed encode
+        const f = fx.getContext('2d'); f.fillStyle = 'rgba(210,59,59,.28)'; f.fillRect(0, 0, fx.width, fx.height); }
       if (ev.e === 'error') { step(3, 'fail'); return say(`<span class="bad">${esc(ev.detail)}</span>`); }
       if ($('d-s2').className === 'run') step(2, ev.found.length ? 'done' : 'fail');
       step(3, ev.found.length ? 'done' : 'fail');

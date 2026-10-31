@@ -20,9 +20,10 @@ os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str(50_000_000))   # the dec
 import cv2  # noqa: E402
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from PIL import Image
 
+import imprinted
 import imprinted.core as ic
 
 ROOT = Path(__file__).parent
@@ -74,7 +75,12 @@ def b64png(rgb: np.ndarray, max_side: int | None = None, dpi: float | None = Non
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (ROOT / "web" / "index.html").read_text()
+    return (ROOT / "web" / "index.html").read_text().replace("{{version}}", imprinted.__version__)
+
+
+@app.get("/logo.png")
+def logo():
+    return FileResponse(ROOT / "web" / "logo.png")
 
 
 JOBS = threading.BoundedSemaphore(2)    # encodes/decodes at once: each one already uses every core

@@ -1,11 +1,14 @@
 # Imprinted
+<p align="center"><img src="web/logo.png" alt="Imprinted logo" width="160"></p>
 
-[![PyPI](https://img.shields.io/pypi/v/imprinted)](https://pypi.org/project/imprinted/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+<p align="center">
+  <a href="https://pypi.org/project/imprinted/"><img src="https://img.shields.io/pypi/v/imprinted" alt="PyPI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+</p>
 
 Hide up to 32 bytes in a picture, invisibly, and read them back from the file or from a phone photo of a print or screen.
 
-![Original, Imprinted, ×10 difference, and a simulated phone photo of a curled print decoding the payload](versus.png)
+![Original and Imprinted, the web UI decoding each (nothing in the original, the payload in the Imprinted file), and a simulated phone photo of a curled print with its decode](versus.png)
 
 - **Invisible:** same size, no border or markers (SSIM ≥ 0.955, mean ΔL\* ≤ 1).
 - **Camera-robust:** reads from a photo at an angle, in odd light, printed in grayscale, mirrored, curled, cropped or with clutter around it.
@@ -44,9 +47,13 @@ Python 3.10+. Installs the library only.
 ```python
 import imprinted
 
-imprinted.encode("photo.png", "hello", "photo_imprinted.png")                 # save as PNG
-imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")  # now reads "hello world"
-imprinted.decode("phone_shot.jpg")   # -> "hello", or None
+imprinted.encode("photo.png", "hello", "photo_imprinted.png")   # returns the image, saves it (PNG)
+imprinted.decode("photo_imprinted.png")                          # -> "hello"
+
+imprinted.encode("photo_imprinted.png", "world", "again.png", mode="append")
+imprinted.decode("again.png")                                    # -> "hello world"
+
+imprinted.decode("phone_shot.jpg")   # a photo of the print or screen: its text, or None
 imprinted.detect("phone_shot.jpg")   # -> True if it holds an Imprinted pattern
 ```
 
@@ -80,15 +87,15 @@ The codec (`imprinted/core.py`) only changes lightness (L\* in CIE Lab), so colo
 
 `hard`: tilt up to ~40°, 0.6 camera px per printed px, JPEG 75.
 
-Speed (v1.0.0, CPU seconds on one core, `scripts/speed_bench.py --cpu`):
+Speed (v1.0.1, CPU seconds on one core, `scripts/speed_bench.py --cpu`):
 
 | task | 768×512 | 3000×2000 |
 |---|---|---|
-| encode | 1.2–1.3 s | 21–24 s |
-| already-Imprinted check (in `encode`) | 7.0 s | 2.6–3.2 s |
-| decode file | 2.4–2.9 s | 2.5–3.0 s |
+| encode | 1.0–1.1 s | 18–20 s |
+| already-Imprinted check (in `encode`) | 6.0–7.0 s | 2.6–2.8 s |
+| decode file | 2.0–2.5 s | 2.4–2.5 s |
 
-Decoding a simulated phone photo of a 15 cm print takes 4.7–5.6 s. `detect` says yes in 0.7–1.6 s and no in 2.8–7.0 s, with no false alarms on 66 pictures without a pattern (`scripts/detect_bench.py`, `scripts/small_bench.py`).
+Decoding a simulated phone photo of a 15 cm print takes 4.1–4.6 s. `detect` says yes in 0.7–1.6 s and no in 2.8–7.0 s, with no false alarms on 66 pictures without a pattern (`scripts/detect_bench.py`, `scripts/small_bench.py`).
 
 ## Development
 
